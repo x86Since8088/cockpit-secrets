@@ -76,7 +76,14 @@
  *   page draws every one of them —
  *       text · password · password-reveal · number · toggle · select · radio ·
  *       textarea · tags · search · object · file-bytes · readonly · hidden
- *   plus the aliases a differently-shaped schema might use for the same thing.
+ *   plus the aliases a differently-shaped schema might use for the same thing,
+ *   plus ROWS: a repeating subform, N copies of the shape `fields` declares,
+ *   with Add and Remove. A descriptor reaches it either by naming it (`custom`,
+ *   `key-value`, `rows`, …) or by describing an `object` whose `type` is
+ *   `array` — one subform where the request wants a list would silently drop
+ *   every row but the first, which is the class of failure this page refuses.
+ *   The custom string field both formats carry (name, value, protected) is the
+ *   first request for it and not a special case in the renderer.
  *
  * A control type this page does not know is drawn as text WITH A VISIBLE NOTE,
  * never dropped. Where the schema says nothing (the keys of an entries[] row,
@@ -163,6 +170,11 @@
      * Fetched once at load, unescalated, and re-fetched only while there is an
      * agent to watch. */
     var HEALTH = null;
+    /* The escalation the LAST health call was made at. `health` is one document
+     * describing every safe, and part of it is euid-dependent — the admin-class
+     * agent socket is /run/cockpit-secrets/<euid>/agent.sock — so "what was in
+     * it" is not a complete answer without "who asked". */
+    var HEALTH_ADMIN = false;
 
     /* Wipers: one function per rendered secret, so lock() scrubs the DOM
      * rather than merely navigating away from it (I17, task rule 7). */
@@ -229,6 +241,58 @@
         "breach":         ["breach", "breach-check", "pwned", "hibp"],
         "yubikey":        ["yubikey-challenge", "yubikey", "challenge"]
     };
+
+    /* The shape of ONE row of a repeating subform, used only when the schema
+     * declares a repeating field without describing its elements.
+     *
+     * The capability that forced the repeater to exist is the custom string
+     * field both formats carry — KDBX calls them custom strings, PWS3 calls
+     * them unknown fields, and both store a NAME, a VALUE and a flag saying
+     * whether the value is protected. The helper's `reveal` verb already
+     * publishes the addressing for them: its `field` pattern accepts
+     * `custom:<name>`, which is this page's evidence that a custom field is a
+     * (name, value, protected) triple and not something else.
+     *
+     * It is a FALLBACK and it says so on screen. The moment the schema
+     * describes the element fields itself, its description is used instead and
+     * this constant is not consulted — the same rule as every other CONTRACT_*
+     * table in this file. */
+    var CONTRACT_CUSTOM_ROW = [
+        { id: "name", label: "Field name", control: "text", type: "string",
+          required: true, secret: false, maxlength: 128,
+          placeholder: "API token",
+          help: "What the field is called inside the entry. `reveal` reaches it " +
+                "afterwards as custom:<name>.",
+          breaks_when_wrong: "Two custom fields with the same name are one field in " +
+                "every format that stores them, so the second silently replaces the " +
+                "first. This form refuses a duplicate rather than letting that happen." },
+        { id: "value", label: "Value", control: "password", type: "string",
+          required: false, secret: true, maxlength: 4096,
+          /* Deliberately NOT scored. The strength meter answers "how hard is
+           * this to guess as a password", and a custom string is very often
+           * not one — a licence key, a recovery code, an account number. A
+           * number computed as though it were would be this page inventing a
+           * judgement about a field whose meaning it does not know, and it
+           * would cost one helper call per keystroke per row to do it. */
+          strength: false,
+          help: "Travels on the helper's stdin inside the request object, like every " +
+                "other secret on this page (I10). It is never put in browser storage (I11).",
+          breaks_when_wrong: "Leave it empty and the field is created empty; there is no " +
+                "way to tell that apart from a value that is genuinely the empty string." },
+        { id: "protected", label: "Protected", control: "toggle", type: "boolean",
+          required: false, secret: false, "default": true,
+          help: "Store the value the way the format stores a password — encrypted in " +
+                "memory and hidden in a listing.",
+          breaks_when_wrong: "Unprotected, the value is visible in the entry listing of " +
+                "other clients and is carried in the clear by an export. Protected is the " +
+                "restrictive default here for the same reason admin is the default access " +
+                "class (I1)." }
+    ];
+    var ROWS_FALLBACK_NOTE =
+        "This helper declares the field as a list but does not describe what one row " +
+        "contains, so the three parts docs/CONTRACT.md pins for a custom field are drawn: " +
+        "a name, a value, and whether the value is protected. A schema that describes its " +
+        "own rows replaces these entirely.";
 
     /* The keys docs/CONTRACT.md pins for one entries[] row. Used only when the
      * schema declares no list columns. */
@@ -406,8 +470,15 @@
         if (problem === "not-found")
             return mkErr("not-found", HELPER + " is not installed on this host.");
         if (DENY_PROBLEMS[problem])
+            /* Say what to DO about it. The bridge refuses a `superuser:"require"`
+             * channel outright when this session is in limited access — no
+             * dialog is drawn, here or anywhere — so an operator who read only
+             * the problem code had a refusal with no route out of it. The route
+             * is Cockpit's own header control and nothing on this page. */
             return mkErr("access-denied",
-                "Administrative access is required and was not granted (" + problem + ").");
+                "Administrative access is required and was not granted (" + problem + "). " +
+                "Cockpit does not ask for it from inside a page: turn it on with the " +
+                "“Limited access” control in the Cockpit header, then try again.");
         return mkErr("internal", (err && (err.message || err.problem)) || "the helper failed");
     }
 
@@ -920,8 +991,16 @@
         var key = safeId || "";
         var st = BREACH[key];
         if (st && st.pending) return st.pending;
-        st = BREACH[key] = { state: "asking", reason: "", pending: null };
         var verb = verbFor("breach");
+        /* The escalation this answer is being obtained at, recorded on the
+         * cache entry. Asking about an admin-class safe's corpus without
+         * administrative access is refused by the helper, and remembering that
+         * refusal for the life of the page would leave "breach check could not
+         * be reached" under every password box long after access came on.
+         * dropStaleForEscalation() clears it; this stamp is what tells it
+         * which entries to clear. */
+        var admin = verb ? adminForVerb(verb, safeSpecById(safeId)) : false;
+        st = BREACH[key] = { state: "asking", reason: "", pending: null, _admin: admin };
         if (!verb) {
             st.state = "no";
             st.pending = Promise.resolve(st);
@@ -929,7 +1008,7 @@
         }
         var req = {};
         if (safeId) req.safe = safeId;
-        st.pending = callOnce(verb, req, adminForVerb(verb, safeSpecById(safeId)))
+        st.pending = callOnce(verb, req, admin)
         .then(function (res) {
             if (res && res.available === false) {
                 st.state = "no";
@@ -1263,6 +1342,26 @@
         "file": "file", "file-b64": "file", "file-bytes": "file",
         "keyfile": "file", "attachment": "file",
         "object": "object", "subform": "object", "group": "object",
+        /* A REPEATING subform: N rows of the same shape, with Add and Remove.
+         *
+         * Nothing here is about custom fields specifically. This is the
+         * generic "array of objects" the field dictionary is now able to
+         * describe — the element fields come from the descriptor, exactly the
+         * way `object` takes its subform from one — and a verb that declares
+         * any other repeating shape gets the same editor with no edit here.
+         * The custom string field is simply the first request that needed it.
+         *
+         * The spellings below are the ones a reasonable schema might pick for
+         * the same idea, in the same spirit as VERB_ALIASES: the page does not
+         * dictate the name, it recognises it. */
+        "rows": "rows", "row-list": "rows", "rowlist": "rows",
+        "repeat": "rows", "repeating": "rows", "multi-object": "rows",
+        "custom": "rows", "custom-field": "rows", "custom-fields": "rows",
+        "custom_fields": "rows", "customfields": "rows",
+        "custom-string": "rows", "custom-strings": "rows", "custom_strings": "rows",
+        "kv": "rows", "key-value": "rows", "keyvalue": "rows", "key_value": "rows",
+        "pairs": "rows", "name-value": "rows", "field-list": "rows",
+        "fieldlist": "rows", "attributes": "rows",
         "json": "json", "raw": "json",
         "info": "info", "note": "info",
         "hidden": "hidden"
@@ -1276,6 +1375,40 @@
         var kind = TYPE_ALIAS[c] || TYPE_ALIAS[t] || null;
         if (kind === "int" && (t === "float" || t === "number")) kind = "float";
         if (kind === "search") kind = "text";
+        /* PROMOTIONS TO THE ROW LIST. Both are the schema saying "many of
+         * these" in a way the control name alone did not.
+         *
+         *   object + type array   `object` describes ONE subform. The same
+         *                         descriptor typed as an array says the
+         *                         request carries a LIST of them, and drawing
+         *                         a single subform would silently drop every
+         *                         row after the first — a loss with no visible
+         *                         symptom, which is the failure mode this file
+         *                         refuses everywhere else.
+         *
+         *   tags + element fields `type: "array"` on its own is a list of
+         *                         strings, which is the tags box. An array
+         *                         whose ELEMENTS carry their own field list is
+         *                         a list of objects, and a comma-separated
+         *                         text box cannot carry one. */
+        var repeats = !!(spec && (spec.repeat === true || spec.multiple === true ||
+                                  spec.many === true)) || t === "array" || t === "list";
+        var hasElementFields = !!(spec && Array.isArray(spec.fields) && spec.fields.length);
+        var hasKeyField = !!(spec && spec.key && typeof spec.key === "object" &&
+                             specName(spec.key));
+        if (kind === "object" && repeats) kind = "rows";
+        if (kind === "tags" && hasElementFields) kind = "rows";
+        /* A descriptor that names its map KEY *and* describes its element
+         * FIELDS is a map of objects, which is a row list whose first column
+         * is the key. That combination cannot describe anything else, so the
+         * promotion is safe whatever `control` said — and what `control` says
+         * for the helper's `custom` field today is "json", which would put an
+         * operator in front of a textarea and ask them to type
+         *     {"API token": {"value": "…", "protected": true}}
+         * by hand. The schema described a name, a value and a flag; drawing a
+         * name, a value and a flag is rendering what it described, and a raw
+         * JSON box is this page declining to. */
+        if (hasKeyField && hasElementFields) kind = "rows";
         /* Two controls are refused for a field the helper marked secret, and
          * both refusals fail towards the password box rather than away from it.
          *
@@ -1294,6 +1427,24 @@
         return kind;                          /* null => unknown, say so out loud */
     }
     function isSecretSpec(spec) {
+        /* A ROW LIST IS SECRET WHOLESALE, whatever the container's own `secret`
+         * key says — and the container's key will usually say false, because
+         * the names in it are not secrets.
+         *
+         * The reason is where the values live. A row of a custom-field list
+         * carries a name AND a value, and the value is a credential the moment
+         * its `protected` flag is on. If the container were treated as
+         * non-secret, buildForm().values() would collect the whole array —
+         * values included — into the ordinary bag that the dialog's submit
+         * path walks, and the promise this file makes in its header ("values()
+         * returns the NON-secret values only", I11) would be false at one
+         * level of nesting. Marking the container secret puts the entire array
+         * on the applySecrets() path instead: read once, immediately before
+         * the request is serialized, and dropped straight after.
+         *
+         * It also means addArgv() refuses it, which is the right refusal: a
+         * custom field's value must never reach a command line (I10). */
+        if (controlType(spec) === "rows") return true;
         if (spec && spec.secret !== undefined) return !!spec.secret;
         return controlType(spec) === "password";
     }
@@ -1341,6 +1492,13 @@
                 "plain text so the field is not silently dropped."));
 
         var input = null, extra = null, fileBytes = null, sub = null;
+        /* Control "rows": the element descriptors, the live row forms, the host
+         * they live in, and the change handlers a row created later has to be
+         * wired into. */
+        var rowSpecs = null, rowDrawSpecs = null, rowCtls = null;
+        var rowHost = null, rowAdd = null;
+        var rowWatchers = [];
+        var ROW_SEQ = 0;
         /* The two kinds whose value does not live in a DOM property: a
          * radiogroup with nothing checked, and a readonly display whose text is
          * a rendering of the value rather than the value itself (an array is
@@ -1601,6 +1759,104 @@
                     "Only the fields you fill in are sent; anything left blank " +
                     "is left as it is in the safe."));
             break;
+        case "rows": {
+            /* A REPEATING SUBFORM — N rows of the shape the descriptor
+             * declares, with Add and Remove.
+             *
+             * Like `object` above, the nesting is the helper's: the element
+             * fields come from `spec.fields`, resolved one level down through
+             * the same FIELD shape, and this file writes none of them. When the
+             * descriptor declares a list but not what one row contains, the
+             * three parts docs/CONTRACT.md pins for a custom field are drawn
+             * and a visible note says that is what happened — the same
+             * contract-as-fallback rule the rest of this page follows, never a
+             * silent guess.
+             *
+             * It is a <fieldset>/<legend> rather than a <label for>, for the
+             * same reason the radiogroup is: a group of controls that answer
+             * one question needs to be announced as one group, or a screen
+             * reader reads a run of orphaned name/value boxes with no idea
+             * what they belong to. */
+            clear(wrap);
+            /* The element descriptors, in the order they are drawn. A map-shaped
+             * field publishes its KEY separately from its element `fields` —
+             * the helper's `custom` descriptor is exactly that: `key` is the
+             * field name, `fields` is {value, protected} — so the key goes
+             * first and becomes the row's identifying column. */
+            rowSpecs = (Array.isArray(spec.fields) && spec.fields.length)
+                ? spec.fields
+                : (Array.isArray(spec.item_fields) && spec.item_fields.length
+                    ? spec.item_fields
+                    : (Array.isArray(spec.row_fields) && spec.row_fields.length
+                        ? spec.row_fields : CONTRACT_CUSTOM_ROW));
+            if (spec.key && typeof spec.key === "object" && specName(spec.key) &&
+                rowSpecs !== CONTRACT_CUSTOM_ROW)
+                rowSpecs = [spec.key].concat(rowSpecs);
+            var rfs = el("fieldset", "sec-rows");
+            var rlg = el("legend", null, spec.label || fname);
+            rfs.appendChild(rlg);
+            if (spec.help) rfs.appendChild(el("div", "hint", spec.help));
+            if (spec.breaks_when_wrong)
+                rfs.appendChild(el("div", "hint", String(spec.breaks_when_wrong)));
+            if (rowSpecs === CONTRACT_CUSTOM_ROW)
+                rfs.appendChild(el("div", "hint", ROWS_FALLBACK_NOTE));
+            /* THE GUIDANCE IS HOISTED OUT OF THE ROWS, ONCE.
+             *
+             * Every other control on this page prints its descriptor's `help`
+             * and `breaks_when_wrong` beside it, because that sentence is the
+             * most useful thing on the form and is not this page's to write.
+             * In a REPEATER that rule turns against itself: the helper's
+             * custom-name field carries a hundred and ninety words about which
+             * ten KeePass names are reserved and why, and three rows means
+             * three identical copies of it, which is how a form becomes
+             * unreadable and how people learn to skip the prose.
+             *
+             * So it is printed once, under the legend, labelled by field — the
+             * same words, none dropped, said once instead of once per row. The
+             * rows themselves are drawn from copies with those two keys
+             * cleared. Nothing else about the descriptor is touched: pattern,
+             * required, maxlength, secret and default all still come from the
+             * helper, and validation still quotes its own message. */
+            var guide = el("div", "sec-row-guide");
+            rowSpecs.forEach(function (f) {
+                if (!f.help && !f.breaks_when_wrong) return;
+                var lead = (f.label || specName(f)) + " — ";
+                if (f.help) {
+                    var h = el("div", "hint");
+                    h.appendChild(el("strong", null, lead));
+                    h.appendChild(document.createTextNode(String(f.help)));
+                    guide.appendChild(h);
+                }
+                if (f.breaks_when_wrong)
+                    guide.appendChild(el("div", "hint",
+                        (f.help ? "" : lead) + String(f.breaks_when_wrong)));
+            });
+            if (guide.childNodes.length) rfs.appendChild(guide);
+            rowDrawSpecs = rowSpecs.map(function (f) {
+                var c = {};
+                Object.keys(f).forEach(function (k) { c[k] = f[k]; });
+                c.help = null;
+                c.breaks_when_wrong = null;
+                return c;
+            });
+            rowHost = el("div", "sec-rowlist");
+            rowHost.id = id;
+            rfs.appendChild(rowHost);
+            rowCtls = [];
+            rowAdd = btn(spec.add_label ? String(spec.add_label) : "Add a field",
+                         "tiny", function () {
+                var rc = addRow();
+                rc.form.focusFirst();
+                announce("Added an empty row. It is row " + rowCtls.length + " of " +
+                         rowCtls.length + ".");
+            });
+            rfs.appendChild(rowAdd);
+            if (spec.partial)
+                rfs.appendChild(el("div", "hint",
+                    "Only the rows you fill in are sent; an empty row is not a change."));
+            wrap.appendChild(rfs);
+            break;
+        }
         case "json":
             input = attrs(el("textarea"));
             input.setAttribute("spellcheck", "false");
@@ -1621,7 +1877,204 @@
         }
         wrap.appendChild(errLine);
 
+        /* ---------------- control "rows": the repeater's machinery -------- */
+
+        /* The first element field is the row's KEY — the custom field's name.
+         * "First" is the schema's own ordering, not a name this file looks for:
+         * a descriptor that puts the identifying field first is describing
+         * which one it is, and a row whose key is empty is an empty row. */
+        function rowKeyName() { return specName(rowSpecs[0]) || "name"; }
+
+        /* One row's COMPLETE value, secrets included.
+         *
+         * values() is secret-free by construction, so the secret half is read
+         * back through the row form's own applySecrets() — the same door every
+         * other secret on this page goes through, one read, immediately before
+         * the value is handed on. Nothing here keeps a reference afterwards:
+         * the object is returned to rowsValue(), which is only ever called from
+         * the parent form's applySecrets(). */
+        function rowFull(rc) {
+            var o = rc.form.values();
+            rc.form.applySecrets(o);
+            return o;
+        }
+
+        function rowIsEmpty(o) {
+            var k = rowKeyName();
+            var v = o[k];
+            return (v === undefined || v === null || String(v).trim() === "");
+        }
+
+        /* Anything at all typed into a row, key or not — used to tell an
+         * abandoned empty row (dropped in silence) from a row with a value and
+         * no name (refused out loud, because dropping it would throw away
+         * something the operator typed). */
+        function rowHasAnything(o) {
+            var k = rowKeyName();
+            return Object.keys(o).some(function (n) {
+                if (n === k) return false;
+                var v = o[n];
+                if (v === undefined || v === null || v === "" || v === false) return false;
+                if (Array.isArray(v) && !v.length) return false;
+                /* A boolean that is merely sitting at its declared default is
+                 * not something the operator typed. */
+                for (var i = 0; i < rowSpecs.length; i++)
+                    if (specName(rowSpecs[i]) === n &&
+                        rowSpecs[i]["default"] !== undefined &&
+                        rowSpecs[i]["default"] === v) return false;
+                return true;
+            });
+        }
+
+        function renumberRows() {
+            rowCtls.forEach(function (rc, ix) {
+                rc.node.setAttribute("aria-label",
+                    (spec.label || fname) + " row " + (ix + 1) + " of " + rowCtls.length);
+            });
+        }
+
+        function removeRow(rc) {
+            var ix = rowCtls.indexOf(rc);
+            if (ix < 0) return;
+            rc.form.wipeAll();                 /* scrub before detaching (I11) */
+            rowCtls.splice(ix, 1);
+            if (rc.node.parentNode) rc.node.parentNode.removeChild(rc.node);
+            renumberRows();
+            if (rowAdd) rowAdd.focus();
+            announce("Removed a row. " + rowCtls.length + " left.");
+            rowWatchers.forEach(function (fn) { fn(); });
+        }
+
+        function addRow(values) {
+            var rc = { form: null, node: null };
+            rc.node = el("div", "sec-row");
+            rc.node.setAttribute("role", "group");
+            rc.form = buildForm(rowDrawSpecs, { values: values || {} });
+            rc.node.appendChild(rc.form.node);
+            var rm = btn("Remove", "danger tiny", function () { removeRow(rc); });
+            rm.setAttribute("aria-label", "Remove this row");
+            /* On a PARTIAL list — the helper sends only the rows that are
+             * filled in — taking a row out of this form is not the same as
+             * taking the field out of the safe, and an operator who thinks it
+             * is will believe they deleted something they did not. Say which
+             * one it is, on the control itself. */
+            if (spec.partial)
+                rm.title = "Takes this row out of this form. The field already in the safe " +
+                           "is left exactly as it is: only the rows you fill in are sent.";
+            rc.node.appendChild(rm);
+            rowHost.appendChild(rc.node);
+            rowCtls.push(rc);
+            renumberRows();
+            /* A row created after the parent form wired its dependency handler
+             * still has to report changes, or depends_on stops working for
+             * everything downstream of this control. */
+            rowWatchers.forEach(function (fn) {
+                rc.form.controls.forEach(function (c) { c.onChange(fn); });
+            });
+            rowWatchers.forEach(function (fn) { fn(); });
+            return rc;
+        }
+
+        /* The wire shape.
+         *
+         * An ARRAY of row objects, keyed by the element ids the schema
+         * declared — that is what `type: "array"` asked for and it is the only
+         * shape that can carry a per-row flag. A descriptor typed `object`
+         * asks for a MAP instead, so the key field becomes the property name
+         * and what is left of the row becomes its value: a bare scalar when
+         * one field remains, the rest of the row when more than one does.
+         *
+         * Both are read off the descriptor. Nothing here picks a shape the
+         * schema did not ask for, and the helper is what refuses one it did
+         * not mean. */
+        function rowsValue() {
+            var out = [];
+            rowCtls.forEach(function (rc) {
+                var o = rowFull(rc);
+                if (rowIsEmpty(o)) { dropDeep(o); return; }
+                out.push(o);
+            });
+            if (!out.length) return undefined;
+            if (String(spec.type || "").toLowerCase() !== "object") return out;
+            var key = rowKeyName();
+            var map = {};
+            out.forEach(function (o) {
+                var rest = {};
+                var names = [];
+                Object.keys(o).forEach(function (n) {
+                    if (n === key) return;
+                    rest[n] = o[n];
+                    names.push(n);
+                });
+                map[String(o[key])] = (names.length === 1) ? rest[names[0]] : rest;
+            });
+            return map;
+        }
+
+        function setRows(v) {
+            while (rowCtls.length) {
+                var rc = rowCtls.pop();
+                rc.form.wipeAll();
+                if (rc.node.parentNode) rc.node.parentNode.removeChild(rc.node);
+            }
+            var key = rowKeyName();
+            if (Array.isArray(v)) {
+                v.forEach(function (r) {
+                    if (r && typeof r === "object") { addRow(r); return; }
+                    /* A bare list of NAMES — which is what a listing that
+                     * reports custom fields without their values looks like. */
+                    var one = {};
+                    one[key] = String(r);
+                    addRow(one);
+                });
+            } else if (v && typeof v === "object") {
+                Object.keys(v).forEach(function (n) {
+                    var row = {};
+                    row[key] = n;
+                    var val = v[n];
+                    if (val && typeof val === "object" && !Array.isArray(val))
+                        Object.keys(val).forEach(function (k2) { row[k2] = val[k2]; });
+                    else if (rowSpecs.length > 1) row[specName(rowSpecs[1])] = val;
+                    addRow(row);
+                });
+            }
+            renumberRows();
+        }
+
+        function rowsValidate() {
+            var first = null;
+            var seen = {};
+            var key = rowKeyName();
+            rowCtls.forEach(function (rc) {
+                var o = rowFull(rc);
+                if (rowIsEmpty(o)) {
+                    /* An untouched row is not an error — it is a row the
+                     * operator added and did not use, and dropping it silently
+                     * is right. A row with a VALUE and no name is different:
+                     * dropping that would throw away something they typed. */
+                    if (rowHasAnything(o) && !first)
+                        first = (rowSpecs[0].label || key) + " is required on every row " +
+                                "that has anything in it.";
+                    dropDeep(o);
+                    return;
+                }
+                var k = String(o[key]);
+                if (Object.prototype.hasOwnProperty.call(seen, k)) {
+                    if (!first) first = "“" + k + "” appears twice. Every row needs its " +
+                        "own name: two rows with the same one are one field in the file, " +
+                        "so the second would replace the first with nothing to show for it.";
+                } else { seen[k] = 1; }
+                dropDeep(o);
+                var m = rc.form.validate();
+                if (m && !first) first = m;
+            });
+            if (!first && spec.required && !rowCtls.length)
+                first = (spec.label || fname) + " needs at least one row.";
+            return first;
+        }
+
         function setValue(v) {
+            if (kind === "rows") { setRows(v); return; }
             if (kind === "object") {
                 if (sub && v && typeof v === "object")
                     Object.keys(v).forEach(function (k) {
@@ -1660,6 +2113,10 @@
         }
 
         function getValue() {
+            /* A row list returns the WHOLE array, values included — and it is
+             * only ever reached through applySecrets(), because isSecretSpec()
+             * marks the control secret. values() never calls this. */
+            if (kind === "rows") return rowsValue();
             /* An object control returns the NON-SECRET half of its subform;
              * nested secrets are collected separately by applySecrets(), so
              * values() stays secret-free at every depth (I11). */
@@ -1720,6 +2177,7 @@
         }
 
         function validate() {
+            if (kind === "rows") return rowsValidate();
             if (kind === "object") return sub ? sub.validate() : null;
             var v = getValue();
             var empty = (v === undefined || v === null || v === "" ||
@@ -1762,6 +2220,11 @@
             get: getValue,
             set: setValue,
             focus: function () {
+                if (kind === "rows") {
+                    if (rowCtls && rowCtls.length) { rowCtls[0].form.focusFirst(); return; }
+                    if (rowAdd) rowAdd.focus();      /* an empty list: Add is the control */
+                    return;
+                }
                 if (kind === "object") { if (sub) sub.focusFirst(); return; }
                 if (kind === "readonly") return;     /* nothing to type into */
                 /* A radiogroup and a checklist are <div>s holding the real
@@ -1778,6 +2241,16 @@
             setVisible: function (yes) { wrap.hidden = !yes; },
             visible: function () { return !wrap.hidden; },
             onChange: function (fn) {
+                if (kind === "rows") {
+                    /* Remembered as well as attached: a row added later has to
+                     * be wired up too, or depends_on stops seeing this control
+                     * change the moment the operator presses Add. */
+                    rowWatchers.push(fn);
+                    rowCtls.forEach(function (rc) {
+                        rc.form.controls.forEach(function (c) { c.onChange(fn); });
+                    });
+                    return;
+                }
                 if (kind === "object") {
                     if (sub) sub.controls.forEach(function (c) { c.onChange(fn); });
                     return;
@@ -1807,6 +2280,17 @@
             wipe: function () {
                 fileBytes = null;
                 if (strengthCtl) strengthCtl.reset();
+                if (kind === "rows") {
+                    /* Scrub every row's controls, then take the rows away. A
+                     * detached node still holding a value is the one thing the
+                     * Lock button could not reach (I11, I17). */
+                    while (rowCtls.length) {
+                        var rc = rowCtls.pop();
+                        rc.form.wipeAll();
+                        if (rc.node.parentNode) rc.node.parentNode.removeChild(rc.node);
+                    }
+                    return;
+                }
                 if (kind === "object") { if (sub) sub.wipeAll(); return; }
                 if (!input) return;
                 try {
@@ -1832,9 +2316,30 @@
             }
         };
         ctrl.sub = sub;
+        /* Scrub the CREDENTIAL and keep the structure.
+         *
+         * wipe() on a row list takes the rows away, which is what locking and a
+         * successful submit want. An error path wants something narrower: the
+         * dialog stays open with the helper's refusal on it, and taking the
+         * operator's typed field NAMES away along with the values would punish
+         * them for a failed request by making them retype the form. So the
+         * values go and the rows stay. Everything that is not a row list has
+         * one behaviour, and this is it. */
+        ctrl.wipeSecret = function () {
+            if (kind === "rows") {
+                rowCtls.forEach(function (rc) { rc.form.wipeSecrets(); });
+                return;
+            }
+            ctrl.wipe();
+        };
         if (initial !== undefined) setValue(initial);
         else if (spec["default"] !== undefined && spec["default"] !== null)
             setValue(spec["default"]);
+        /* An empty row list is a legend and a button, which reads as a feature
+         * that is switched off. One empty row shows the shape of what can be
+         * added; it carries no key, so rowsValue() drops it and an untouched
+         * form sends nothing. */
+        if (kind === "rows" && rowCtls && !rowCtls.length) addRow();
         return ctrl;
     }
 
@@ -1957,8 +2462,11 @@
             },
             wipeSecrets: function () {
                 controls.forEach(function (c) {
-                    if (c.secret) c.wipe();
-                    else if (c.kind === "object" && c.sub) c.sub.wipeSecrets();
+                    /* wipeSecret() is wipe() for everything except a row list,
+                     * where it scrubs the values and leaves the rows standing
+                     * — see the comment on it in makeControl. */
+                    if (c.secret) { c.wipeSecret(); return; }
+                    if (c.kind === "object" && c.sub) c.sub.wipeSecrets();
                 });
             },
             wipeAll: function () { controls.forEach(function (c) { c.wipe(); }); }
@@ -2253,10 +2761,21 @@
     /* ================================================================== *
      * Escalation (task rule 9)
      *
-     * Cockpit owns the administrative prompt. This page asks for it by calling
-     * spawn with superuser:"require" and lets the bridge put up its own dialog;
-     * cockpit.permission tells us whether it is currently on so the list can
-     * say so instead of only failing.
+     * COCKPIT OWNS THE ADMINISTRATIVE PROMPT, AND IT DOES NOT LEND IT OUT.
+     * This page spawns admin-class verbs with superuser:"require"; when the
+     * session already has administrative access that runs the helper as root,
+     * and when it does not the bridge refuses the channel with `access-denied`
+     * AND NO DIALOG IS SHOWN. Measured on Cockpit 360, in a real session, from
+     * inside this frame — the dialog is the shell's own component behind the
+     * header control, which calls cockpit.Superuser.Start() and listens for its
+     * Prompt signal around that one call; nothing a package page can reach
+     * makes it appear, and drawing a lookalike here would be a password box
+     * this program did not write asking for a password it must never see.
+     *
+     * So the rule is: ask for escalation on every admin verb, report honestly
+     * when it was not granted, and point at the control that grants it.
+     * cockpit.permission tells us which of the two states we are in, so the
+     * list can say so up front instead of only failing.
      * ================================================================== */
     function adminAllowed() { return !!(PERM && PERM.allowed); }
 
@@ -2276,7 +2795,9 @@
      * including through "Check this safe", which was itself gated on
      * reachability and therefore never drawn in the one situation it exists
      * for. The escalation banner's own sentence, "just open one below and
-     * Cockpit will ask you for it", described something the page did not do.
+     * Cockpit will ask you for it", described something NOTHING does: it was
+     * removed when the live run measured the bridge refusing that spawn with
+     * `access-denied` and no prompt (see the section header above).
      *
      * Whether this operator may open it is decided by the ESCALATED verb, and
      * the helper re-checks the class inside it from kernel identity (I3). That
@@ -2286,14 +2807,104 @@
         return isAdminClass(safe) && !adminAllowed();
     }
 
+    /* ------------------------------------------------------------------ *
+     * PRIVILEGE-LEVEL STALENESS — the general form of the bug above.
+     *
+     * The escalation bug was not really about `safeReachable`. It was about a
+     * page keeping an answer the helper gave at ONE privilege level and reusing
+     * it as though it were the answer at ANOTHER. `list` runs unescalated,
+     * always; its verdict on an admin-class safe is a fact about the euid that
+     * asked and not about the operator, and reading it as a refusal disabled
+     * the default access class permanently.
+     *
+     * Every other cached helper answer on this page has the same shape, so
+     * every one of them is stamped with the escalation it was obtained at and
+     * dropped when that stamp is lower than what the question now needs. The
+     * three caches are PROBES (per safe), BREACH (per safe) and HEALTH (one
+     * document). A stamp of `true` means "asked with superuser:require".
+     *
+     * The rule is one-directional on purpose: an answer obtained ESCALATED is
+     * not invalidated when administrative access goes away. It is still a true
+     * statement about the file — the KDF it uses, the warnings it carries —
+     * and re-asking would be a Cockpit prompt the operator did not ask for.
+     * What changes is that the verbs are refused again, and the helper is what
+     * refuses them (I3).
+     * ------------------------------------------------------------------ */
+
+    /* What escalation a question about this safe has to be asked at. */
+    function needsAdminFor(safe) { return isAdminClass(safe); }
+
+    /* Was this cached answer obtained at a high enough privilege to be worth
+     * anything? An entry with no stamp is from an older code path and is
+     * treated as unescalated, which is the restrictive reading. */
+    function staleForClass(entry, safe) {
+        if (!entry) return false;                 /* nothing cached is not stale */
+        return needsAdminFor(safe) && entry._admin !== true;
+    }
+
+    /* Throw away every cached answer that administrative access has just made
+     * askable properly. Called from the permission listener, which is the only
+     * moment the privilege level changes under a page that is already drawn. */
+    function dropStaleForEscalation() {
+        var dropped = 0;
+        SAFES.forEach(function (s) {
+            if (!needsAdminFor(s)) return;
+            if (staleForClass(PROBES[s.id], s)) { delete PROBES[s.id]; dropped++; }
+            var b = BREACH[s.id];
+            if (b && b._admin !== true) { delete BREACH[s.id]; dropped++; }
+        });
+        /* The safe-less breach question — asked from a password control with
+         * nothing open — is keyed on the empty string. It is asked
+         * unescalated by construction, so it goes too rather than being the
+         * one cache entry that outlives a privilege change. */
+        if (BREACH[""] && BREACH[""]._admin !== true) { delete BREACH[""]; dropped++; }
+        /* `health` is one document covering every safe, and its admin-class
+         * agent socket path is euid-dependent — measured: the helper reports
+         * /run/cockpit-secrets/<euid>/agent.sock, so an unescalated health call
+         * describes a socket the admin-class agent does not use. Re-ask it
+         * escalated the moment that is possible and there is an admin-class
+         * agent to see. */
+        if (agentPollAdmin() && HEALTH_ADMIN !== true) { HEALTH = null; dropped++; }
+        return dropped;
+    }
+
     function escalationBanner() {
         if (adminAllowed()) return null;
+        /* …and only when there is actually something waiting on it. A registry
+         * of nothing but user-class safes is a registry with no admin-class
+         * safe to be unable to open, and a permanent warning about a situation
+         * that does not exist is how a page teaches people to ignore its
+         * warnings. */
+        if (!SAFES.some(pendingEscalation)) return null;
         var box = el("div", "sec-alert warn");
+        /* WHAT THIS SENTENCE USED TO SAY, AND WHY IT WAS WRONG.
+         *
+         * It ended "— or just open one below and Cockpit will ask you for it",
+         * and that is not what happens. MEASURED on this host, Cockpit 360,
+         * with a session in limited access: a channel opened with
+         * `superuser: "require"` is refused IMMEDIATELY with `access-denied`
+         * and no dialog is drawn anywhere. Cockpit's escalation dialog belongs
+         * to the SHELL: it is the component behind the header control, it calls
+         * `cockpit.Superuser.Start()` itself and listens for the `Prompt`
+         * signal around that one call. There is no API by which a package page
+         * can make it appear — `superuser` as the shipped pages import it is
+         * read-only (`allowed`, `configured`, `reload_page_on_change`), and a
+         * page that called `Start()` on its own would receive the Prompt signal
+         * in its own frame and have to draw Cockpit's password dialog itself,
+         * which is exactly the thing this page must never do.
+         *
+         * So the banner names the one control that really escalates, and does
+         * not promise a second route that does not exist. An operator who
+         * followed the old sentence got a bare "access-denied" on the card and
+         * no way to tell a refusal from an un-asked question. */
         box.appendChild(el("p", null,
             "Administrative access is off in this Cockpit session, so admin-class safes " +
-            "cannot be opened yet. Turn it on with the “Administrative access” " +
-            "control in the Cockpit header — or just open one below and Cockpit will " +
-            "ask you for it."));
+            "cannot be opened yet. Turn it on with the “Limited access” control in the " +
+            "Cockpit header, then open the safe here."));
+        box.appendChild(el("p", "sec-subtle",
+            "Cockpit only asks for a password from that control. Opening an admin-class " +
+            "safe from this page while access is off is refused straight away, without a " +
+            "prompt — nothing is wrong when that happens, and nothing has been sent."));
         return box;
     }
 
@@ -2310,15 +2921,39 @@
          * verb, from the kernel's idea of who is calling (I3). */
         callOnce("list", {}, false).then(function (res) {
             SAFES = (res && res.safes) || [];
+            /* REFRESH MEANS RE-READ. probeSafe() now declines to re-ask a safe
+             * that already holds an answer good at the current privilege level
+             * — which is what stops the permission listener from firing a
+             * second round of probes — so the caches have to be emptied here or
+             * pressing Refresh would redraw the same stale card. Nothing is
+             * lost by it: an admin-class probe is only re-asked when
+             * administrative access is already on, so this costs no extra
+             * Cockpit prompt. */
+            PROBES = {};
+            BREACH = {};
             renderSafes();
             /* Only now can health be asked usefully: whether to keep polling
              * it, and whether to ask escalated, are both decided from the
-             * registry rows that have just arrived. The first call is
-             * unconditional and unescalated — it is what makes the export
-             * confirm name the right directory, and it reports any hold the
-             * agent already has. */
-            refreshHealth(false);
-            SAFES.forEach(probeSafe);
+             * registry rows that have just arrived. The call is UNCONDITIONAL
+             * — it is what makes the export confirm name the right directory,
+             * and it reports any hold the agent already has — but its
+             * escalation is not.
+             *
+             * It used to be hard-coded to false, and that was the same
+             * privilege-level mistake as the one above wearing different
+             * clothes: the admin-class agent socket is
+             * /run/cockpit-secrets/<euid>/agent.sock, so an unescalated health
+             * call describes a socket that no admin-class hold ever uses. With
+             * an admin safe holding a ticket, the banner stayed empty until the
+             * next poll — up to fifteen seconds in which a safe was unlocked
+             * and this page said nothing, which is exactly what I18's "an
+             * unlocked safe must never be invisible" forbids.
+             *
+             * agentPollAdmin() is false unless an admin-class entry has opted
+             * into the agent AND Cockpit has already granted access, so this
+             * still never raises a prompt of its own. */
+            refreshHealth(agentPollAdmin());
+            SAFES.forEach(function (s) { probeSafe(s); });
         }).catch(function (e) {
             clear(host);
             host.appendChild(errNode(e));
@@ -2338,8 +2973,38 @@
          * class inside every verb, and that is what refuses. The test suite
          * drives the helper directly as a non-admin to prove it. */
         if (!safe) return false;
-        /* An ADMIN-class safe's usability cannot be read off this list AT ALL,
-         * and not merely while escalation is off.
+        /* THE WHOLE MATRIX, because the bug was one cell of it and the fix has
+         * to be right in all of them. `list` is spawned with no superuser
+         * option, ALWAYS, so the euid column is "whoever the Cockpit bridge is
+         * running as" and never "root because we escalated".
+         *
+         *  class  euid of list   admin access   list row      this returns
+         *  -----  -------------  ------------   -----------   -------------------
+         *  admin  the operator   off            usable:false  TRUE  — not a refusal:
+         *  admin  the operator   ON             usable:false          the row says nothing
+         *  admin  root (*)       either         usable:true   TRUE
+         *  user   the operator   either         usable:true   TRUE
+         *  user   the operator   either         usable:false  FALSE — authoritative
+         *  user   root (*)       either         usable:false  FALSE — also authoritative:
+         *                                                             the helper refuses a
+         *                                                             user safe when it is
+         *                                                             root, and this page
+         *                                                             has no way to be
+         *                                                             anything else
+         *  (*) only when the logged-on Cockpit user IS root.
+         *
+         * The two admin rows in the middle are the finding: they are the same
+         * row. Measured, same binary, same hermetic registry, same request,
+         * euid the only variable — `usable:false` at euid 1000 for an operator
+         * who IS in `sudo`, `usable:true` under `unshare --map-root-user`. The
+         * user-class rows invert it exactly: a user safe is usable:false to a
+         * root helper. In every case the verdict is a fact about the euid that
+         * asked, and it is authoritative precisely when that euid is the one
+         * the safe would actually be opened at — which is true for the user
+         * class and false for the admin class.
+         *
+         * An ADMIN-class safe's usability therefore cannot be read off this
+         * list AT ALL, and not merely while escalation is off.
          *
          * `list` is spawned without escalation, always. The helper's class gate
          * raises for an admin entry before it checks anything else, so the row
@@ -2358,14 +3023,31 @@
         return !(safe.locked && safe.reason);
     }
 
-    function probeSafe(safe) {
+    /* One probe, remembering the escalation it was asked at.
+     *
+     * `force` is the "Check this safe" button: it asks even while
+     * administrative access is off, because triggering Cockpit's own prompt is
+     * the entire point of that control. Everything else declines to probe an
+     * admin-class safe unescalated — a prompt per card on load is an
+     * interrogation, not a page. */
+    function probeSafe(safe, force) {
         if (!safeReachable(safe)) return;
-        if (isAdminClass(safe) && !adminAllowed()) return;   /* do not prompt N times on load */
-        callOnce("probe", { safe: safe.id }, isAdminClass(safe)).then(function (res) {
-            PROBES[safe.id] = res;
+        var admin = isAdminClass(safe);
+        if (admin && !adminAllowed() && !force) return;
+        var already = PROBES[safe.id];
+        if (already && !already._error && !staleForClass(already, safe) && !force) return;
+        callOnce("probe", { safe: safe.id }, admin).then(function (res) {
+            var out = res || {};
+            out._admin = admin;
+            PROBES[safe.id] = out;
             renderSafes();
         }).catch(function (e) {
-            PROBES[safe.id] = { _error: e };
+            /* A refusal is remembered WITH the level it was refused at, so a
+             * later escalation can tell "you were told no" from "you never
+             * asked properly". Without that stamp the page kept a
+             * cancelled-prompt error forever and hid the control that would
+             * have retried it. */
+            PROBES[safe.id] = { _error: e, _admin: admin };
             renderSafes();
         });
     }
@@ -2390,8 +3072,9 @@
          * list should read in the same order the registry defaults do. */
         var classes = [
             { key: "admin", label: "Administrator safes",
-              note: "The default class. Root-owned files; Cockpit asks for administrative " +
-                    "access, and the helper refuses the verb unless it is running as root." },
+              note: "The default class. Root-owned files; every verb is spawned with " +
+                    "Cockpit's administrative access, which has to be ON in this session " +
+                    "already, and the helper refuses the verb unless it is running as root." },
             { key: "user", label: "Your own safes",
               note: "Opened by the helper running as you, with no escalation at all. The file " +
                     "must be owned by you." }
@@ -2492,18 +3175,36 @@
         /* NOT gated on `reachable`. It used to be, and that was the bug: the
          * only state this button exists for is the one in which an unescalated
          * list reports an admin safe unusable, so the guard removed it exactly
-         * when it was needed. */
-        if (!p && pendingEscalation(safe))
-            acts.appendChild(btn("Check this safe", "", function () {
-                /* Deliberately triggers Cockpit's own administrative prompt. */
-                callOnce("probe", { safe: safe.id }, true).then(function (res) {
-                    PROBES[safe.id] = res;
-                    renderSafes();
-                }).catch(function (e) {
-                    PROBES[safe.id] = { _error: e };
-                    renderSafes();
-                });
-            }));
+         * when it was needed.
+         *
+         * Nor is it gated on there being no probe yet, which was the SAME bug
+         * one step further on. Cancelling Cockpit's prompt leaves an error in
+         * PROBES; an error is a probe; so the control that exists to raise that
+         * prompt disappeared the first time an operator dismissed it, and the
+         * permission listener would not re-probe either because the slot was
+         * occupied. The card was left with a refusal it could not retry.
+         *
+         * The rule now: an admin-class safe always has a way to ask again, and
+         * it says which of the two it is doing. */
+        if (isAdminClass(safe) && (!p || p._error)) {
+            var again = !!(p && p._error);
+            var chk = btn(again ? "Check again" : "Check this safe", "", function () {
+                /* Asks the helper, escalated, whether this safe can be opened
+                 * right now. It does NOT raise Cockpit's password dialog: no
+                 * page can (see escalationBanner). While administrative access
+                 * is off this answers "access-denied" and says where to turn it
+                 * on, which is a fact worth having and is why the control is
+                 * still drawn in that state. */
+                probeSafe(safe, true);
+            });
+            chk.title = adminAllowed()
+                ? "Opens nothing. Asks the helper, with this session's administrative " +
+                  "access, whether the safe is readable and what is in its header."
+                : "Opens nothing, and does not ask you for a password — Cockpit only does " +
+                  "that from the “Limited access” control in its header. This reports what " +
+                  "the helper says while administrative access is off.";
+            acts.appendChild(chk);
+        }
         card.appendChild(acts);
         /* The helper's own sentence, whenever it sent one. For a safe this
          * caller genuinely cannot reach it is the refusal; for an admin-class
@@ -2671,7 +3372,12 @@
 
     function unlockDialog(safe) {
         var probe = PROBES[safe.id];
-        if (probe && probe._error) probe = null;
+        /* A refusal is not a description of the file, and neither is an answer
+         * obtained below the privilege this safe's questions need. Both are
+         * dropped here rather than shaping the form: needsPassword() and
+         * needsKeyfile() fall back to the registry row, which says "yes, ask"
+         * — the restrictive answer and the point of the program. */
+        if (probe && (probe._error || staleForClass(probe, safe))) probe = null;
         var admin = isAdminClass(safe);
         var yk = yubikeyState(safe, probe);
         var ykField = yubikeyField();
@@ -2680,8 +3386,14 @@
         modal("Unlock " + (safe.label || safe.id), function (box, m) {
             var intro = el("p", "sec-modal-intro");
             intro.textContent = admin
-                ? "Administrator safe. Cockpit will ask for administrative access if it is " +
-                  "not already on, and the helper refuses this verb unless it is running as root."
+                ? (adminAllowed()
+                    ? "Administrator safe. This session already has Cockpit's administrative " +
+                      "access, so the unlock is spawned with it; the helper refuses this verb " +
+                      "unless it is running as root."
+                    : "Administrator safe, and administrative access is OFF in this Cockpit " +
+                      "session. Turn it on with the “Limited access” control in the Cockpit " +
+                      "header first — from here the unlock is refused straight away, without " +
+                      "a prompt, and the helper refuses this verb unless it is running as root.")
                 : "Your own safe. The helper runs as you, with no escalation.";
             box.appendChild(intro);
 
@@ -3463,10 +4175,25 @@
         clear(host);
         host.appendChild(el("h3", null, txt(row.title) || "(untitled)"));
 
-        /* Metadata the helper already sent. No value is in here by contract. */
+        /* Metadata the helper already sent. No value is in here by contract.
+         *
+         * The custom-field keys are skipped here and get their own section
+         * below, and that is a defence as well as a layout choice. This loop
+         * prints whatever the helper sent, and a row that carried
+         * `[{name, value}]` would print the value as data — no mask, no
+         * countdown, no re-hide, which is exactly what I17 exists to stop.
+         * Below, the same list is drawn by NAME with a reveal control beside
+         * each one, so the only way to see a custom value is still the audited
+         * `reveal` call every other value goes through. */
         var dl = el("dl", "sec-kv");
         Object.keys(row).forEach(function (k) {
             if (k === "title" || k === "uuid") return;
+            if (CUSTOM_ROW_KEYS[k]) return;
+            /* This page's own bookkeeping, parked on the row object because
+             * that is the thing loadEntries() replaces: the attach-list reply,
+             * whether it has been asked for, and the last error. None of it
+             * came from the helper, and this panel is "what the helper said". */
+            if (k.charAt(0) === "_" || k === "attachment_names") return;
             dl.appendChild(el("dt", null, k.replace(/_/g, " ")));
             var dd = el("dd");
             var v = row[k];
@@ -3515,23 +4242,35 @@
             /* Custom fields. The reveal pattern the helper publishes accepts
              * "custom:<name>", so a row that names its custom fields gets a
              * control each; one that does not gets an explicit way to ask. */
-            var custom = row.custom_fields || row.custom || row.fields;
-            if (Array.isArray(custom) && custom.length) {
+            var custom = customFieldRows(row);
+            if (custom.length) {
                 host.appendChild(el("h4", null, "Custom fields"));
-                custom.forEach(function (cname) {
-                    host.appendChild(revealWidget({
-                        label: String(cname),
+                custom.forEach(function (cf) {
+                    var w = revealWidget({
+                        label: cf.name,
                         fetch: function () {
                             return SESSION.call("reveal",
-                                { uuid: row.uuid, field: "custom:" + String(cname) });
+                                { uuid: row.uuid, field: "custom:" + cf.name });
                         }
-                    }));
+                    });
+                    /* Protected / not protected is a fact about how the FILE
+                     * stores the value, and it is the difference between a
+                     * field an export carries in the clear and one it does
+                     * not. It is metadata, so it is shown; the value still is
+                     * not. revealWidget() returns its node directly, so the
+                     * badge goes into that node's own head row. */
+                    var cfHead = w.querySelector(".sec-reveal-head");
+                    if (cfHead && cf.protected === true)
+                        cfHead.insertBefore(badge("protected", "ok"), cfHead.lastChild);
+                    else if (cfHead && cf.protected === false)
+                        cfHead.insertBefore(badge("not protected", "warn"), cfHead.lastChild);
+                    host.appendChild(w);
                 });
-            } else if (revealFields().length) {
+            }
+            if (revealFields().length)
                 host.appendChild(btn("Reveal a custom field…", "tiny", function () {
                     customFieldDialog(row);
                 }));
-            }
         }
 
         /* --- TOTP: as sensitive as a password, so the same countdown --- */
@@ -3574,6 +4313,58 @@
             }));
         });
         host.appendChild(acts);
+    }
+
+    /* The keys an entries[] row might use to name its custom fields.
+     *
+     * docs/CONTRACT.md pins the row's other keys but not this one, so — the
+     * same rule as attachments — several spellings are accepted and none is
+     * demanded. A row that uses none of them simply has no custom-field
+     * section, and the "Reveal a custom field…" dialog is the way in.
+     *
+     * These keys are also excluded from the raw metadata dump in renderDetail:
+     * see the comment there. */
+    var CUSTOM_ROW_KEYS = {
+        "custom": 1, "custom_fields": 1, "customFields": 1, "custom_strings": 1,
+        "customStrings": 1, "custom_field_names": 1, "strings": 1, "attributes": 1
+    };
+
+    /* One entry's custom fields as [{name, protected}] — NEVER a value.
+     *
+     * `entries()` publishes names and never values, by contract, and this
+     * function keeps that true whatever shape the helper chose: a bare list of
+     * names, a list of {name, protected} objects, or a map. If a row ever did
+     * arrive carrying values, the value is dropped HERE rather than rendered:
+     * a custom value reaches the screen through `reveal`, with its countdown
+     * and its audit line, or it does not reach the screen. */
+    function customFieldRows(row) {
+        var raw = null;
+        Object.keys(CUSTOM_ROW_KEYS).forEach(function (k) {
+            if (raw === null && row && row[k] !== undefined && row[k] !== null) raw = row[k];
+        });
+        if (raw === null) return [];
+        var out = [];
+        function push(name, prot) {
+            var n = String(name === undefined || name === null ? "" : name);
+            if (!n || n === "undefined") return;
+            out.push({ name: n, protected: (prot === true || prot === false) ? prot : undefined });
+        }
+        if (Array.isArray(raw)) {
+            raw.forEach(function (c) {
+                if (c && typeof c === "object")
+                    push(c.name !== undefined ? c.name : c.key,
+                         c.protected !== undefined ? c.protected : c.is_protected);
+                else push(c, undefined);
+            });
+        } else if (typeof raw === "object") {
+            Object.keys(raw).forEach(function (n) {
+                var v = raw[n];
+                push(n, (v && typeof v === "object")
+                        ? (v.protected !== undefined ? v.protected : v.is_protected)
+                        : undefined);
+            });
+        }
+        return out;
     }
 
     /* A custom field is reached by name through the same single door: the
@@ -3631,8 +4422,11 @@
      * names are not available rather than inventing them. */
     function attachmentRows(row) {
         var raw = row.attachments;
+        /* `attachment_names` is where an attach-list reply is parked: the
+         * listing row's own `attachments` is the helper's and is not
+         * overwritten, so a re-listing that fails leaves the count intact. */
         var named = Array.isArray(row.attachment_names) ? row.attachment_names : null;
-        if (Array.isArray(raw)) named = raw;
+        if (!named && Array.isArray(raw)) named = raw;
         if (!named) {
             var n = Number(raw);
             return { known: false, count: isFinite(n) && n > 0 ? n : 0, rows: [] };
@@ -3644,6 +4438,65 @@
             return { name: String(a), bytes: undefined };
         }).filter(function (a) { return a.name && a.name !== "undefined"; });
         return { known: true, count: out.length, rows: out };
+    }
+
+    /* Whatever the attach-list verb answered, as [{name, size}].
+     *
+     * The Backend ABC pins the backend method's return — a list of
+     * {name, size}, in the order the file stores them, and NO bytes — but the
+     * verb is free to wrap it in whichever key it likes, so the wrappers a
+     * reasonable helper might choose are all unwrapped and none is demanded.
+     * A reply carrying bytes is not a shape this page renders: `b64` is
+     * `attach-get`'s answer, and it is dropped here rather than passed on. */
+    function attachListRows(res) {
+        var raw = null;
+        if (Array.isArray(res)) raw = res;
+        else if (res && typeof res === "object")
+            ["attachments", "names", "files", "rows", "entries", "list"]
+                .forEach(function (k) {
+                    if (raw === null && Array.isArray(res[k])) raw = res[k];
+                });
+        if (!Array.isArray(raw)) return null;
+        return raw.map(function (a) {
+            if (a && typeof a === "object")
+                return { name: String(a.name === undefined ? a.filename : a.name),
+                         size: (a.size !== undefined ? a.size : a.bytes) };
+            return { name: String(a), size: undefined };
+        }).filter(function (a) { return a.name && a.name !== "undefined"; });
+    }
+
+    /* Ask the helper for this entry's attachment names.
+     *
+     * `entries()` reports `attachments` as a COUNT on purpose — a listing must
+     * show that an entry HAS attachments without shipping them — and
+     * `attach-get` takes a NAME. Those two together leave a file that can be
+     * uploaded and never fetched again, which is the gap this verb closes, so
+     * the page asks for the names ONCE per selected entry rather than making
+     * the operator find a button first. It is metadata: names and sizes, no
+     * bytes, one audited call.
+     *
+     * `_attachAsked` is per ROW OBJECT, and loadEntries() replaces those
+     * objects wholesale, so a refresh re-asks. That is deliberate: a cached
+     * name list that survived an attach-add would be a list missing the file
+     * that was just added. */
+    function fetchAttachmentNames(row, onDone) {
+        var lister = verbFor("attachList");
+        if (!lister || !SESSION) { if (onDone) onDone(null); return; }
+        SESSION.call(lister, { uuid: row.uuid }).then(function (res) {
+            var rows = attachListRows(res);
+            if (rows) row.attachment_names = rows;
+            row._attachError = null;
+            if (onDone) onDone(rows);
+            /* Only redraw the pane if this entry is still the selected one:
+             * an answer that arrives after the operator has moved on must not
+             * yank the pane back to the previous entry. */
+            if (BROWSE && BROWSE.selected === row.uuid) renderDetail(row);
+        }).catch(function (e) {
+            row._attachError = e;
+            if (onDone) onDone(null);
+            if (BROWSE && BROWSE.selected === row.uuid) renderDetail(row);
+            handleSessionError(e);
+        });
     }
 
     /* The cap the helper publishes for one attachment, read off whichever
@@ -3685,29 +4538,35 @@
         var adder = verbFor("attachAdd");
         var remover = verbFor("attachRm");
         var lister = verbFor("attachList");
-        if (!info.count && !adder && !hasVerb("attach-get")) return;
+        if (!info.count && !adder && !lister && !hasVerb("attach-get")) return;
 
         host.appendChild(el("h4", null, "Attachments"));
+
+        /* The last attempt at the listing, if it failed. Shown rather than
+         * swallowed: "this entry has three attachments and here is why you
+         * cannot see what they are called" is an operator's problem to solve,
+         * and a silent empty list looks like an entry with no files. */
+        if (row._attachError) host.appendChild(errNode(row._attachError));
 
         if (!info.count && info.known) {
             host.appendChild(el("p", "sec-subtle", "None."));
         } else if (!info.known && info.count) {
-            /* A count with no names. Ask the helper for the names if it offers
-             * a verb for them; otherwise say plainly that a download needs a
-             * name this helper does not provide, rather than guessing one. */
+            /* A count with no names. The listing verb is what turns that into
+             * something addressable — `attach-get` takes a NAME and a count is
+             * not one — so it is asked automatically, once, the first time this
+             * entry is drawn. Without it a file can be uploaded and never
+             * fetched again from a page that never learned what it is called.
+             *
+             * When the helper publishes no such verb, say so plainly rather
+             * than guessing a name. */
             host.appendChild(el("p", "sec-subtle",
                 info.count + " attachment(s) on this entry."));
             if (lister) {
-                host.appendChild(btn("List them", "tiny", function () {
-                    SESSION.call(lister, { uuid: row.uuid }).then(function (res) {
-                        row.attachment_names =
-                            res.names || res.attachments || res.files || [];
-                        renderDetail(row);
-                    }).catch(function (e) {
-                        alertBox(errNode(e));
-                        handleSessionError(e);
-                    });
-                }));
+                if (!row._attachAsked && !row._attachError) {
+                    row._attachAsked = true;
+                    host.appendChild(el("p", "sec-subtle", "Asking the helper for their names…"));
+                    fetchAttachmentNames(row);
+                }
             } else {
                 host.appendChild(el("p", "sec-subtle",
                     "Downloading one needs its name, and this helper publishes no verb that " +
@@ -3741,6 +4600,25 @@
                 panel.appendChild(line);
             });
             host.appendChild(panel);
+        }
+
+        /* The listing on demand, whatever state the section is in.
+         *
+         * It is drawn even when the names are already known, because "known"
+         * only means "known as of the last entries call". An upload made from
+         * another Cockpit tab, or a name list this page fetched before an
+         * attach-rm, is stale in the direction that matters: the operator
+         * presses Download on a file that is no longer there. One button, one
+         * label, whether it is the first listing or the fourth. */
+        if (lister) {
+            host.appendChild(btn("List attachments", "tiny", function () {
+                row._attachAsked = true;
+                row._attachError = null;
+                fetchAttachmentNames(row);
+            }));
+            host.appendChild(el("div", "hint",
+                "Names and sizes only — the bytes come back one file at a time through " +
+                "Download, which is a separate audited call."));
         }
 
         if (adder && BROWSE.writable) {
@@ -4113,6 +4991,34 @@
         return s ? isAdminClass(s) : false;
     }
 
+    /* The safe a request is actually about, as opposed to the one the page knew
+     * about when it opened the dialog.
+     *
+     * Same family of bug as the escalation one: a decision taken at one moment
+     * and reused at another where it is no longer the same question. A generic
+     * dialog for a safe-scoped verb draws the `safe` control from
+     * `options_from: "list.safes"` and the operator picks the safe INSIDE it —
+     * so an escalation decided when the dialog opened was decided before there
+     * was a safe to decide about. Deciding it from the request, at submit time,
+     * is deciding it from the thing that is actually being asked.
+     *
+     * Getting it wrong costs an access-denied that reads as "you are not
+     * allowed" when the truth is "you were never asked for administrative
+     * access" — which is precisely the sentence the escalation bug put on every
+     * admin card. */
+    function safeForRequest(req, presets, opts) {
+        if (opts && opts.safe) return opts.safe;
+        var id = (req && req.safe) || (presets && presets.safe);
+        var known = id ? safeSpecById(String(id)) : null;
+        if (known) return known;
+        /* An id the list does not know is still an id, and a registry entry
+         * with no `access` key is admin (I1) — so an unknown one is treated as
+         * admin rather than as user. Guessing the permissive class is the
+         * mistake this file refuses everywhere. */
+        if (id) return { id: String(id), access: "admin" };
+        return null;
+    }
+
     /* The fields the open session already supplies, so no form should ask for
      * them again: the handle, and everything the `unlock` request carries.
      *
@@ -4260,10 +5166,15 @@
                 form.applySecrets(bag);
                 if (env) req[env] = bag;
 
+                /* Escalation from the safe THIS REQUEST names — see
+                 * safeForRequest(). opts.safe still wins when the caller named
+                 * one, because export and restore are reached from the list
+                 * with nothing open and know exactly which safe they mean. */
                 var p = needsSession(name)
                     ? (SESSION ? SESSION.call(name, req)
                                : Promise.reject(mkErr("access-denied", "The safe is locked.")))
-                    : callOnce(name, req, adminForVerb(name, opts.safe), argv);
+                    : callOnce(name, req,
+                               adminForVerb(name, safeForRequest(req, presets, opts)), argv);
 
                 p.then(function (res) {
                     /* Drop every reference to whatever we just sent. */
@@ -4457,8 +5368,25 @@
                         } else req[specName(c.spec)] = v;
                     });
                     if (bad) { out.appendChild(errNode(bad)); return; }
-                    callOnce("audit-tail", req, adminAllowed(), argv).then(function (res) {
+                    /* WHICH LOG THIS IS. Measured: audit-tail answers from the
+                     * caller's own log, so the same verb run as the operator
+                     * and as root returns two different files — and a page that
+                     * printed either without saying which would let an operator
+                     * conclude "nothing has been done to this safe" from a log
+                     * that simply is not the one the admin verbs write to.
+                     *
+                     * The escalation is read at the moment of the call, never
+                     * cached: adminAllowed() is Cockpit's current answer. */
+                    var asRoot = adminAllowed();
+                    callOnce("audit-tail", req, asRoot, argv).then(function (res) {
                         clear(out);
+                        out.appendChild(el("div", "sec-alert info", asRoot
+                            ? "Read with administrative access, so this is the log the " +
+                              "root helper writes — the one admin-class safes are audited to."
+                            : "Read as you, with no escalation, so this is your own log. " +
+                              "Admin-class safes are audited by the root helper into a " +
+                              "different one; turn on Cockpit's Administrative access to " +
+                              "see that instead."));
                         renderAnyResult(out, res);
                     }).catch(function (e) {
                         clear(out);
@@ -4805,6 +5733,7 @@
         if (!hasVerb("health")) { renderAgentBanner(); return Promise.resolve(); }
         return callOnce("health", {}, !!escalate).then(function (res) {
             HEALTH = res || null;
+            HEALTH_ADMIN = !!escalate;
             var got = agentRowsFromHealth(res);
             AGENT.failed = got.faults.length ? got.faults : null;
             /* The daemon's answer replaces this page's guesses outright. A row
@@ -5016,6 +5945,12 @@
     function exportTarget(safe) {
         var spec = verbSpec(verbFor("export")) || {};
         var probe = PROBES[safe && safe.id] || {};
+        /* A refusal is not a description of the file, and an answer obtained
+         * below the privilege this safe needs is not one either. Either way
+         * there is nothing in it to name a destination with, and the confirm
+         * must name the real place or say it does not know — never a plausible
+         * one (I21). */
+        if (probe._error || staleForClass(probe, safe)) probe = {};
         var consts = (SCHEMA && SCHEMA.constants) || {};
         /* `health.export.enabled_safes` carries the directory THIS safe would be
          * written to, which is the accurate answer whenever a registry entry
@@ -5468,17 +6403,36 @@
 
         PERM = cockpit.permission({ admin: true });
         PERM.addEventListener("changed", function () {
-            if (SESSION) return;
-            renderSafes();
-            /* Administrative access has just come on. The admin-class safes
-             * were deliberately not probed while it was off — one Cockpit
-             * prompt per card on load is an interrogation, not a page — so this
-             * is the first moment they can be, and without it an operator who
-             * escalates from Cockpit's own header watches the cards stay blank
-             * until they think to press Refresh. Only the ones not already
-             * probed, because this event can fire more than once. */
-            if (adminAllowed())
-                SAFES.forEach(function (s) { if (!PROBES[s.id]) probeSafe(s); });
+            /* THE ONE MOMENT THE PRIVILEGE LEVEL CHANGES UNDER A DRAWN PAGE.
+             *
+             * Everything this page cached from the helper was cached at some
+             * privilege level, and this event is where those levels stop
+             * matching. So the stale ones go first and the re-asking happens
+             * second — in that order, because probeSafe() declines to re-ask a
+             * safe that already has an answer, and the whole failure this
+             * closes was an answer that should not have counted as one.
+             *
+             * It runs even while a safe is open: SESSION only means the browse
+             * view is on screen, and the safe list underneath it, the agent
+             * banner above it and the breach control inside its dialogs are all
+             * still reading these caches. Only the re-render of the list is
+             * skipped while it is not the visible view. */
+            var dropped = dropStaleForEscalation();
+            if (!SESSION) renderSafes();
+            if (adminAllowed()) {
+                /* Administrative access has just come on. The admin-class safes
+                 * were deliberately not probed while it was off — one Cockpit
+                 * prompt per card on load is an interrogation, not a page — so
+                 * this is the first moment they can be, and without it an
+                 * operator who escalates from Cockpit's own header watches the
+                 * cards stay blank until they think to press Refresh.
+                 * probeSafe() skips the ones that already hold an answer good
+                 * at this level, so firing more than once is harmless. */
+                SAFES.forEach(function (s) { probeSafe(s); });
+                /* And the agent: an admin-class hold is only visible to an
+                 * escalated health call (I18). */
+                if (dropped || HEALTH === null) refreshAgent();
+            }
         });
 
         /* The schema is fetched first and everything else waits for it: this

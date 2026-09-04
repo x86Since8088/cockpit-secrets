@@ -145,6 +145,43 @@ async function main() {
         const html = fs.readFileSync(path.join(H.SRC, "index.html"), "utf8");
         ok(!/<style[\s>]/.test(html) && !/<script(?![^>]*\bsrc=)/.test(html),
            "index.html has no inline <style> or <script> (I9)");
+        /* The inline STYLE ATTRIBUTE, which is a different thing from the
+         * CSSOM. Under this package's policy — measured on the live host,
+         * `default-src 'self'` with no `style-src` and no `'unsafe-inline'`
+         * (tests/browser/artifacts/01-csp-header.txt) — a `style="…"` attribute
+         * in markup, and setAttribute("style", …) which produces one, are
+         * blocked. Assigning `node.style.width` is NOT: CSP governs the parsing
+         * of style attributes and stylesheets, and explicitly does not restrict
+         * the CSSOM. The countdown bar and the tree indent do the second, which
+         * is why they work under a policy that would refuse the first. */
+        ok(!/\bstyle\s*=\s*["']/.test(html) && !/setAttribute\(\s*["']style["']/.test(js),
+           "no inline style ATTRIBUTE in the markup or written from script (I9)");
+        {
+            /* Motion is opt-in. Every transition and animation in the sheet has
+             * to sit inside a `prefers-reduced-motion: no-preference` block, or
+             * a countdown animates for somebody who asked it not to. Checked as
+             * a source invariant because a new rule is exactly where it gets
+             * forgotten. */
+            const css = fs.readFileSync(path.join(H.SRC, "secrets.css"), "utf8");
+            const guarded = [];
+            css.replace(/@media\s*\(\s*prefers-reduced-motion:\s*no-preference\s*\)\s*\{/g,
+                (m, at) => {
+                    /* Take the block by brace balance from the opening brace. */
+                    let depth = 0, i = at + m.length - 1;
+                    for (; i < css.length; i++) {
+                        if (css[i] === "{") depth++;
+                        else if (css[i] === "}") { depth--; if (!depth) break; }
+                    }
+                    guarded.push(css.slice(at, i + 1));
+                    return m;
+                });
+            const inGuard = guarded.join("\n");
+            const all = (css.match(/^\s*[^@\n]*\b(transition|animation)\s*:/gm) || []);
+            const loose = all.filter((line) => inGuard.indexOf(line.trim()) < 0);
+            ok(loose.length === 0,
+               `every transition/animation is behind prefers-reduced-motion ` +
+               `(${all.length} found${loose.length ? ", loose: " + loose.join(" | ") : ""})`);
+        }
 
         /* ============================================ schema coverage ===== */
         head("Schema coverage — the page must draw everything the helper declares");
@@ -215,6 +252,7 @@ async function main() {
                 "reveal": "Reveal",
                 "totp": "Reveal",
                 "attach-get": "Download",
+                "attach-list": "List attachments",
                 "add": "Add entry…",
                 "edit": "Edit entry",
                 "move": "Move entry",
@@ -1125,6 +1163,631 @@ async function main() {
         }
 
         /* ============================================ accessibility ======= */
+        /* ============================================ custom fields ======= */
+        /* The `custom` sub-field on add/edit. The helper describes it as a MAP:
+         * `control: "json"`, `type: "object"`, a `key` descriptor for the field
+         * name and element `fields` for {value, protected}. A page that took
+         * "json" literally would hand the operator a textarea and ask them to
+         * type
+         *     {"API token": {"value": "…", "protected": true}}
+         * by hand — which renders the descriptor's letters and none of its
+         * meaning. These assertions are what stop that regressing. */
+        head("Custom fields — the keyed map is drawn as rows, not as JSON");
+        {
+            const custom = schema.fields
+                .filter((f) => f.id === "entry" || f.id === "changes")
+                .map((f) => (f.fields || []).filter((x) => x.id === "custom")[0])
+                .filter(Boolean);
+            ok(custom.length === 2,
+               `the schema declares a custom sub-field on both entry and changes (${custom.length})`);
+            const cf = custom[0] || {};
+            ok(!!(cf.key && cf.key.id) && Array.isArray(cf.fields) && cf.fields.length >= 2,
+               "it declares a key descriptor and its element fields, which is what makes it " +
+               "a row list rather than free JSON");
+
+            const s = scen();
+            s.responses.add = { uuid: "e2", saved: false };
+            const page = await bootToSafes(browser, s);
+            await unlockFirst(page, "lab-dc");
+            await page.click('#sec-browse-tools button:text-is("Add entry…")');
+            await page.waitForSelector(".sec-modal .sec-rows");
+
+            const legends = await page.$$eval(".sec-modal .sec-rows legend",
+                                              (n) => n.map((x) => x.textContent));
+            ok(legends.some((l) => /custom/i.test(l)),
+               `the custom field is a fieldset with its own legend (${legends.join(" | ")})`);
+            /* The failure this replaces: a bare textarea holding JSON. */
+            const jsonBoxes = await page.$$eval(".sec-modal textarea",
+                (n) => n.map((x) => (x.getAttribute("placeholder") || "")));
+            ok(!jsonBoxes.some((p) => /\{.*value.*\}/.test(p)),
+               "no textarea is offered with the map's JSON as its placeholder");
+
+            ok((await page.$$(".sec-modal .sec-row")).length === 1,
+               "it starts with exactly one empty row, so the shape is visible");
+            const rowLabels = await page.$$eval(".sec-modal .sec-row label",
+                (n) => n.map((x) => x.textContent.split(/[A-Z(]/)[0].trim() || x.textContent.trim()));
+            ok((await page.$$(".sec-modal .sec-row input[type=text]")).length === 1 &&
+               (await page.$$(".sec-modal .sec-row input[type=password]")).length === 1 &&
+               (await page.$$(".sec-modal .sec-row input[type=checkbox]")).length === 1,
+               `a row is a name, a value and a flag (${rowLabels.join(", ")})`);
+            ok(await page.$eval(".sec-modal .sec-row input[type=checkbox]", (n) => n.checked),
+               "the protected flag starts ON, which is the schema's declared default");
+            /* The value box is a password box, so a custom value is not on
+             * screen in the clear while it is being typed (I17). */
+            ok(await page.$eval(".sec-modal .sec-row input[type=password]",
+                                (n) => n.getAttribute("autocomplete") === "off"),
+               "the value box is a password control with autofill off (I11)");
+
+            await page.click('.sec-modal .sec-rows > button:text-is("Add a field")');
+            ok((await page.$$(".sec-modal .sec-row")).length === 2, "Add a field adds a row");
+            await page.click('.sec-modal .sec-row:nth-child(2) button:text-is("Remove")');
+            ok((await page.$$(".sec-modal .sec-row")).length === 1, "Remove takes one away");
+            /* Removing must not strand focus on a detached node. */
+            ok(await page.evaluate(() => document.activeElement &&
+                                         document.activeElement.closest(".sec-modal") !== null),
+               "focus is still inside the dialog after a row is removed");
+
+            /* The entry's own required fields first: buildForm.validate()
+             * reports the FIRST failure it finds, and an empty Title would
+             * mask everything below it. */
+            await page.fill('.sec-modal .sec-field:has(> label:text-matches("^Title")) input',
+                            "New entry");
+
+            /* A row with a value and no name is refused, not silently dropped:
+             * dropping it would throw away something the operator typed. */
+            await page.fill(".sec-modal .sec-row input[type=password]", "orphan");
+            await page.click('.sec-modal button:text-is("Run")');
+            let err = await page.textContent(".sec-modal .sec-alert.err");
+            ok(/required on every row/i.test(err),
+               `a value with no name is refused (${(err || "").trim().slice(0, 60)})`);
+
+            /* A reserved name is refused by the schema's own pattern. */
+            await page.fill(".sec-modal .sec-row input[type=text]", "Password");
+            await page.click('.sec-modal button:text-is("Run")');
+            const fieldErr = await page.$$eval(".sec-modal .sec-row .err",
+                                               (n) => n.map((x) => x.textContent).join(" "));
+            ok(/required form|refus/i.test(fieldErr),
+               `a KeePass-reserved custom name is refused by the schema's pattern ` +
+               `(${fieldErr.trim().slice(0, 60)})`);
+
+            /* Two rows with the same name are one field in the file. */
+            await page.fill(".sec-modal .sec-row input[type=text]", "API token");
+            await page.click('.sec-modal .sec-rows > button:text-is("Add a field")');
+            await page.fill(".sec-modal .sec-row:nth-child(2) input[type=text]", "API token");
+            await page.fill(".sec-modal .sec-row:nth-child(2) input[type=password]", "dup");
+            await page.click('.sec-modal button:text-is("Run")');
+            err = await page.textContent(".sec-modal .sec-alert.err");
+            ok(/appears twice/i.test(err),
+               `a duplicate custom name is refused and named (${(err || "").trim().slice(0, 50)})`);
+
+            /* Now a legal pair, and the wire shape. */
+            await page.fill(".sec-modal .sec-row:nth-child(2) input[type=text]", "Recovery code");
+            await page.uncheck(".sec-modal .sec-row:nth-child(2) input[type=checkbox]");
+            await page.click('.sec-modal button:text-is("Run")');
+            await page.waitForSelector(".sec-modal", { state: "detached", timeout: 5000 });
+
+            const body = await page.evaluate(() =>
+                window.__BODIES.filter((b) => b && b.verb === "add").pop());
+            ok(!!(body && body.entry && body.entry.custom),
+               "the add request carries entry.custom");
+            const map = (body && body.entry && body.entry.custom) || {};
+            ok(!Array.isArray(map) && typeof map === "object",
+               "it is a MAP keyed by the field name, which is the shape the schema declared");
+            ok(Object.keys(map).sort().join("|") === "API token|Recovery code",
+               `both rows are there, keyed by name (${Object.keys(map).join(", ")})`);
+            ok(map["API token"] && map["API token"].value === "orphan" &&
+               map["API token"].protected === true,
+               "a row carries its value and its protected flag");
+            ok(map["Recovery code"] && map["Recovery code"].protected === false,
+               "unticking the flag is sent as false, not omitted");
+
+            /* Where it went, and where it did NOT go. */
+            const argv = await page.evaluate(() =>
+                window.__CALLS.map((c) => c.argv.join(" ")).join("  "));
+            ok(!/orphan|dup/.test(argv),
+               "no custom value reached a command line (I10)");
+            const stored = await page.evaluate(() => {
+                let ls = "", ss = "";
+                try { ls = JSON.stringify(window.localStorage); } catch (e) { ls = ""; }
+                try { ss = JSON.stringify(window.sessionStorage); } catch (e) { ss = ""; }
+                return ls + ss + document.cookie;
+            });
+            ok(!/orphan|dup/.test(stored) && stored.replace(/[{}"]/g, "") === "",
+               "and nothing about it is in any browser storage area (I11)");
+            const dom = await page.content();
+            ok(!/orphan/.test(dom),
+               "the dialog was wiped on success — the value is not left in the DOM");
+            await page.close();
+        }
+        {
+            /* An untouched custom editor must send NOTHING. The seeded empty
+             * row is an affordance, not a change: a page that sent
+             * `custom: {"": {...}}` would create a nameless field in the safe
+             * every time somebody added an entry. */
+            const s = scen();
+            s.responses.add = { uuid: "e2", saved: false };
+            const page = await bootToSafes(browser, s);
+            await unlockFirst(page, "lab-dc");
+            await page.click('#sec-browse-tools button:text-is("Add entry…")');
+            await page.waitForSelector(".sec-modal .sec-rows");
+            await page.fill('.sec-modal .sec-field:has(> label:text-matches("^Title")) input',
+                            "Plain entry");
+            await page.click('.sec-modal button:text-is("Run")');
+            await page.waitForSelector(".sec-modal", { state: "detached", timeout: 5000 });
+            const body = await page.evaluate(() =>
+                window.__BODIES.filter((b) => b && b.verb === "add").pop());
+            ok(!!body && body.entry && body.entry.custom === undefined,
+               "an untouched row list sends no custom key at all");
+            ok(!!body && body.entry.title === "Plain entry",
+               "and the rest of the entry is unaffected");
+            await page.close();
+        }
+        {
+            /* The detail pane: custom fields are listed by NAME with a reveal
+             * control each, and the value is not on screen until the audited
+             * reveal call fetches it. */
+            const s = scen();
+            s.responses.entries = { total: 1, entries: [Object.assign({}, ENTRY, {
+                custom_fields: [{ name: "API token", protected: true },
+                                { name: "Ticket URL", protected: false }] })] };
+            s.responses.reveal = { field: "custom:API token", value: "tok-not-real",
+                                   expires_in: 15 };
+            const page = await bootToSafes(browser, s);
+            await unlockFirst(page, "lab-dc");
+            await page.click("#sec-entries .sec-btn.link");
+            await page.waitForSelector("#sec-detail h3");
+            const detail = await page.textContent("#sec-detail");
+            ok(/Custom fields/.test(detail) && /API token/.test(detail) &&
+               /Ticket URL/.test(detail),
+               "the entry's custom fields are listed by name");
+            ok(!/\[object Object\]/.test(detail),
+               "a list of {name, protected} objects is not printed as [object Object]");
+            ok(/protected/.test(detail) && /not protected/.test(detail),
+               "each one says whether the file stores it protected");
+            ok(!/custom fields\s*$/i.test(detail) && !/tok-not-real/.test(detail),
+               "no custom value is on screen before anything is revealed");
+            /* Internal bookkeeping this page parks on the row must not appear
+             * in a panel whose heading is "what the helper said". */
+            ok(!/attachAsked|attachment names|attachError/i.test(detail),
+               "the metadata panel prints the helper's keys and not this page's own");
+
+            const before = await page.evaluate(() => window.__BODIES.length);
+            await page.click('#sec-detail .sec-reveal:has(.sec-reveal-label:text-is("API token")) ' +
+                             'button:text-is("Reveal")');
+            await page.waitForSelector("#sec-detail .sec-value:not(.masked)", { timeout: 5000 });
+            const req = await page.evaluate((n) =>
+                window.__BODIES.slice(n).filter((b) => b && b.verb === "reveal").pop(), before);
+            ok(!!req && req.field === "custom:API token",
+               `revealing one goes through the single door as custom:<name> (${req && req.field})`);
+            ok(/tok-not-real/.test(await page.textContent("#sec-detail")),
+               "and only then is the value on screen");
+            await page.close();
+        }
+
+        /* ============================================ attach-list ========= */
+        head("The attachment list (attach-list) turns a count into a name");
+        {
+            /* entries() reports `attachments` as a COUNT on purpose. A count is
+             * not addressable and attach-get takes a NAME, so without this verb
+             * a file can be uploaded and never fetched again. */
+            const s = scen();
+            s.responses.entries = { total: 1, entries: [
+                Object.assign({}, ENTRY, { attachments: 2 })] };
+            s.responses["attach-list"] = { uuid: "e1", total: 2, attachments: [
+                { name: "runbook.md", size: 812 }, { name: "cert.pem", size: 1900 }] };
+            s.responses["attach-get"] = { name: "runbook.md", size: 12,
+                b64: Buffer.from("hello there\n").toString("base64") };
+            const page = await bootToSafes(browser, s);
+            await unlockFirst(page, "lab-dc");
+            await page.click("#sec-entries .sec-btn.link");
+            await page.waitForSelector("#sec-detail .sec-file-row", { timeout: 5000 });
+            const called = await page.evaluate(() =>
+                window.__BODIES.filter((b) => b && b.verb === "attach-list"));
+            ok(called.length === 1,
+               `a bare count makes the page ask for the names, once (${called.length})`);
+            ok(called[0] && called[0].uuid === "e1", "it asks about the selected entry");
+            const files = await page.$$eval("#sec-detail .sec-file-row",
+                                            (n) => n.map((x) => x.textContent));
+            ok(files.length === 2 && /runbook\.md/.test(files[0]) && /cert\.pem/.test(files[1]),
+               `both attachments are listed, in the order the file stores them ` +
+               `(${files.length})`);
+            ok(/812 bytes/.test(files[0]), "with the size attach-list reported");
+            ok((await page.$$('#sec-detail .sec-file-row button:text-is("Download")')).length === 2,
+               "each one can now be downloaded, which the count alone did not allow");
+
+            const dl = page.waitForEvent("download", { timeout: 5000 }).catch(() => null);
+            await page.click('#sec-detail .sec-file-row:nth-child(1) button:text-is("Download")');
+            const got = await dl;
+            ok(!!got && got.suggestedFilename() === "runbook.md",
+               "the name from attach-list is the name attach-get is asked for");
+
+            /* Asked once, not once per render. */
+            await page.click('#sec-detail button:text-is("List attachments")');
+            await page.waitForTimeout(300);
+            const again = await page.evaluate(() =>
+                window.__BODIES.filter((b) => b && b.verb === "attach-list").length);
+            ok(again === 2,
+               `the explicit control re-asks, and nothing else does (${again} calls total)`);
+            await page.close();
+        }
+        {
+            /* A name list fetched before a mutation is stale in the direction
+             * that matters: the operator presses Download on a file that is no
+             * longer there. loadEntries() replaces the row objects, so the
+             * "asked already" flag goes with them and the list is re-fetched. */
+            const s = scen();
+            s.responses.entries = { total: 1, entries: [
+                Object.assign({}, ENTRY, { attachments: 2 })] };
+            s.responses["attach-list"] = { __seq: [
+                { uuid: "e1", total: 2, attachments: [
+                    { name: "old.txt", size: 10 }, { name: "keep.txt", size: 20 }] },
+                { uuid: "e1", total: 1, attachments: [{ name: "keep.txt", size: 20 }] }
+            ] };
+            s.responses["attach-rm"] = { ok: true, name: "old.txt", saved: false };
+            const page = await bootToSafes(browser, s);
+            await unlockFirst(page, "lab-dc");
+            await page.click("#sec-entries .sec-btn.link");
+            await page.waitForSelector("#sec-detail .sec-file-row", { timeout: 5000 });
+            ok(/old\.txt/.test(await page.textContent("#sec-detail")),
+               "the first listing is on screen");
+            await page.click('#sec-detail .sec-file-row:nth-child(1) button:text-is("Remove")');
+            await page.waitForSelector('.sec-modal h2:has-text("Remove")');
+            await page.check(".sec-modal .sec-alert.warn input[type=checkbox]");
+            await page.click('.sec-modal button:text-is("Remove the attachment")');
+            await page.waitForSelector(".sec-modal", { state: "detached" });
+            await page.waitForFunction(
+                () => !/old\.txt/.test(document.querySelector("#sec-detail").textContent),
+                null, { timeout: 5000 })
+                .then(() => ok(true, "after a mutation the names are re-fetched, not reused"))
+                .catch(() => ok(false, "after a mutation the names are re-fetched, not reused"));
+            ok(/keep\.txt/.test(await page.textContent("#sec-detail")),
+               "and the file that survived is still listed");
+            await page.close();
+        }
+        {
+            /* A listing that fails must not look like an entry with no files. */
+            const s = scen();
+            s.responses.entries = { total: 1, entries: [
+                Object.assign({}, ENTRY, { attachments: 3 })] };
+            s.responses["attach-list"] = { error: "access-denied",
+                detail: "this safe is open read-only for this caller" };
+            const page = await bootToSafes(browser, s);
+            await unlockFirst(page, "lab-dc");
+            await page.click("#sec-entries .sec-btn.link");
+            await page.waitForSelector("#sec-detail h3");
+            await page.waitForTimeout(400);
+            const txt = await page.textContent("#sec-detail");
+            ok(/3 attachment/.test(txt),
+               "the count the helper gave is still shown when the names cannot be had");
+            ok(/read-only for this caller|Not permitted/.test(txt),
+               "and the helper's refusal is shown rather than swallowed");
+            ok((await page.$$('#sec-detail button:text-is("List attachments")')).length === 1,
+               "the control to try again is still there");
+            await page.close();
+        }
+
+        /* ======================================== escalation matrix ======= */
+        /* docs/LIVE-WALKTHROUGH.md item 9. The bug: an unescalated `list` says
+         * usable:false for EVERY admin-class safe whatever the operator's
+         * rights, because the process that asked was not root — measured, same
+         * binary, euid the only variable. Reading that as a refusal disabled
+         * the DEFAULT access class permanently, and gated the one control that
+         * could have fixed it on the same verdict.
+         *
+         * The cell that broke is the first one below. The other seven are here
+         * because a fix that is right in one cell and wrong in another is not a
+         * fix, and nothing in the suite covered any of them. */
+        head("Escalation — every (class, list verdict, administrative access) cell");
+        {
+            const ADM_REASON = "this safe is administrator-class; turn on Cockpit's " +
+                               "Administrative access and try again";
+            const USR_REASON = "this safe belongs to another user";
+            const matrix = [
+                { id: "adm-off",  access: "admin", usable: false, reason: ADM_REASON,
+                  admin: false, reachable: true, check: true,
+                  why: "admin class, access off — the cell that broke: not a refusal" },
+                { id: "adm-on",   access: "admin", usable: false, reason: ADM_REASON,
+                  admin: true,  reachable: true, check: false,
+                  why: "admin class, access ON — the SAME row; the list cannot say otherwise" },
+                { id: "adm-root", access: "admin", usable: true, reason: "",
+                  admin: true,  reachable: true, check: false,
+                  why: "admin class seen by a root bridge — usable:true, still reachable" },
+                { id: "adm-dflt", access: undefined, usable: false, reason: ADM_REASON,
+                  admin: false, reachable: true, check: true,
+                  why: "NO access key at all — admin by default (I1), so it must behave " +
+                       "exactly like adm-off" },
+                { id: "usr-ok",   access: "user", usable: true, reason: "",
+                  admin: true,  reachable: true, check: false,
+                  why: "user class the caller owns" },
+                { id: "usr-no",   access: "user", usable: false, reason: USR_REASON,
+                  admin: true,  reachable: false, check: false,
+                  why: "user class the caller genuinely may not have — here the list " +
+                       "verdict IS authoritative and must be obeyed" },
+                { id: "usr-noadm", access: "user", usable: false, reason: USR_REASON,
+                  admin: false, reachable: false, check: false,
+                  why: "…and turning administrative access off does not change that: " +
+                       "escalation is not the missing ingredient" },
+                { id: "old-plain", access: "user", usable: undefined, locked: true, reason: "",
+                  admin: true,  reachable: true, check: false,
+                  why: "an older helper that publishes locked+reason only: locked with no " +
+                       "reason is the NORMAL state of every safe here" },
+                { id: "old-deny", access: "user", usable: undefined, locked: true,
+                  reason: USR_REASON,
+                  admin: true,  reachable: false, check: false,
+                  why: "the same older shape, with a reason: that is the refusal" }
+            ];
+            for (const cell of matrix) {
+                const row = { id: cell.id, label: cell.id, format: "kdbx", mode: "rw",
+                              locked: cell.locked === undefined ? true : cell.locked,
+                              reason: cell.reason, password_required: true,
+                              needs_keyfile: false, agent_enabled: false,
+                              export_allowed: false };
+                if (cell.access !== undefined) row.access = cell.access;
+                if (cell.usable !== undefined) row.usable = cell.usable;
+                const s = scen();
+                s.admin = cell.admin;
+                s.responses.list = { safes: [row], registry_errors: 0 };
+                const page = await bootToSafes(browser, s);
+                const card = `.sec-safe:has(.sec-safe-id:text-is("${cell.id}"))`;
+                const unreachable = await page.$eval(card,
+                    (n) => n.classList.contains("unreachable"));
+                ok(unreachable === !cell.reachable,
+                   `${cell.id}: ${cell.reachable ? "reachable" : "NOT reachable"} — ${cell.why}`);
+                const disabled = await page.$eval(`${card} button:text-is("Unlock…")`,
+                                                  (n) => n.disabled);
+                ok(disabled === !cell.reachable,
+                   `${cell.id}: the Unlock control is ${cell.reachable ? "enabled" : "disabled"}`);
+                const hasCheck =
+                    (await page.$$(`${card} button:text-is("Check this safe")`)).length === 1;
+                ok(hasCheck === cell.check,
+                   `${cell.id}: “Check this safe” is ${cell.check ? "offered" : "not offered"}`);
+                if (cell.reason)
+                    ok(new RegExp(cell.reason.slice(0, 30).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+                            .test(await page.textContent(card)),
+                       `${cell.id}: the helper's own sentence is on the card either way`);
+                if (!cell.reachable)
+                    ok(await page.$eval(`${card} button:text-is("Unlock…")`,
+                                        (n) => (n.title || "").length > 0),
+                       `${cell.id}: the disabled control says why`);
+                await page.close();
+            }
+        }
+        {
+            /* The load-time probe policy, both directions. Probing an
+             * admin-class safe means asking Cockpit for administrative access,
+             * so it must not happen per card on load — and it must happen the
+             * moment access is already on, or the cards stay blank. */
+            const s = scen();
+            s.admin = false;
+            s.responses.list = { safes: baseSafes(), registry_errors: 0 };
+            const page = await bootToSafes(browser, s);
+            await page.waitForTimeout(300);
+            let probes = await page.evaluate(() =>
+                window.__CALLS.filter((c) => c.verb === "probe"));
+            ok(probes.length === 1 && probes[0].superuser === null,
+               `with access off, only the user-class safe is probed, unescalated ` +
+               `(${probes.length} probe call(s))`);
+            ok(/Administrative access is off/.test(await page.textContent("#sec-banners")),
+               "the escalation banner explains the situation");
+            await page.close();
+
+            /* …and only when something is actually waiting on it. */
+            const sUser = scen();
+            sUser.admin = false;
+            sUser.responses.list = { safes: [baseSafes()[1]], registry_errors: 0 };
+            const pUser = await bootToSafes(browser, sUser);
+            ok((await pUser.textContent("#sec-banners")).trim() === "",
+               "with no admin-class safe registered there is no escalation banner: a standing " +
+               "warning about a situation that does not exist teaches people to ignore them");
+            await pUser.close();
+
+            const s2 = scen();
+            s2.admin = true;
+            s2.responses.list = { safes: baseSafes(), registry_errors: 0 };
+            const page2 = await bootToSafes(browser, s2);
+            await page2.waitForTimeout(300);
+            probes = await page2.evaluate(() =>
+                window.__CALLS.filter((c) => c.verb === "probe"));
+            const admProbe = probes.filter((c) => c.superuser === "require");
+            const usrProbe = probes.filter((c) => c.superuser === null);
+            ok(admProbe.length === 1 && usrProbe.length === 1,
+               `with access on, each safe is probed at ITS OWN class ` +
+               `(${admProbe.length} escalated, ${usrProbe.length} not)`);
+            ok((await page2.textContent("#sec-banners")).trim() === "",
+               "and the escalation banner is gone");
+            await page2.close();
+        }
+
+        /* ==================================== privilege-level caching ===== */
+        /* The root cause, stated generally: an answer the helper gave at ONE
+         * privilege level, kept and reused as though it were the answer at
+         * ANOTHER. safeReachable was one instance. These are the others. */
+        head("No helper answer is reused at a privilege level it was not obtained at");
+        {
+            /* Cancelling Cockpit's prompt leaves an error in the probe cache.
+             * An error is a probe, so the control that raises that prompt used
+             * to disappear the first time it was dismissed — and the permission
+             * listener would not re-probe either, because the slot was full. */
+            const s = scen();
+            s.admin = false;
+            s.responses.list = { safes: [baseSafes()[0]], registry_errors: 0 };
+            s.responses.probe = { __seq: [
+                { error: "access-denied", detail: "administrative access was refused" },
+                { format: "kdbx", version: "4.1", kdf: "argon2id", iterations: 19,
+                  needs_password: true, needs_keyfile: false, writable: true, warnings: [] }
+            ] };
+            const page = await bootToSafes(browser, s);
+            const card = '.sec-safe:has(.sec-safe-id:text-is("lab-dc"))';
+            await page.click(`${card} button:text-is("Check this safe")`);
+            await page.waitForSelector(`${card} .sec-alert`, { timeout: 5000 });
+            ok(/administrative access was refused|Not permitted/
+                   .test(await page.textContent(card)),
+               "a refused escalation lands on the card where an operator can see it");
+            const retry = await page.$$(`${card} button:text-is("Check again")`);
+            ok(retry.length === 1,
+               "and the card still offers a way to ask again — it used to lose it forever");
+            ok((await page.$eval(`${card} button:text-is("Unlock…")`, (n) => n.disabled)) === false,
+               "the Unlock control was never disabled by the refusal either");
+
+            await retry[0].click();
+            await page.waitForSelector(`${card} .sec-safe-probe`, { timeout: 5000 });
+            const calls = await page.evaluate(() =>
+                window.__CALLS.filter((c) => c.verb === "probe"));
+            ok(calls.length === 2 && calls.every((c) => c.superuser === "require"),
+               `the retry really re-spawns the probe, escalated both times (${calls.length})`);
+            ok(/argon2id/.test(await page.textContent(card)),
+               "and the second answer replaces the first on the card");
+            ok((await page.$$(`${card} button:text-is("Check again")`)).length === 0,
+               "with a good probe in hand the retry control steps out of the way");
+            await page.close();
+        }
+        {
+            /* health carries the agent's holdings, and the admin-class agent
+             * socket is /run/cockpit-secrets/<euid>/agent.sock — measured. So
+             * an unescalated health call describes a socket no admin-class hold
+             * ever uses, and the FIRST call is the one that matters: a safe
+             * held unlocked must never be invisible, not even for one poll
+             * interval (I18). */
+            const withAgent = () => {
+                const rows = baseSafes();
+                rows[0].agent_enabled = true;
+                return { safes: rows, registry_errors: 0 };
+            };
+            const s = scen();
+            s.admin = true;
+            s.responses.list = withAgent();
+            const page = await bootToSafes(browser, s);
+            await page.waitForTimeout(300);
+            const first = await page.evaluate(() =>
+                window.__CALLS.filter((c) => c.verb === "health")[0]);
+            ok(first && first.superuser === "require",
+               "with an admin-class safe holding the agent open, the FIRST health call is " +
+               "escalated — it used to be hard-coded unescalated");
+            await page.close();
+
+            /* …and not otherwise, in either direction. */
+            const s2 = scen();
+            s2.admin = false;
+            s2.responses.list = withAgent();
+            const p2 = await bootToSafes(browser, s2);
+            await p2.waitForTimeout(300);
+            const h2 = await p2.evaluate(() =>
+                window.__CALLS.filter((c) => c.verb === "health"));
+            ok(h2.length && h2.every((c) => c.superuser === null),
+               "with administrative access off it stays unescalated: a background poll must " +
+               "never be the thing that throws a password prompt at somebody");
+            await p2.close();
+
+            const s3 = scen();
+            s3.admin = true;                       /* agent off for every safe: the default */
+            const p3 = await bootToSafes(browser, s3);
+            await p3.waitForTimeout(1600);
+            const h3 = await p3.evaluate(() =>
+                window.__CALLS.filter((c) => c.verb === "health"));
+            ok(h3.length === 1 && h3[0].superuser === null,
+               `in the default configuration health is asked once, unescalated, and never ` +
+               `polled again (${h3.length} call(s) after 1.6 s of a 1 s poll)`);
+            await p3.close();
+        }
+
+        {
+            /* The other side of "do not re-ask what you already know": Refresh
+             * has to mean RE-READ. probeSafe() now declines a safe that already
+             * holds an answer good at this privilege level, which is what stops
+             * the permission listener firing a second round of prompts — and it
+             * would just as happily have made the Refresh button redraw a stale
+             * card. */
+            const s = scen();
+            s.admin = true;
+            s.responses.list = { safes: [baseSafes()[1]], registry_errors: 0 };  /* user class */
+            s.responses.probe = { __seq: [
+                { format: "psafe3", version: "3.30", kdf: "sha256", iterations: 262144,
+                  needs_password: true, needs_keyfile: false, writable: true, warnings: [] },
+                { format: "psafe3", version: "3.30", kdf: "sha256", iterations: 999999,
+                  needs_password: true, needs_keyfile: false, writable: true, warnings: [] }
+            ] };
+            const page = await bootToSafes(browser, s);
+            await page.waitForSelector(".sec-safe-probe");
+            ok(/262144 iterations/.test(await page.textContent("#sec-safes")),
+               "the first probe is on the card");
+            await page.click("#sec-refresh");
+            await page.waitForFunction(
+                () => /999999/.test(document.querySelector("#sec-safes").textContent),
+                null, { timeout: 5000 })
+                .then(() => ok(true, "Refresh re-probes rather than redrawing the cached answer"))
+                .catch(() => ok(false, "Refresh re-probes rather than redrawing the cached answer"));
+            await page.close();
+        }
+        {
+            /* The same mistake one layer up: escalation decided when a dialog
+             * OPENED, for a safe the operator had not picked yet.
+             *
+             * A safe-scoped verb the page draws no purpose-built control for
+             * gets the generic dialog, whose `safe` control is filled from
+             * `options_from: "list.safes"`. Deciding the spawn shape before
+             * that control exists means deciding it with no safe — which came
+             * out unescalated, so choosing an admin-class safe inside the
+             * dialog produced "Not permitted" from the helper when the truth
+             * was that nobody had asked Cockpit for anything. */
+            const probe = JSON.parse(JSON.stringify(schema));
+            probe.verbs = probe.verbs.concat([{
+                id: "vacuum", group: "maintenance", title: "Vacuum",
+                help: "A safe-scoped verb this page draws no special control for.",
+                danger: false, mutates: false, needs: "safe", stdin: true,
+                session_only: false, request: ["safe"], response: { ok: "bool" },
+                confirm: null, audited: true, access: "class", breaks_when_wrong: null
+            }]);
+            for (const pick of [{ safe: "lab-dc", want: "require", cls: "admin-class" },
+                                { safe: "mine", want: null, cls: "user-class" }]) {
+                const s = scen();
+                s.responses.schema = probe;
+                s.responses.schema.constants.agent_poll_seconds = 1;
+                s.responses.vacuum = { ok: true };
+                const page = await bootToSafes(browser, s);
+                await page.click('#sec-safes button:text-is("Vacuum")');
+                await page.waitForSelector(".sec-modal select");
+                await page.selectOption(".sec-modal select", pick.safe);
+                await page.click('.sec-modal button:text-is("Run")');
+                await page.waitForSelector(".sec-modal", { state: "detached", timeout: 5000 });
+                const call = await page.evaluate(() =>
+                    window.__CALLS.filter((c) => c.verb === "vacuum").pop());
+                ok(!!call && call.superuser === pick.want,
+                   `a generic safe-scoped verb is spawned at the class of the safe CHOSEN ` +
+                   `inside the dialog (${pick.cls} → superuser ${JSON.stringify(call &&
+                       call.superuser)})`);
+                await page.close();
+            }
+        }
+        {
+            /* audit-tail answers from the CALLER'S log — measured: the same
+             * verb run as the operator and under `unshare --map-root-user`
+             * returns two different files. Printing either without saying which
+             * lets an operator read "nothing happened to this safe" off a log
+             * that is simply not the one the admin verbs write to. */
+            for (const admin of [true, false]) {
+                const s = scen();
+                s.admin = admin;
+                s.responses["audit-tail"] = { entries: [
+                    { ts: "2026-09-04T09:05:41Z", verb: "list", safe: null, uid: 1000,
+                      outcome: "ok" }], path: null, count: 1 };
+                const page = await bootToSafes(browser, s);
+                await page.click('#sec-safes button:text-is("Audit log")');
+                await page.waitForSelector(".sec-modal");
+                await page.click('.sec-modal button:text-is("Show")');
+                await page.waitForSelector(".sec-modal .sec-alert.info", { timeout: 5000 });
+                const said = await page.textContent(".sec-modal .sec-alert.info");
+                const call = await page.evaluate(() =>
+                    window.__CALLS.filter((c) => c.verb === "audit-tail").pop());
+                ok(call && call.superuser === (admin ? "require" : null),
+                   `the audit log is read at the escalation Cockpit currently grants ` +
+                   `(admin ${admin})`);
+                ok(admin ? /administrative access/i.test(said)
+                         : /your own log/i.test(said),
+                   `and the view says WHICH log it is showing (admin ${admin})`);
+                await page.close();
+            }
+        }
+
         head("Keyboard, focus and live regions");
         {
             const page = await bootToSafes(browser, scen());
@@ -1166,6 +1829,50 @@ async function main() {
             const overflow = await page.evaluate(() =>
                 document.documentElement.scrollWidth - document.documentElement.clientWidth);
             ok(overflow <= 1, `no horizontal overflow at a 640px viewport (${overflow}px)`);
+            await page.close();
+        }
+        {
+            /* The row editor is the widest new thing on the page — three
+             * controls and two buttons per row, inside a modal. At the layout
+             * equivalent of 200% zoom it has to stack, not scroll. */
+            const page = await H.openPage(browser, scen());
+            await page.setViewportSize({ width: 640, height: 720 });
+            await page.goto(url);
+            await page.waitForSelector("#sec-safes .sec-safe");
+            await unlockFirst(page, "lab-dc");
+            await page.click('#sec-browse-tools button:text-is("Add entry…")');
+            await page.waitForSelector(".sec-modal .sec-rows");
+            await page.click('.sec-modal .sec-rows > button:text-is("Add a field")');
+            await page.click('.sec-modal .sec-rows > button:text-is("Add a field")');
+            const over = await page.evaluate(() =>
+                document.documentElement.scrollWidth - document.documentElement.clientWidth);
+            ok(over <= 1, `three custom-field rows still do not overflow sideways (${over}px)`);
+            const boxed = await page.$$eval(".sec-modal .sec-row", (ns) => ns.map((n) => {
+                const r = n.getBoundingClientRect();
+                return r.right <= document.documentElement.clientWidth + 1;
+            }));
+            ok(boxed.length === 3 && boxed.every(Boolean),
+               "and every row is inside the viewport");
+            /* The focus trap has to survive the buttons the repeater adds. */
+            for (let i = 0; i < 40; i++) await page.keyboard.press("Tab");
+            ok(await page.evaluate(() =>
+                   !!document.activeElement.closest(".sec-modal")),
+               "the focus trap still holds with a row editor in the dialog");
+            /* Removing a row must not leave focus on a detached node — a
+             * keyboard user would be dropped back to the document. */
+            await page.click('.sec-modal .sec-row:nth-child(3) button:text-is("Remove")');
+            ok(await page.evaluate(() =>
+                   !!document.activeElement.closest(".sec-modal") &&
+                   document.activeElement.isConnected),
+               "focus lands on a live control after Remove");
+            const live = await page.textContent("#sec-live");
+            ok(/Removed a row/.test(live),
+               `the removal is announced into the polite region (${live.trim().slice(0, 40)})`);
+            const groups = await page.$$eval(".sec-modal .sec-row",
+                (n) => n.map((x) => x.getAttribute("aria-label")));
+            ok(groups.length === 2 && /row 1 of 2/.test(groups[0]) && /row 2 of 2/.test(groups[1]),
+               `each row is a labelled group and the numbering is rewritten on removal ` +
+               `(${groups.join(" | ")})`);
             await page.close();
         }
 

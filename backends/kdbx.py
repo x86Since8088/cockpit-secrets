@@ -1967,6 +1967,31 @@ class KdbxBackend(Backend):
         otp = pyotp.HOTP(_b32(seed, encoding))
         return {"code": otp.at(counter), "seconds_remaining": 0}
 
+    def attach_list(self, uuid):
+        """Attachment NAMES and sizes for one entry. No bytes (see the ABC).
+
+        `fields()` has carried this list since the first build, but nothing
+        published it: `entries()` sends `attachments` as a COUNT and there was
+        no verb that turned a count into a name, so a file could be uploaded
+        and never fetched again. This is the same list under its own method so
+        `attach-list` can be one narrow verb rather than a page reading it out
+        of a fatter response that also enumerates every field name.
+
+        The size is the DECLARED length of the stored bytes and is reported
+        even when it exceeds `Limits.MAX_ATTACHMENT_BYTES` — `attach_get` is
+        where that cap refuses, with a sentence naming the number. Hiding the
+        row here would make an oversized attachment look like no attachment.
+
+        `strict=False` matches `fields()`: a binary whose pool reference is
+        dangling is worth reporting as a zero-length row rather than making the
+        whole listing raise, because the operator's next move is to remove it
+        and they cannot remove a row they cannot see.
+        """
+        entry = self._entry(uuid)
+        return [{"name": a.filename,
+                 "size": len(_attachment_bytes(a, strict=False))}
+                for a in entry.attachments]
+
     def attach_get(self, uuid, name):
         """One attachment's bytes, base64, for streaming to the browser.
 
@@ -2105,12 +2130,24 @@ class KdbxBackend(Backend):
         password = _check_text(entry.get("password") or "", "password")
         url = _check_text(entry.get("url"), "url")
         notes = _check_text(entry.get("notes"), "notes")
-        otp = _check_text(entry.get("otp"), "otp")
+        # `totp_uri` is the name the schema and docs/CONTRACT.md publish; `otp`
+        # is this backend's storage key. `edit` accepts both for the same
+        # reason: a form built from the schema sends the schema's spelling.
+        otp = _check_text(entry.get("totp_uri") or entry.get("otp"), "otp")
         tags = entry.get("tags") or None
         if tags is not None and not isinstance(tags, list):
             raise Invalid("tags must be a list of strings")
-        expiry = (_parse_iso(entry["expiry_time"], "expiry_time")
-                  if entry.get("expiry_time") else None)
+        # `expires` is an ISO-8601 timestamp in the published vocabulary and a
+        # bool in the KDBX file. A string sets the DATE (and the flag below); a
+        # bool is the flag alone. `expiry_time` stays accepted as the storage
+        # spelling, and wins if both are sent, so nothing that worked before
+        # changed meaning.
+        want_expiry = entry.get("expiry_time")
+        if not want_expiry and isinstance(entry.get("expires"), str) \
+                and entry["expires"].strip():
+            want_expiry = entry["expires"]
+        expiry = (_parse_iso(want_expiry, "expires")
+                  if want_expiry else None)
         try:
             new = self._kp.add_entry(
                 dest, title, username, password, url=url, notes=notes,
@@ -2122,10 +2159,26 @@ class KdbxBackend(Backend):
                 force_creation=True)
         except Exception as exc:
             raise self._map_pykeepass_error(exc)
-        for name, spec in (entry.get("custom") or {}).items():
+        # Same shape and the same validator as `edit`'s `changes.custom`, so a
+        # custom field can be created WITH the entry rather than only bolted on
+        # by a second verb afterwards. The isinstance check is not decoration:
+        # without it a `custom` that arrived as a string reached `.items()` and
+        # left the verb as an AttributeError, which the error barrier reports
+        # as `internal` — the one code that tells an operator nothing about
+        # what they got wrong.
+        custom = entry.get("custom")
+        if custom is not None and not isinstance(custom, dict):
+            raise Invalid("custom must be an object of "
+                          "{name: {value, protected}}")
+        for name, spec in (custom or {}).items():
             self._set_custom(new, name, spec)
         if entry.get("expires") is not None:
-            new.expires = bool(entry["expires"])
+            # A timestamp was already turned into `expiry_time` above; here it
+            # only has to mean "yes, this expires". A bool still means exactly
+            # what it says, and an empty string means never.
+            value = entry["expires"]
+            new.expires = (bool(value.strip()) if isinstance(value, str)
+                           else bool(value))
         uuid = str(new.uuid)
         self._index[uuid] = new
         return {"uuid": uuid}
@@ -2144,6 +2197,14 @@ class KdbxBackend(Backend):
         changed = []
         for name, value in changes.items():
             low = str(name).casefold()
+            # The helper's published vocabulary spells the OTP seed `totp_uri`
+            # (schema field, docs/CONTRACT.md) and this backend's own storage
+            # key is `otp`. Without this row the schema declared a control
+            # whose only effect was `invalid: totp_uri is not an editable
+            # field` — a form box that could never work, which is the same
+            # defect as a missing one and harder to see.
+            if low == "totp_uri":
+                low = "otp"
             if low in ("title", "username", "password", "url", "notes", "otp"):
                 # None means "clear it". It has to become "" here: lxml's
                 # element builder raises a bare TypeError on a None child, and
@@ -2163,7 +2224,25 @@ class KdbxBackend(Backend):
                 entry.icon = str(value) if value is not None else None
                 changed.append("icon")
             elif low == "expires":
-                entry.expires = bool(value)
+                # The schema publishes `expires` as "ISO-8601 UTC timestamp,
+                # or empty for never", and this used to be a bare bool()  — so
+                # a page that sent the timestamp the schema asked for set the
+                # FLAG and left the DATE untouched, and the verb answered
+                # `changed: ["expires"]`. A wrong answer that reports success
+                # is worse than a refusal, and this is the one field on the
+                # form where the wrong answer is "this credential never
+                # expires".
+                #
+                # All three spellings are honoured because all three are things
+                # a caller reasonably means: a timestamp sets the date AND the
+                # flag; false/null/"" clears the flag; true without a date is
+                # the flag alone, which is what the KDBX field itself is.
+                if isinstance(value, str) and value.strip():
+                    entry.expiry_time = _parse_iso(value, "expires")
+                    entry.expires = True
+                    changed.append("expiry_time")
+                else:
+                    entry.expires = bool(value)
                 changed.append("expires")
             elif low == "expiry_time":
                 entry.expiry_time = _parse_iso(value, "expiry_time")

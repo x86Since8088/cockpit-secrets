@@ -33,7 +33,7 @@ const REC = H.Recorder("live-access");
 
 const ITEMS = {
     8: "The non-admin refusal (I3): refused in the UI AND when driven from devtools",
-    9: "Escalation: Cockpit's own prompt when access is off, and the safe opens when it is on"
+    9: "Escalation: refused with no prompt while access is off, then Cockpit's own header control grants it and the admin safe opens"
 };
 const ORDER = [8, 9];
 
@@ -64,6 +64,10 @@ async function item8(browser) {
     try {
         const page = await H.login(ctx, H.CFG.user, pass);
         const frame = await H.openPlugin(page);
+        /* openPlugin() waits for the SCHEMA; the card comes from `list`, which is
+         * a different spawn. Counting or reading cards without this reads a
+         * page still saying "Loading the safe registry…". */
+        await U.waitForSafeList(frame);
 
         /* Establish the principal really is the non-admin one, from the kernel's
          * point of view and not from a variable in this file. */
@@ -195,7 +199,8 @@ async function item9(browser) {
          * rather than assumed. */
         const state = await H.adminAccessState(page);
         it.note("Cockpit's header reports: " + state);
-        const frame = await H.openPlugin(page);
+        let frame = await H.openPlugin(page);
+        await U.waitForSafeList(frame);
 
         const perm = await frame.evaluate(() => new Promise((resolve) => {
             const p = cockpit.permission({ admin: true });
@@ -214,8 +219,8 @@ async function item9(browser) {
             return;
         }
 
-        /* The page's own words for the un-escalated state: a banner naming the
-         * control in Cockpit's header, NOT an error. */
+        /* --- the page's own words for the un-escalated state ---------------
+         * A banner naming the control in Cockpit's header, NOT an error. */
         const banner = (await frame.locator("#sec-banners").innerText().catch(() => "")).trim();
         it.ok(/Administrative access is off/i.test(banner),
               "the page states the situation plainly instead of failing: " +
@@ -234,45 +239,85 @@ async function item9(browser) {
         }
         const target = admins[0];
 
-        /* Reaching for the safe is what asks. The card offers "Check this safe"
-         * precisely so that the operator triggers COCKPIT's prompt deliberately
-         * rather than meeting it as a failure. */
+        /* --- WHAT A PACKAGE PAGE CAN AND CANNOT DO, MEASURED ---------------
+         *
+         * The previous revision of this item waited thirty seconds for
+         * Cockpit's password dialog to appear after the page asked for
+         * escalation, and failed. That failure was CORRECT and it was the
+         * finding: on Cockpit 360 a channel opened with `superuser: "require"`
+         * from a session in limited access is refused immediately with
+         * `access-denied`, and no dialog is drawn anywhere. The dialog belongs
+         * to the shell — it is the component behind the header control, which
+         * calls cockpit.Superuser.Start() and listens for its Prompt signal
+         * around that one call — and there is no API a package page can use to
+         * summon it. The `superuser` module the shipped Cockpit pages import is
+         * read-only (allowed / configured / reload_page_on_change).
+         *
+         * So the assertion is now the true one, in two halves: the page must
+         * REPORT that plainly and point at the control that really escalates,
+         * and the control that really escalates must then really open the safe.
+         * Anything else would be this suite asserting a Cockpit feature that
+         * does not exist and calling the page broken for not using it. */
         const card = U.cardFor(frame, target.id).first();
-        const check = card.locator('button:text-is("Check this safe")');
-        const open = card.locator('button:text-is("Unlock…")');
-        if (await check.count()) {
-            it.ok(true, "the card offers “Check this safe” — the deliberate route to " +
-                        "Cockpit's prompt, rather than meeting it as a failure");
-            await check.click();
-        } else if (!(await open.isDisabled())) {
-            it.note("no “Check this safe” control; using Unlock, which asks the bridge for " +
-                    "escalation on the same spawn.");
-            await open.click();
-        } else {
-            /* Nothing on the card can ask. Say so instead of clicking a disabled
-             * control and waiting out a 30 s timeout, which is how this read as
-             * an abort the first time it ran. */
-            it.fail("the admin-class card offers no way to ask for escalation: “Check this " +
-                    "safe” is absent and Unlock is disabled. With administrative access off " +
-                    "this card is a dead end, and the page's own banner promises otherwise.");
-            it.shot(await H.shot(page, "09-dead-end"));
-            it.done();
-            return;
-        }
+        const check = card.locator('button:text-is("Check this safe"), button:text-is("Check again")');
+        it.ok(await check.count() > 0,
+              "the admin-class card offers a “Check this safe” control while access is off");
+        it.ok(!(await card.locator('button:text-is("Unlock…")').isDisabled()),
+              "…and Unlock is NOT permanently disabled — admin is the default class and a " +
+              "session can escalate at any moment");
 
-        /* Cockpit's prompt lives in the SHELL page, outside the plugin's frame —
-         * which is the assertion: the page did not draw this, the bridge did. */
+        await check.first().click();
+        const refusal = await frame.waitForFunction((id) => {
+            const cards = document.querySelectorAll(".sec-safe");
+            for (const c of cards) {
+                const n = c.querySelector(".sec-safe-id");
+                if (!n || n.textContent.trim() !== id) continue;
+                const a = c.querySelector(".sec-alert.err");
+                if (!a) return null;
+                return a.textContent.replace(/\s+/g, " ").trim().slice(0, 300);
+            }
+            return null;
+        }, target.id, { timeout: 30000 }).then((h) => h.jsonValue()).catch(() => null);
+
+        it.ok(!!refusal,
+              "asking for an admin-class safe while access is off produces an answer on the " +
+              "card rather than a silent nothing");
+        it.ok(!!refusal && /access-denied/.test(refusal),
+              "the answer is the bridge's refusal, delivered without any prompt: " +
+              JSON.stringify(String(refusal).slice(0, 180)));
+        it.ok(!!refusal && /Limited access|administrative access/i.test(refusal),
+              "…and it names the control that DOES escalate, so the operator is not left " +
+              "with a code and no route out of it");
+        /* And no lookalike password box was drawn anywhere by this page. That
+         * is the half a bespoke "escalation dialog" would fail. */
+        const fakePrompt = await frame.evaluate(() =>
+            document.querySelectorAll(".sec-modal input[type=password]").length);
+        it.ok(fakePrompt === 0,
+              "the page drew no password prompt of its own in response (" + fakePrompt +
+              " password inputs in its frame) — Cockpit's prompt is Cockpit's");
+        it.shot(await H.shot(page, "09-refused-without-prompt"));
+
+        /* --- NOW THE ROUTE THAT WORKS: COCKPIT'S OWN HEADER CONTROL --------
+         * This is the operator gesture the page's banner names. Everything
+         * below happens in the SHELL page, outside the plugin's frame, which is
+         * the assertion: the page did not draw this, Cockpit did. */
+        const hdr = page.locator('button:has-text("Limited access"), a:has-text("Limited access")');
+        it.ok(await hdr.count() > 0,
+              "Cockpit's header carries the “Limited access” control the page points at");
+        await hdr.first().click();
+
         const prompt = await page.waitForFunction(() => {
             const t = document.body ? document.body.innerText : "";
             const pw = document.querySelector("input[type=password]");
-            return (/administrative access|switch to admin|password for/i.test(t) && !!pw)
+            return (/administrative access|switch to admin|password for|Limited access mode/i.test(t)
+                    && !!pw)
                 ? { text: t.slice(0, 300), hasPassword: true } : null;
         }, null, { timeout: 30000 }).then((h) => h.jsonValue()).catch(() => null);
 
         if (!prompt) {
-            const err = (await frame.locator("#sec-alerts, .sec-modal").innerText().catch(() => "")).trim();
-            it.fail("Cockpit's escalation prompt did not appear within 30 s. The plugin frame " +
-                    "shows: " + JSON.stringify(err.replace(/\s+/g, " ").slice(0, 240)));
+            it.fail("Cockpit's own escalation dialog did not appear within 30 s of using its " +
+                    "header control. That is a Cockpit-side failure, not a page one — the " +
+                    "page's part (reporting the state and naming this control) held above.");
             it.shot(await H.shot(page, "09-no-prompt"));
             it.done();
             return;
@@ -287,15 +332,34 @@ async function item9(browser) {
         /* .first() rather than page.fill(): the shell can carry more than one
          * password control and a strict locator would rather say so than pick. */
         await page.locator("input[type=password]:visible").first().fill(pass);
-        const buttons = await page.locator("button:visible").allInnerTexts();
-        const label = buttons.find((t) => /^(authenticate|ok|continue|apply|log in)$/i.test(t.trim()));
-        if (label) await page.locator(`button:text-is("${label}")`).first().click();
-        else await page.keyboard.press("Enter");
+        /* noWaitAfter, and the failure swallowed on purpose. Cockpit RELOADS the
+         * whole page the moment its superuser state changes
+         * (superuser.js: window.location.reload(true)), so the button this
+         * click lands on is detached before the click can report success —
+         * measured: `locator.click` waited its full 30 s for
+         * button:text-is("Authenticate") on a dialog that had already done its
+         * job and gone. What the click did is not asserted from the click; it
+         * is asserted from cockpit.permission afterwards, which is the fact
+         * that matters. */
+        const auth = page.locator("button:visible")
+                         .filter({ hasText: /^(Authenticate|Ok|Continue|Apply|Log in)$/i }).first();
+        if (await auth.count())
+            await auth.click({ noWaitAfter: true, timeout: 10000 }).catch(() => {});
+        else
+            await page.keyboard.press("Enter");
 
+        /* Cockpit RELOADS the page when its superuser state changes
+         * (superuser.js: window.location.reload(true) on the transition), so
+         * the frame handle from before the prompt is stale by design. Re-open
+         * the plugin rather than reaching through a detached frame. */
+        await page.waitForLoadState("domcontentloaded").catch(() => {});
         await page.waitForFunction(() => {
             const t = document.body ? document.body.innerText : "";
             return /Administrative access/i.test(t) && !/Limited access/i.test(t);
         }, null, { timeout: 30000 }).catch(() => {});
+        it.note("Cockpit's header now reports: " + (await H.adminAccessState(page)));
+        frame = await H.openPlugin(page);
+        await U.waitForSafeList(frame);
 
         const now = await frame.evaluate(() => new Promise((resolve) => {
             const p = cockpit.permission({ admin: true });
@@ -303,6 +367,8 @@ async function item9(browser) {
         }));
         it.ok(now === true, "administrative access is now on (cockpit.permission.allowed === " +
                             JSON.stringify(now) + ")");
+        it.ok(!(await frame.locator("#sec-banners .sec-alert.warn").count()),
+              "the page's escalation banner is gone now that there is nothing to warn about");
 
         /* And the safe genuinely opens. A permission flag that flipped while the
          * verb still refused would be the interesting failure, so the check is
@@ -317,13 +383,24 @@ async function item9(browser) {
             it.note("no passphrase file for " + target.id + ", so the unlock itself was not " +
                     "driven; the escalated verb answering is the half that escalation decides.");
         } else {
-            await frame.locator("#sec-refresh").click();
             await U.openUnlockDialog(frame, target.id);
-            await U.submitUnlock(frame, safePass);
-            const opened = await frame.waitForSelector("#sec-browse-view:not([hidden])",
-                                                       { timeout: 120000 })
-                                      .then(() => true).catch(() => false);
-            it.ok(opened, "with administrative access on, the admin-class safe opens");
+            const opened = await U.unlockAndWaitOutBackoff(frame, safePass, it);
+            it.ok(!!(opened && opened.ok),
+                  "with administrative access on, the ADMIN-CLASS safe opens through the page" +
+                  (opened && !opened.ok
+                      ? " — got " + JSON.stringify(opened.code + ": " + opened.detail) : ""));
+            if (opened && opened.ok) {
+                await frame.waitForSelector("#sec-entries table.sec tbody tr", { timeout: 60000 })
+                           .catch(() => {});
+                const rows = await frame.locator("#sec-entries table.sec tbody tr").count();
+                it.ok(rows > 0,
+                      "…and its entries render — " + rows + " row(s) out of a root-owned file " +
+                      "that this account cannot read without escalating");
+                /* Lock it again: leaving an admin safe open behind a suite that
+                 * is about to close the browser is not this suite's to do. */
+                await frame.locator('#sec-browse-tools button:text-is("Lock")').click()
+                           .catch(() => {});
+            }
         }
         it.shot(await H.shot(page, "09-escalated"));
     } finally {

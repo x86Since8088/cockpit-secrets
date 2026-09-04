@@ -2021,12 +2021,45 @@ class Backend(abc.ABC):
         """
 
     @abc.abstractmethod
+    def attach_list(self, uuid):
+        """The NAMES of one entry's attachments, and their sizes. **No bytes.**
+
+        Returns a list, in the order the file stores them::
+
+            [{"name": str, "size": int}, ...]
+
+        It exists because `entries()` reports `attachments` as a COUNT, on
+        purpose — a listing must show that an entry HAS attachments without
+        shipping them. A count is not addressable, though, and `attach_get`
+        takes a NAME, so with only those two methods an attachment can be
+        uploaded and never fetched again from a page that never learned what it
+        is called. This is the missing half: names in, bytes out through
+        `attach_get`, one audited call each.
+
+        It is deliberately the same shape as `history()` — presence and size,
+        never content. `size` is the DECLARED length of the stored bytes and is
+        reported even when it exceeds `Limits.MAX_ATTACHMENT_BYTES`, because
+        "there is a 40 MiB file here that this transport will not carry" is a
+        more useful answer than hiding the row; `attach_get` is where that cap
+        refuses.
+
+        An entry with no attachments returns `[]`. `NotFound` is for an unknown
+        uuid, never for an empty list. A format with no attachment concept at
+        all raises `Unsupported` naming that limit — it does not return `[]`,
+        because an empty list says "this entry has none" and that is a
+        different and untrue statement about a format that cannot have any.
+        """
+
+    @abc.abstractmethod
     def attach_get(self, uuid, name):
         """One attachment's content, base64, streamed to the browser.
 
         Returns `{"name": str, "size": int, "b64": str}`. Size is checked
         against `Limits.MAX_ATTACHMENT_BYTES` from the DECLARED length before
         anything is allocated (I7).
+
+        The name comes from `attach_list()`, which is the only thing that
+        publishes one; `entries()` publishes a count and nothing addressable.
 
         The content goes through the Cockpit channel to the browser and never
         lands on this host's disk — an attachment written to a server-side path
@@ -2680,7 +2713,13 @@ def _selfcheck():                                       # noqa: C901
                   # operator-named copy, and the one method that empties the
                   # safe in one call.
                   "history", "history_restore", "attach_add", "attach_rm",
-                  "save_as", "export_plain"}
+                  "save_as", "export_plain",
+                  # `attach_list` is abstract rather than a default returning
+                  # []: a default would let a backend that cannot do
+                  # attachments answer "this entry has none", which is a
+                  # different and untrue statement, and it would do it
+                  # silently. Each backend states its own answer.
+                  "attach_list"}
         ok("every CONTRACT.md verb is abstract",
            needed <= set(Backend.__abstractmethods__))
         ok("no extra abstract methods",
@@ -2748,6 +2787,7 @@ class _StubBackend(Backend):
         return {"total": 0, "entries": []}
     def reveal(self, uuid, field): raise NotFound("stub")
     def totp(self, uuid): raise Unsupported("stub")
+    def attach_list(self, uuid): return []
     def attach_get(self, uuid, name): raise NotFound("stub")
     def history(self, uuid): return []
     def export_plain(self, *, fmt): raise Unsupported("stub")

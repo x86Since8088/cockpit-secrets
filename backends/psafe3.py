@@ -87,6 +87,7 @@ import os
 import secrets as _sysrandom
 import sys
 import time
+import urllib.parse
 import uuid as _uuid
 from datetime import datetime, timezone
 
@@ -1432,6 +1433,106 @@ def write_file(path, passphrase, db, *, iterations=None, backup_dir=None,
 # TOTP  (§3.3 notes [23] and [29])
 # ===========================================================================
 
+def _iso_to_unix(value):
+    """ISO-8601 (with or without a trailing Z) -> a 32-bit time_t.
+
+    The published vocabulary carries timestamps as ISO-8601 UTC and §3.1.3
+    stores them as a 4-byte little-endian time_t, so the range is the
+    STORAGE's: a date outside it cannot be written and is refused here rather
+    than silently wrapping into 1970 or 2038.
+    """
+    if isinstance(value, int) and not isinstance(value, bool):
+        secs = value
+    else:
+        try:
+            when = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            raise Invalid("expires is not a valid ISO-8601 timestamp")
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        secs = int(when.astimezone(timezone.utc).timestamp())
+    if not 0 <= secs <= 0xFFFFFFFF:
+        raise Invalid("that date cannot be stored in this format's 32-bit "
+                      "time field")
+    return secs
+
+
+def _parse_otpauth(uri):
+    """`otpauth://totp/...?secret=…` -> (seed bytes, digits, period).
+
+    The published `entry`/`changes` vocabulary spells the OTP seed `totp_uri`
+    and carries it as an `otpauth://` URI, because that is what a QR code
+    decodes to and what every authenticator app emits. This format stores the
+    same thing as four typed fields — Two Factor Key (0x1b) holds the RAW
+    seed, not base32 — so the URI is taken apart here rather than stored
+    verbatim. Storing the URI text in 0x1b would produce a field that reads
+    back through `reveal` as base32-of-the-URI and generates codes that are
+    always wrong, which is exactly the failure a "malformed URI is stored
+    happily" note in the schema warns about.
+
+    Refusals, all of them because the alternative is a silently wrong code:
+
+      * `hotp://` — counter-based, and this format has no counter field.
+      * an `algorithm` other than SHA1 — §3.3 note [29] defines only 0x00
+        (SHA1) in TOTP Config, so there is nowhere to record another.
+      * a secret that is not valid base32, or is empty.
+
+    `urllib.parse` opens nothing; it is a string parser, which is why
+    validate.sh's network ban names the network-capable modules specifically.
+    """
+    if not isinstance(uri, str) or not uri.strip():
+        # The caller filters the empty case (it means "remove the seed"), so
+        # reaching here with nothing is a caller bug, not an operator one.
+        raise Invalid("a TOTP secret must be an otpauth:// URI")
+    text = uri.strip()
+    parts = urllib.parse.urlsplit(text)
+    if parts.scheme.lower() != "otpauth":
+        raise Invalid("a TOTP secret must be an otpauth:// URI")
+    if (parts.netloc or "").lower() != "totp":
+        raise Unsupported("Password Safe v3 stores time-based one-time "
+                          "passwords only; there is no counter field for "
+                          "otpauth://hotp")
+    query = urllib.parse.parse_qs(parts.query)
+    secret = (query.get("secret") or [""])[0].strip().replace(" ", "")
+    if not secret:
+        raise Invalid("the otpauth URI carries no secret")
+    algorithm = (query.get("algorithm") or ["SHA1"])[0].strip().upper()
+    if algorithm not in ("SHA1", ""):
+        raise Unsupported("Password Safe v3's TOTP Config defines only SHA-1 "
+                          "(note [29]); %s cannot be recorded" % algorithm)
+    try:
+        # base32 with the padding restored: authenticator apps almost always
+        # strip it, and b32decode refuses an unpadded string outright.
+        pad = "=" * (-len(secret) % 8)
+        seed = base64.b32decode(secret.upper() + pad, casefold=True)
+    except (binascii.Error, ValueError):
+        raise Invalid("the otpauth URI's secret is not valid base32")
+    if not seed:
+        raise Invalid("the otpauth URI's secret is empty")
+
+    def _int(name, default, low, high):
+        raw = (query.get(name) or [""])[0].strip()
+        if not raw:
+            return default
+        try:
+            value = int(raw)
+        except ValueError:
+            raise Invalid("the otpauth URI's %s is not a number" % name)
+        if not low <= value <= high:
+            raise Invalid("the otpauth URI's %s is out of range" % name)
+        return value
+
+    # Both are single unsigned bytes in this format (0x22, 0x23), so the
+    # ranges are the storage's and not a policy.
+    digits = _int("digits", 6, 1, 10)
+    period = _int("period", 30, 1, 255)
+    # No T0 is returned because the otpauth URI has no parameter for one: RFC
+    # 6238's T0 is fixed at the Unix epoch there. TOTP Start Time (0x24) is a
+    # PWS3 extension, and the caller CLEARS it rather than leaving a stale one
+    # behind — a leftover T0 from a previous seed shifts every code.
+    return seed, digits, period
+
+
 def _totp_code(seed, digits, step, t0, now=None):
     """RFC 6238, computed here rather than through `pyotp`.
 
@@ -1804,6 +1905,46 @@ class Psafe3Backend(Backend):
         code, remaining = _totp_code(seed, digits, step, t0)
         return {"code": code, "seconds_remaining": int(remaining)}
 
+    def attach_list(self, uuid):
+        """Attachment NAMES and sizes for one record. No bytes (see the ABC).
+
+        **Password Safe v3 does have attachments, and this backend writes
+        them** — §3.3 note [30], fields 0x25..0x29, introduced in format
+        version 0x030F (PasswordSafe V3.68). So this returns a real list rather
+        than `Unsupported`; claiming the format cannot do it would be a lie
+        about a file `attach_add` has already written.
+
+        Two limits are the format's own and are reported by SHAPE rather than
+        explained in a sentence nobody reads:
+
+          * **At most one attachment per record.** A record is a list of typed
+            fields and a type appears at most once in it, so there is nowhere
+            to put a second Att Content. The list is therefore empty or one
+            element long, always — a page that renders it as a list is right,
+            and a page that assumes several is only ever wrong on this format.
+          * **MediaType is what says an attachment exists** (note [30]:
+            "if an entry contains an attachment the field Att MediaType must be
+            present and non-empty"), so `_attachment_name` is the single place
+            that decides, shared with `attach_get` and `attach_rm`. A record
+            with an Att Content and no MediaType is not an attachment here, and
+            listing one would name something `attach_get` then refuses.
+
+        A database older than 0x030F simply has no such fields and lists
+        nothing; it is `attach_add` that refuses with the version, because a
+        version is a reason not to WRITE, not a reason to lie about what is
+        already in the file.
+        """
+        self.require_unlocked()
+        idx = self._require_record(uuid)
+        record = self._db.records[idx]
+        have = self._attachment_name(record)
+        if not have:
+            return []
+        # "Absence of [Att Content] implies a zero-sized attachment" — note
+        # [30]. A row with size 0 is therefore a legal answer and not a bug.
+        content = Pws3Db.field_get(record, REC_ATT_CONTENT) or b""
+        return [{"name": have, "size": len(content)}]
+
     def attach_get(self, uuid, name):
         """One attachment, base64, through the Cockpit channel (§3.3 note 30).
 
@@ -2003,6 +2144,42 @@ class Psafe3Backend(Backend):
                 old_password_when = int.from_bytes(stamp[:4], "little")
         changed = []
         for name, value in changes.items():
+            if not value and name in ("custom", "tags"):
+                # An EMPTY custom map or tag list asks for nothing, and a form
+                # built from the schema sends both keys on every `add` whether
+                # the operator filled them in or not. Refusing "write no tags"
+                # would make every add from the page fail on this format for a
+                # request that wanted nothing written.
+                continue
+            if name == "custom" or (isinstance(name, str)
+                                    and name.startswith("custom:")):
+                # The write half of `reveal`'s refusal, in the same words and
+                # for the same reason. A PWS3 record is a list of TYPED fields
+                # and a type appears at most once, so there is no name-keyed
+                # string space to create a field IN. 0xdf ("custom-text-field")
+                # is one such type, not a dictionary.
+                #
+                # `unsupported`, not `invalid`: the request is well formed and
+                # would be honoured on the other backend, so the operator needs
+                # to be told the FORMAT cannot do this — not that they typed
+                # something wrong. The alternatives were both worse than
+                # refusing: writing it into Notes invents a convention no other
+                # Password Safe implementation reads, and squatting on 0xdf
+                # gives every entry exactly one custom field whose name is not
+                # stored anywhere.
+                raise Unsupported(
+                    "Password Safe v3 records carry typed fields, not named "
+                    "custom fields; there is nowhere to create this one. Use "
+                    "the notes field, or keep this entry in a KDBX safe")
+            if name in ("totp_uri", "expires", "tags"):
+                # The three remaining names in the helper's published
+                # `entry`/`changes` vocabulary that this format does not spell
+                # the same way. Before this they all fell through to "unknown
+                # field name", which is `invalid` — the code that tells an
+                # operator they typed something wrong, for a request a
+                # schema-driven form generated correctly.
+                changed.extend(self._apply_published_name(record, name, value))
+                continue
             ftype = _RECORD_NAME_TO_TYPE.get(name)
             if ftype is None:
                 raise Invalid("unknown field name")
@@ -2025,6 +2202,71 @@ class Psafe3Backend(Backend):
                 self._push_password_history(record, old_password,
                                             old_password_when)
         return changed
+
+    @staticmethod
+    def _apply_published_name(record, name, value):
+        """Three names the helper publishes that §3.3 spells differently — or
+        does not have at all. Returns the list of names actually changed.
+
+        Each one is either mapped to the field the format really has, or
+        refused with `unsupported` naming the format's limit. What none of them
+        does any more is answer `invalid: unknown field name`, which read as
+        "you typed that wrong" for a request a schema-driven form built exactly
+        as the schema told it to.
+
+          `expires`   -> Password Expiry Time (0x0a). PWS3 has one expiry per
+                        record and calls it the password's; KDBX has one and
+                        calls it the entry's. They are the same operator
+                        intention and there is no second field to disagree
+                        with. Empty/None DELETES it, which is this format's
+                        "never" — note [11] treats an absent 0x0a as no expiry
+                        and a zero value is NOT the same statement.
+          `totp_uri`  -> Two Factor Key (0x1b) plus TOTP Length (0x22) and
+                        Time Step (0x23), through `_parse_otpauth`. The raw
+                        seed is stored, never the URI text.
+          `tags`      -> refused. §3.3 lists no tag field, `_entry_meta`
+                        returns `[]` for exactly that reason, and inventing one
+                        out of the group path would write data the file does
+                        not contain and no other implementation would read.
+        """
+        if name == "tags":
+            raise Unsupported(
+                "Password Safe v3 has no tag field (§3.3 lists none), so "
+                "there is nothing to write tags into; this format's grouping "
+                "is the record's Group path")
+        if name == "expires":
+            if value is None or (isinstance(value, str) and not value.strip()):
+                removed = Pws3Db.field_del(record, REC_PASSWORD_EXPIRY_TIME)
+                return ["expires"] if removed else []
+            if isinstance(value, bool):
+                # A bare true has no date in it and this format stores only a
+                # date. Refusing beats inventing one.
+                raise Invalid("expires needs an ISO-8601 timestamp on this "
+                              "format, or null for never")
+            Pws3Db.field_set(record, REC_PASSWORD_EXPIRY_TIME,
+                             _time_field(_iso_to_unix(value)))
+            return ["expires"]
+        # totp_uri
+        if value is None or (isinstance(value, str) and not value.strip()):
+            removed = False
+            for ftype in (REC_TWO_FACTOR_KEY, REC_TOTP_CONFIG,
+                          REC_TOTP_LENGTH, REC_TOTP_TIME_STEP,
+                          REC_TOTP_START_TIME):
+                removed = Pws3Db.field_del(record, ftype) or removed
+            return ["totp_uri"] if removed else []
+        seed, digits, period = _parse_otpauth(value)
+        Pws3Db.field_set(record, REC_TWO_FACTOR_KEY, seed)
+        # Note [29]: bits 0-1 select the hash and only 0x00 (SHA-1) is defined.
+        # It is written explicitly rather than left absent so a reader does not
+        # have to infer the algorithm from a missing field.
+        Pws3Db.field_set(record, REC_TOTP_CONFIG, b"\x00")
+        Pws3Db.field_set(record, REC_TOTP_LENGTH, bytes((digits,)))
+        Pws3Db.field_set(record, REC_TOTP_TIME_STEP, bytes((period,)))
+        # An otpauth URI carries no T0, so any Start Time already on the record
+        # belonged to the seed being replaced. Leaving it would shift every
+        # code this seed produces, silently and by a constant.
+        Pws3Db.field_del(record, REC_TOTP_START_TIME)
+        return ["totp_uri"]
 
     @staticmethod
     def _encode_value(kind, value):

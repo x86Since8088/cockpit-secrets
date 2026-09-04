@@ -17,21 +17,39 @@
 #   sudo DESTDIR=/tmp/stage ./install.sh  # stage into a package build root
 #   ./install.sh --help
 #
-# What it touches, and nothing else:
+# What it touches, and nothing else. This list is checked, not promised: the
+# library root is asserted against it at the end of every run (section 5b
+# below), and tests/root/20-verify-install.sh audits the whole set from outside,
+# as a separate root job - a run that checked its own work would report the mode
+# it intended in both places.
 #
 #   /usr/share/cockpit/secrets/                  0755 root:root, files 0644
+#   /usr/local/sbin/                             0755 root:root   created if absent
 #   /usr/local/sbin/secrets-admin                0755 root:root
-#   /usr/local/lib/cockpit-secrets/backends/     0755, *.py 0644
+#   /usr/local/lib/cockpit-secrets/              0755 root:root
+#   /usr/local/lib/cockpit-secrets/backends/     0755, *.py 0644 and NOTHING else
 #   /usr/local/lib/cockpit-secrets/schema/       0755, *.json 0644
 #   /etc/cockpit-secrets/                        0755 root:root
 #   /etc/cockpit-secrets/safes.d/                0755 root:root   the registry
 #   /etc/cockpit-secrets/safes/                  0700 root:root   admin-class safe files
 #   /var/log/cockpit-secrets/                    0700 root:root   audit.log
+#   /var/lib/cockpit-secrets/                    0700 root:root
 #   /var/lib/cockpit-secrets/state/              0700 root:root   lockout counters (I16)
 #   /var/lib/cockpit-secrets/exports/            0700 root:root   export destination (I21)
 #   /usr/local/lib/cockpit-secrets/agent/        --with-agent only
+#   /usr/local/lib/cockpit-secrets/secrets-agent --with-agent only, if the source
+#                                                tree ships one (0755; today it
+#                                                ships modules and no executable)
+#   /usr/local/lib/systemd/user/                 --with-agent only
 #   /usr/local/lib/systemd/user/secrets-agent.*  --with-agent only
+#   /usr/local/lib/systemd/system/               --with-agent only
 #   /usr/local/lib/systemd/system/secrets-agent@.*  --with-agent only, NOT enabled
+#
+# --uninstall removes every one of those EXCEPT the data locations it names on
+# the way out: /etc/cockpit-secrets (the registry and the safe files),
+# /var/log/cockpit-secrets (the audit log), /var/lib/cockpit-secrets/state
+# (lockout counters) and /var/lib/cockpit-secrets/exports (which may hold
+# PLAINTEXT exports - see docs/OPERATIONS.md, "The exports directory").
 #
 # What it never does:
 #
@@ -105,7 +123,15 @@ warn()    { WARNINGS+=("$*"); printf '  ! %s\n' "$*" >&2; }
 note()    { printf '  %s\n' "$*"; }
 die()     { printf 'install.sh: %s\n' "$*" >&2; exit 1; }
 
-usage() { sed -n '2,51p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'; exit "${1:-0}"; }
+# --help is the header block, from line 2 to the `set -x` note. Addressed by
+# that note rather than by a line number: the header grew this round and a
+# hard-coded `2,51p` silently truncated it mid-sentence, which is the failure
+# mode where a usage message stops matching the program.
+usage() {
+    sed -n '2,/^# There is no .set -x. anywhere/p' "${BASH_SOURCE[0]}" \
+        | sed '$d' | sed 's/^# \?//'
+    exit "${1:-0}"
+}
 
 while (($#)); do
     case "$1" in
@@ -139,8 +165,14 @@ if [[ $ACTION == uninstall ]]; then
     # Only ever remove units this package installs, by exact name prefix - a
     # wildcard in a shared unit directory is how you delete someone else's
     # service.
+    #
+    # BOTH directories, and the two globs differ. `secrets-agent.*` does not
+    # match `secrets-agent@.service`, so the user glob alone left the system
+    # template installed after an uninstall - software this package put there,
+    # under "an uninstall removes the software", still on disk. The header's
+    # list of what --with-agent touches now has a removal for every line in it.
     shopt -s nullglob
-    for unit in "$USERUNITDIR"/secrets-agent.*; do
+    for unit in "$USERUNITDIR"/secrets-agent.* "$SYSUNITDIR"/secrets-agent@.*; do
         rm -f -- "$unit"; changed "removed $unit"
     done
     shopt -u nullglob
@@ -162,8 +194,16 @@ if [[ $ACTION == uninstall ]]; then
     echo "  $STATEDIR/"
     echo "      Lockout counters (I16). Uninstalling must not be a way to clear a"
     echo "      lockout."
+    echo "  $EXPORTDIR/"
+    echo "      The export destination. If anybody ever ran the export verb, a"
+    echo "      file here is an ENTIRE SAFE IN PLAINTEXT (I21). Removing the"
+    echo "      software must not be the moment those quietly disappear - or"
+    echo "      quietly survive unnoticed. LOOK IN IT, then shred what is there:"
+    echo "        ls -l $EXPORTDIR/"
+    echo "        shred -u $EXPORTDIR/*        # not rm: see docs/OPERATIONS.md"
     echo
-    echo "To remove those too, after you have read them:"
+    echo "To remove those too, after you have read them - and after you have"
+    echo "shredded any export, because rm -rf does not:"
     echo "  rm -rf $ETCDIR $LOGDIR $DESTDIR/var/lib/cockpit-secrets"
     echo
     if ((${#CHANGES[@]})); then
@@ -437,6 +477,14 @@ done
 # why the loop above globs *.py explicitly instead of copying the directory:
 # root-owned bytecode next to root-run source is a second thing to keep honest
 # and buys nothing.
+#
+# THIS SWEEP IS NOT THE WHOLE STORY, and believing it was is what made the
+# invariant false for a whole release. Anything that imports the package after
+# this line puts the bytecode straight back, and section 5 below - this script's
+# own verification - did exactly that. The three parts that make the claim true
+# are: this sweep; `sys.dont_write_bytecode` in secrets-admin, so no root run of
+# the helper ever writes any; and the assertion in section 5b, which re-checks
+# the directory after everything else has run.
 for existing in "$LIBDIR"/backends/*; do
     base="$(basename -- "$existing")"
     if [[ $base != *.py || ! -f "$SRC/backends/$base" ]]; then
@@ -558,7 +606,14 @@ echo "Verifying"
 if [[ -z $DESTDIR ]]; then
     # Does the library root the helper depends on actually import? This isolates
     # a path problem from a helper problem.
-    if python3 -c "import sys; sys.path.insert(0, '$LIBDIR_RUNTIME'); import backends" 2>/dev/null; then
+    #
+    # `-B` IS LOAD-BEARING. Without it this probe is a writer: it imports a
+    # package out of a root-owned directory as root, and CPython caches the
+    # bytecode next to the source - under this script's umask 022, so 0644.
+    # That single line put a __pycache__ back into a directory the sweep above
+    # had just cleaned, four files, and the installer then reported success
+    # against an invariant it had broken itself.
+    if python3 -B -c "import sys; sys.path.insert(0, '$LIBDIR_RUNTIME'); import backends" 2>/dev/null; then
         note "backends import from $LIBDIR_RUNTIME"
     else
         warn "python3 cannot import backends from $LIBDIR_RUNTIME"
@@ -566,6 +621,12 @@ if [[ -z $DESTDIR ]]; then
     # One JSON object on stdout and nothing else, exit 0 - the whole contract in
     # one call. Only the verdict is printed: health output names safes and paths,
     # and this runs in a group-readable job log (I15).
+    #
+    # Deliberately NOT run with PYTHONDONTWRITEBYTECODE=1, even though that
+    # would also stop the bytecode: the helper has to be smoke-tested in the
+    # environment it will really run in. It sets `sys.dont_write_bytecode`
+    # itself, and section 5b is what proves it - handing it the variable here
+    # would test the variable instead of the helper.
     if out="$("$HELPER_DST" health 2>/dev/null)" \
        && printf '%s' "$out" | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if isinstance(d, dict) else 1)' 2>/dev/null; then
         note "secrets-admin health: one JSON object, exit 0"
@@ -575,6 +636,80 @@ if [[ -z $DESTDIR ]]; then
 else
     note "staged into $DESTDIR; smoke test skipped (the helper is not at its runtime path)"
 fi
+
+# ======================================================================
+# 5b. the library root holds exactly what we installed - ASSERTED, LAST
+# ======================================================================
+# The header of this file claims a precise list of what the installation
+# contains. That claim was false for a release: the sweep in section 2 removed
+# the bytecode and section 5 imported the package again and recreated it, four
+# root-owned .pyc files in two different modes from two different umasks
+# (docs/ROOT-VERIFICATION.md F1). The comment saying why bytecode does not
+# belong there was still sitting eight lines above the code that wrote it.
+#
+# So the invariant is now CHECKED here rather than asserted in prose, and it is
+# checked LAST - after the sweep, after both verification steps, after anything
+# else this script might grow. A future change that imports the package one more
+# time, or a helper that starts writing bytecode again, cannot pass this
+# quietly.
+#
+# It repairs and reports rather than dying: at this point the package is
+# installed and working, and the defect is in the installer, not the
+# installation. `warn` is not a quiet channel - it prints to stderr, it lists
+# the file in the "Action required" block below, and tests/root/20-verify-
+# install.sh fails an install that emits any such line. That is where this
+# becomes a test failure.
+assert_library_root_clean() {
+    [[ -d $LIBDIR ]] || return 0
+    local stray=() existing base
+
+    shopt -s nullglob dotglob
+    # Top level: the two package directories, plus the agent's two names. The
+    # agent names are allowed unconditionally, NOT only under --with-agent: a
+    # plain reinstall on a host where somebody installed the agent must not
+    # delete the code their systemd units point at. Uninstall is where the agent
+    # goes away, and it does so by name.
+    for existing in "$LIBDIR"/*; do
+        base="$(basename -- "$existing")"
+        case "$base" in
+            backends|schema|agent|secrets-agent) continue ;;
+        esac
+        stray+=("$existing")
+    done
+    # backends/ - exactly the source's *.py and nothing else. This is the
+    # directory F1 was measured in.
+    for existing in "$LIBDIR"/backends/*; do
+        base="$(basename -- "$existing")"
+        [[ $base == *.py && -f "$SRC/backends/$base" ]] && continue
+        stray+=("$existing")
+    done
+    # schema/ - exactly the source's *.json.
+    for existing in "$LIBDIR"/schema/*; do
+        base="$(basename -- "$existing")"
+        [[ $base == *.json && -f "$SRC/schema/$base" ]] && continue
+        stray+=("$existing")
+    done
+    # agent/ only when it is installed. Same rule, same reason: it is a Python
+    # package imported from a root-owned directory.
+    if [[ -d "$LIBDIR/agent" ]]; then
+        for existing in "$LIBDIR"/agent/*; do
+            base="$(basename -- "$existing")"
+            [[ $base == *.py && -f "$SRC/agent/$base" ]] && continue
+            stray+=("$existing")
+        done
+    fi
+    shopt -u nullglob dotglob
+
+    if ((${#stray[@]} == 0)); then
+        note "library root holds exactly the installed payload (no bytecode, no strays)"
+        return 0
+    fi
+    for existing in "${stray[@]}"; do
+        rm -rf -- "$existing"; changed "removed unexpected $existing"
+    done
+    warn "the library root contained ${#stray[@]} file(s)/directory(ies) this installer did not put there - removed, but something in THIS script or in secrets-admin wrote them after the stale-file sweep. See docs/ROOT-VERIFICATION.md F1: ${stray[*]}"
+}
+assert_library_root_clean
 
 # ======================================================================
 # 6. what changed, and what the operator does next

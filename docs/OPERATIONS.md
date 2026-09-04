@@ -19,7 +19,14 @@ interface, [`CONTRACT.md`](CONTRACT.md); for who it defends against,
 | `/usr/local/lib/cockpit-secrets/` | `0755 root:root` | `backends/`, `schema/` |
 | `/var/log/cockpit-secrets/audit.log` | `0600 root:root` | verb, safe, uid, outcome — never a value |
 | `/var/lib/cockpit-secrets/state/` | `0700 root:root` | per-(uid, safe) unlock-failure counters (I16) |
+| `/var/lib/cockpit-secrets/exports/` | `0700 root:root` | **plaintext exports, if anyone ever ran the export verb** (I21) — §8 |
 | `<safe>.bak.d/` | `0700`, files `0600` | the backup ring — the only undo this program has |
+
+Every one of those survives `--uninstall`. The exports directory is the one to
+look in first on a host you have inherited: it is created empty by `install.sh`
+and it stays empty unless somebody deliberately dumped a safe in the clear, so
+one `ls` answers a question you would otherwise have to reconstruct from the
+audit log. See [§8, "The exports directory"](#the-exports-directory--find-it-read-the-ledger-destroy-the-file).
 
 > **One rule that overrides convenience everywhere below.** Root work on this
 > host goes through the `/srv/jobs` runner and **its `output.log` is
@@ -365,8 +372,18 @@ log `0644` publishes who holds which safes to every user on the host.
 ### Lockout state (I16)
 
 Repeated failures against one `(uid, safe id)` back off exponentially and then
-lock out. The counters are in `/var/lib/cockpit-secrets/state/`. The page shows
-the remaining time; `locked-out` is a distinct error code from `bad-credential`.
+lock out. The counters are in `/var/lib/cockpit-secrets/state/`, one file per
+pair, named `fail.<uid>.<safe id>.json`, `0600`. The page shows the remaining
+time; `locked-out` is a distinct error code from `bad-credential`.
+
+**A counter file exists only while there have been failures.** A successful
+unlock *removes* it — it does not zero it. So `ls /var/lib/cockpit-secrets/state/`
+is a straight answer to "who is currently failing against what", with no need to
+read any of the files. (Before this was fixed, the first successful unlock of
+every pair left a zeroed counter behind for good, so the directory filled up
+with files that meant nothing; a file there did not mean what it looks like it
+means. If you see zeroed counters on an older host, they are inert and safe to
+delete — see `docs/ROOT-VERIFICATION.md` F2.)
 
 Root can clear a lockout by removing that pair's state file. Treat it as a
 security-relevant action: you are re-arming a guessing budget against a safe, and
@@ -447,6 +464,94 @@ copy-on-write filesystem does not overwrite anything — and remember it is not
 covered by the backup ring, the audit trail of *reads*, or any of the file-mode
 guards that protect the safe.
 
+### The exports directory — find it, read the ledger, destroy the file
+
+`install.sh` creates **`/var/lib/cockpit-secrets/exports/`, `0700 root:root`,
+empty**, at install time. The helper would create it on first use anyway, so
+this is not load-bearing — it is so the directory exists *before* anything lands
+in it. A directory that appears the first time somebody dumps a safe in the
+clear is a directory nobody has ever looked at.
+
+`--uninstall` keeps it, along with the registry, the audit log and the lockout
+counters. Removing the software must not be the moment plaintext copies of your
+safes silently disappear — or silently survive unnoticed, which is the more
+likely of the two.
+
+**1 · Which safes can be dumped, and where would it land.** Ask the helper, not
+the directory: an entry may set its own `export_dir`, so there can be more than
+one such directory on the host and only the registry knows them all.
+
+```bash
+secrets-admin health | python3 -c 'import json,sys
+h = json.load(sys.stdin)["export"]
+print("default:", h["default_dir"])
+for row in h["enabled_safes"]:
+    print("  %-20s %-6s -> %s" % (row["safe"], row["access"], row["dir"]))'
+```
+
+`enabled_safes` empty is the answer you want: no registry entry sets
+`export_allowed`, so no export can be written at all.
+
+The sample output here and in steps 2 and 3 was measured against a **hermetic
+test registry** with one export-enabled safe, so its paths are the test root's
+(`COCKPIT_SECRETS_VAR` moves them; see the helper's "test seams"). On a real
+host they read `/var/lib/…` instead — `default_dir` is reported unmoved, which
+is why it is in the output at all:
+
+```
+default: /var/lib/cockpit-secrets/exports
+  lab-export           admin  -> …/var/exports
+```
+
+**2 · What is in it right now.** Root only — the directory is `0700`:
+
+```bash
+ls -l /var/lib/cockpit-secrets/exports/
+# -rw------- 1 root root 1742 …  lab-export-20260904T091822Z.csv
+```
+
+The name is minted by the helper as `<safe id>-<UTC stamp>.<ext>`, so the file
+names alone tell you which safe and when. `O_EXCL`, so an export never
+overwrites an earlier one: two dumps of the same safe are two files.
+
+**3 · The ledger.** Every export attempt is in the audit log, and a successful
+one carries the file name and the row count — never the content (I15/I21). This
+finds exports that were written and then *moved somewhere else*, which is the
+case an `ls` cannot see:
+
+```bash
+python3 -c 'import json,sys
+for ln in open("/var/log/cockpit-secrets/audit.log"):
+    d = json.loads(ln)
+    if d["verb"] == "export":
+        print(d["ts"], d["outcome"], d["safe"], d["artifact"], d["rows"])'
+# 2026-09-04T09:18:22.123Z ok lab-export lab-export-20260904T091822Z.csv 6
+```
+
+An `outcome` that is not `ok` is a refused attempt — someone tried. Those are
+worth reading in their own right: the export gate is four separate refusals, and
+a run of them is a person working through the checklist.
+
+**4 · Destroy it.** `shred -u`, not `rm`:
+
+```bash
+shred -u /var/lib/cockpit-secrets/exports/*
+```
+
+Say plainly what that does and does not buy you on this host. `/var` here is
+**ext4** (`/dev/nvme0n1p2`), so `shred` overwriting in place is meaningful —
+which it would **not** be on btrfs, ZFS or any copy-on-write filesystem, where
+the overwrite lands in a new extent and the old one stays until it is reused.
+Nothing overwrites the page cache, a snapshot, a backup of `/var`, or a copy you
+made somewhere else. An export that has been on disk for a week has been backed
+up; shredding the original does not reach the backup. The only version of this
+that is fully true is not writing the export in the first place.
+
+Nothing expires an export: there is no retention, no rotation, no cleanup timer,
+and deliberately so — a program that deleted evidence of its own plaintext dumps
+on a schedule would be worse. The directory is your responsibility from the
+moment you set `export_allowed: true`.
+
 **Attachments are different, deliberately.** An attachment download streams
 through the Cockpit channel to your browser rather than landing on this host's
 disk. There is no attachment-export-to-path verb, for exactly the reason above.
@@ -458,11 +563,19 @@ sudo ./install.sh --uninstall
 ```
 
 Removes the Cockpit package, the helper, the backends, the schema and any agent
-unit. **Keeps** `/etc/cockpit-secrets/` (registry and safes),
-`/var/log/cockpit-secrets/` (the audit log) and `/var/lib/cockpit-secrets/`
-(lockout counters) — removing a program must not silently change who may open
-what, and an uninstall must not be a way to clear a lockout. The installer
-prints the exact `rm -rf` if you really want those gone.
+unit — both the per-user units and the `secrets-agent@.service` system template,
+which `--with-agent` installs and an earlier version of the uninstall left
+behind. **Keeps** `/etc/cockpit-secrets/` (registry and safes),
+`/var/log/cockpit-secrets/` (the audit log), `/var/lib/cockpit-secrets/state/`
+(lockout counters) and `/var/lib/cockpit-secrets/exports/` — removing a program
+must not silently change who may open what, and an uninstall must not be a way
+to clear a lockout. The installer prints the exact `rm -rf` if you really want
+those gone.
+
+**Look in the exports directory before you type that `rm -rf`.** It is the one
+kept location that can hold plaintext copies of your safes, and `rm -rf` is not
+how you destroy those — [§8](#the-exports-directory--find-it-read-the-ledger-destroy-the-file)
+has the ledger query and the `shred`.
 
 It does not restart Cockpit. The page disappears from the menu on the next
 login.

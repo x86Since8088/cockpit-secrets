@@ -7,11 +7,17 @@ argv.**
 - The plugin never runs raw commands. It calls ONE helper, `/usr/local/sbin/secrets-admin`,
   with a narrow verb.
 - Every verb prints **exactly one JSON object on stdout and nothing else**. Diagnostics go to
-  stderr. Exit 0 = success; on failure stdout carries `{"error": "..."}` and exit ≠ 0.
+  stderr. Exit 0 = success; on failure stdout carries `{"error": "..."}` and exit ≠ 0. The one
+  exception is `open`, which is a session and writes one object per request line — that is
+  what makes it the only verb dispatched separately.
 - The UI renders nothing it invented: every form, control, validation rule and label comes
   from `secrets-admin schema`.
 - **No verb accepts a secret as an argument.** Passwords, key-file bytes and new values are
   fields of the JSON request object on stdin (I10).
+
+**This file is the interface, and the whole build coordinates through it.** Where it and the
+`schema` verb disagree, the schema is what the page actually reads — so a disagreement is a
+bug in this file and gets fixed here, not worked around there. Schema version 2; helper 1.0.0.
 
 ## Invocation
 
@@ -73,52 +79,90 @@ Verbs take a registry **id**; there is no verb that opens a caller-supplied path
 }
 ```
 
-`export_dir` and `breach_corpus` are **extensions** to the original entry, added
-with the verbs below. Both are helper-side absolute paths, never a path from a
-request (I4). `export_dir` is refused under `/tmp`, `/var/tmp` and `/dev/shm`,
-and setting it while `export_allowed` is false is refused rather than ignored —
-the two are one decision. `breach_corpus` names an offline file and nothing
-else: **there is no online fallback and there will not be one.**
+Those sixteen keys are the whole vocabulary. `export_dir` and `breach_corpus` were the last
+two added, with the verbs below; both are helper-side absolute paths, never a path from a
+request (I4). `export_dir` is refused under `/tmp`, `/var/tmp` and `/dev/shm`, and setting it
+while `export_allowed` is false is refused rather than ignored — the two are one decision.
+`breach_corpus` names an offline file and nothing else: **there is no online fallback and there
+will not be one.**
+
+### An unknown key drops the entry
+
+`schema/safe-registry.schema.json` is `additionalProperties: false` and every key this helper
+validates is declared in it, so the two move together and an entry naming anything else is
+**dropped**, with the reason in `health.registry_errors`. There is no tolerated class of schema
+error and no key that is waved through: `"acess": "user"` half-applied would be the permissive
+half (I1).
+
+There was briefly an accommodation for exactly `export_dir` and `breach_corpus` — the helper
+validated them before the schema file listed them, and without it an operator who added one
+lost the whole entry on a host whose schema file lagged. It is **gone**, along with the
+`registry_drift` key `health` used to report it through. The remedy for a helper that gains a
+field is to ship the schema file with it, which is what `install.sh` does.
 
 ## Verbs
 
+Thirty-three verbs. `schema` publishes all of them with their request fields, response keys,
+`danger`/`mutates`/`needs` flags and a `breaks_when_wrong` sentence each; the tables here are
+the prose, and the schema is the machine-readable form the page builds from.
+
 ```
-secrets-admin schema                  -> { version, verbs[], groups[], fields[], enums{} }
-secrets-admin list                    -> { safes:[{id,label,format,access,mode,locked,reason}] }
+secrets-admin schema                  -> { version, verbs[], groups[], fields[], enums{},
+                                           constants{}, ui_rules[] }
+secrets-admin list                    -> { safes:[{id,label,format,access,mode,locked,reason,
+                                           usable}] }
 secrets-admin probe    <stdin:{safe}> -> { format, version, kdf, iterations, needs_password,
-                                           needs_keyfile, writable, warnings:[] }
-secrets-admin unlock   <stdin:{safe,password,keyfile_b64,session}>
-                                      -> { handle, expires_in, entries_total, groups_total, warnings:[] }
+                                           needs_keyfile, writable, needs_challenge,
+                                           challenge_b64, yubikey_slot, warnings:[] }
+secrets-admin unlock   <stdin:{safe,password,keyfile_b64,yubikey_response,session,max_seconds}>
+                                      -> { handle, expires_in, entries_total, groups_total,
+                                           warnings:[], agent? }
+secrets-admin open     <stdin: request frames, one JSON object per line>
+                                      -> a banner frame, one reply per frame, a closing frame
 secrets-admin tree     <stdin:{handle}>        -> { groups:[{uuid,name,parent,count}] }
 secrets-admin entries  <stdin:{handle,group,query,offset,limit}>
                                       -> { total, entries:[{uuid,title,username,url,tags,
                                            has_totp,attachments,modified}] }   # NO passwords
-secrets-admin reveal   <stdin:{handle,uuid,field}>   -> { field, value, expires_in }
+secrets-admin reveal   <stdin:{handle,uuid,field}>
+                                      -> { field, value, expires_in, resolved_field? }
 secrets-admin totp     <stdin:{handle,uuid}>         -> { code, seconds_remaining }
-secrets-admin attach-get <stdin:{handle,uuid,name}>  -> { name, size, b64 }
-secrets-admin add      <stdin:{handle,group,entry}>  -> { uuid }
-secrets-admin edit     <stdin:{handle,uuid,changes}> -> { uuid, changed:[...] }
-secrets-admin move     <stdin:{handle,uuid,group}>   -> { ok:true }
-secrets-admin rm       <stdin:{handle,uuid,permanent}> -> { ok:true, recycled:bool }
-secrets-admin group-add / group-rm / group-mv         -> { ok:true }
-secrets-admin save     <stdin:{handle}>  -> { ok:true, backup, bytes, conflict:false }
-secrets-admin lock     <stdin:{handle}>  -> { ok:true }
-secrets-admin generate <stdin:{policy}>  -> { value, entropy_bits }
+secrets-admin attach-list <stdin:{handle,uuid}>      -> { uuid, total,
+                                                          attachments:[{name,size}] }
+secrets-admin attach-get  <stdin:{handle,uuid,name}> -> { name, size, b64 }
+secrets-admin add      <stdin:{handle,group,entry,autosave,override_stale}>
+                                                     -> { uuid, saved }
+secrets-admin edit     <stdin:{handle,uuid,changes,autosave,override_stale}>
+                                                     -> { uuid, changed:[...], saved }
+secrets-admin move     <stdin:{handle,uuid,group,…}>      -> { ok:true, saved }
+secrets-admin rm       <stdin:{handle,uuid,permanent,…}>  -> { ok:true, recycled, saved }
+secrets-admin group-add / group-rm / group-mv             -> { ok:true, saved }
+secrets-admin save     <stdin:{handle,override_stale}>
+                                      -> { ok:true, backup, bytes, conflict:false }
+secrets-admin lock     <stdin:{handle|safe}>
+                                      -> { ok:true, locked, agent_dropped? }
+secrets-admin generate <stdin:{policy}>  -> { value, entropy_bits, calculation,
+                                              alphabet_size }
 secrets-admin health                     -> { backends:{kdbx:…, psafe3:…}, registry_errors:[],
-                                             registry_drift:[], agent:{…}, export:{…}, breach:{…} }
+                                              registry_gate:{…}, agent:{…}, export:{…},
+                                              breach:{…}, hardening:{…}, state:{…} }
 secrets-admin audit-tail --n N           -> { entries:[…] }        # metadata only, never values
 ```
 
+Every mutating verb takes `autosave` and `override_stale`, and every handle-taking verb accepts
+the credential fields instead of a handle for a single-shot invocation — that is what
+`request` in the schema means by `auth` (`handle`, `safe`, `password`, `keyfile_b64`,
+`yubikey_response`, `session`).
+
 ### Verbs added after the first build
 
-These **extend** the table above; nothing above changed shape. `unlock` gained
-one optional request field and one conditional response key, and `lock` gained
-an alternative way to name what to lock. Everything else is new.
+These **extend** the table above; nothing above changed shape. `unlock` gained one optional
+request field and one conditional response key, and `lock` gained an alternative way to name
+what to lock. Everything else is new.
 
 ```
 secrets-admin history   <stdin:{handle|safe+credentials, uuid}>
                         -> { uuid, total, versions:[{index,when,title,username,
-                             url,has_password,notes_len}] }        # NO passwords
+                             url,has_password,notes_len}], truncated?, warning? }   # NO passwords
 secrets-admin history-restore <stdin:{…, uuid, index, autosave}>
                         -> { uuid, restored_from, saved }
 secrets-admin attach-add <stdin:{…, uuid, name, data_b64, replace, autosave}>
@@ -175,8 +219,115 @@ before it is a feature:
   enumerate every password an entry has ever held.
 - **`attach-add` takes base64 on the wire and the backend takes bytes.** The
   ceiling that actually bites is `MAX_REQUEST_BYTES` (1 MiB for the whole JSON
-  object), not `MAX_ATTACHMENT_BYTES` — base64 costs a third, so roughly 760
-  KiB of attachment fits. Both are checked; the schema's help text names both.
+  object), not `MAX_ATTACHMENT_BYTES` (32 MiB) — base64 costs a third, so
+  roughly 760 KiB of attachment fits. Both are checked; the schema's help text
+  names both.
+
+### `attach-list` — names in, bytes out
+
+`entries` reports `attachments` as a **count**, on purpose: a listing must be able to show
+that an entry HAS attachments without shipping them. A count is not addressable, though, and
+`attach-get` is addressed by **name** — so until this verb existed a file could be uploaded
+through `attach-add` and never fetched again, because nothing ever told the page what it was
+called. `attach-list` is the missing half, and it is deliberately narrow:
+
+```
+attach-list <stdin:{handle|safe+credentials, uuid}>
+    -> { uuid, total, attachments: [{name, size}] }
+```
+
+- **No bytes, ever.** It is not in the helper's `VALUE_BEARING_VERBS`, so the response goes
+  through the same scrubber every listing does — a backend that returned a `b64` key here
+  would lose it and be reported on stderr.
+- **`size` is the declared length and is reported even when it exceeds
+  `MAX_ATTACHMENT_BYTES`.** "There is a 40 MiB file here that this transport will not carry"
+  is a more useful answer than an invisible row; `attach-get` is where the cap refuses.
+- **An entry with no attachments answers `[]`; an unknown uuid answers `not-found`.** An empty
+  list is a statement about the entry, not about the request.
+- **The two formats differ in what the list can hold, not in the shape of it.** KDBX4 gives an
+  entry any number of binaries. **Password Safe v3 gives a record at most one** — a record is a
+  list of typed fields and a type appears at most once, so there is nowhere to put a second Att
+  Content (§3.3 note [30], fields 0x25..0x29, introduced in format 0x030F / PasswordSafe
+  V3.68). PWS3 therefore answers a list that is empty or one row long, always. A database
+  declaring an older format version simply has no such fields and lists nothing; it is
+  `attach-add` that refuses, naming the version, because a version is a reason not to WRITE and
+  not a reason to misreport what the file already contains.
+
+## The `entry` and `changes` objects
+
+`add` takes a whole `entry`; `edit` takes a partial `changes` and returns the field NAMES it
+changed, never the values. Both are described by the same nine sub-fields in the schema, and
+**all nine are honoured by both backends or refused with the format's own reason** — a name a
+schema-driven form can send and the backend then calls "unknown" is a control that can only
+ever fail.
+
+| sub-field | type | KDBX | Password Safe v3 |
+|---|---|---|---|
+| `title` | string | Title | Title (0x03) |
+| `username` | string | UserName | Username (0x04) |
+| `password` | string, **secret** | Password | Password (0x06), old value pushed to History (0x0f) |
+| `url` | string | URL | URL (0x0d) |
+| `notes` | string | Notes | Notes (0x05) |
+| `tags` | array of strings | Tags | **`unsupported`** — §3.3 lists no tag field |
+| `totp_uri` | `otpauth://` URI, **secret** | the `otp` string field | parsed into Two Factor Key (0x1b) + TOTP Length/Time Step |
+| `expires` | ISO-8601 UTC, or null for never | ExpiryTime **and** the Expires flag | Password Expiry Time (0x0a); null deletes it |
+| `custom` | object, **secret** | named string fields | **`unsupported`** — no name-keyed field space |
+
+Three of those are worth stating rather than leaving in a table:
+
+- **`totp_uri` is a URI on the wire and a SEED in the file.** PWS3 stores the raw seed, not
+  base32 and not the URI, so the URI is taken apart helper-side; storing the text verbatim
+  would produce an entry whose codes are always wrong. `otpauth://hotp` and an `algorithm`
+  other than SHA-1 are refused with `unsupported`, because §3.3 note [29] defines only SHA-1
+  and there is no counter field.
+- **`expires` sets the DATE.** It used to be read as a bare boolean on KDBX, so a page that
+  sent the timestamp the schema asked for set the flag, left the date alone, and got
+  `changed: ["expires"]` back — a wrong answer that reported success, on the one field where
+  the wrong answer is "this credential never expires". A string now sets both; a bool is the
+  flag alone (KDBX only — PWS3 stores only a date and refuses a bare `true`); null or `""` is
+  never.
+- **`custom` is a MAP, and the whole of what a "custom field" is here.**
+
+```json
+"changes": {
+  "custom": {
+    "API token":     { "value": "…", "protected": true },
+    "Support phone": { "value": "+44…", "protected": false },
+    "Old field":     null
+  }
+}
+```
+
+  - The **key** is the field's name inside the entry. KeePass reserves `Title`, `UserName`,
+    `Password`, `URL`, `Notes`, `Tags`, `IconID`, `Times`, `History` and `otp`; those ten are
+    refused (`invalid`). pykeepass guards this with an `assert`, which vanishes under `-O`, so
+    the backend checks it itself — and `custom:Password` would otherwise be a third spelling of
+    the door that reads the master password while the audit line said "custom field". The
+    schema publishes the key's rule as a field descriptor of its own (`fields[].key`), so a
+    renderer does not have to assume it.
+  - The **value** is `{value, protected}`. A bare string is shorthand for a protected value.
+    `null` DELETES the named field — meaningful on `changes`, where there is something to
+    delete.
+  - **`protected` defaults to `true`, and setting it false stores the value as plain text
+    inside the database.** It is still encrypted with the file, but KeePassXC shows it unmasked
+    in the entry view and exports it unmasked, and this page lists its name with the
+    unprotected fields. Nothing warns about it later; the flag is only recorded.
+  - Only the names sent are touched. The entry's other custom fields are left alone.
+  - **Reading one back is `reveal` with `field: "custom:<name>"`** — the same door as every
+    other value, one field, one audit line. `entries` never carries a custom field's value, and
+    `attach-list`'s sibling for field names is KDBX's `fields()`, which is not yet a verb.
+  - **Password Safe v3 answers `unsupported` and names the limit.** A PWS3 record is a list of
+    TYPED fields, each type appearing at most once; 0xdf ("custom-text-field") is one such
+    type, not a dictionary. There is nowhere to create a named field. Writing it into Notes
+    would invent a convention no other Password Safe implementation reads, so it is refused
+    instead — keep entries that need custom fields in a KDBX safe.
+
+The schema declares `custom` with `control: "json"` and `secret: true`. `json` is the control
+the shipped renderer can actually draw for a map whose keys are the operator's, and `secret`
+puts it on the right side of every rule that matters: it is excluded from the non-secret
+`values()` path, written into the request immediately before the spawn, and wiped after (I11).
+`fields[].key` and `fields[].fields` describe the key and the value shapes for a renderer that
+grows a proper key/value control later; neither is required to draw it today.
 
 ### `handle` semantics — the part that decides whether this is safe
 
@@ -220,6 +371,35 @@ as a per-safe opt-in — but nothing in this tree produces key material, nothing
 `secrets-admin` strips a `material` key out of any agent reply at the door. Implementing a real
 reattach starts by deleting that line, deliberately.
 
+##### The ticket protocol on the wire
+
+Newline-delimited JSON over the `AF_UNIX` socket, one request object per line, one reply per
+line, UTF-8, every line capped; a malformed or oversized line is answered and then the
+connection is closed. Four operations, and `secrets-admin` is only ever the client:
+
+```
+-> {"op":"put","safe":"lab-dc","handle":"<token>","idle_seconds":300,"max_seconds":3600}
+<- {"ok":true,"handle":"<token>","safe":"lab-dc","expires_in":3600,
+    "idle_seconds":300,"max_seconds":3600,"material_held":false}
+
+-> {"op":"get","safe":"lab-dc","handle":"<token>"}
+<- {"ok":true,"safe":"lab-dc","material_held":false,"expires_in":2871,
+    "idle_expires_in":300}
+
+-> {"op":"drop","safe":"lab-dc"}        # or {"handle":…} / {"all":true}
+<- {"ok":true,"dropped":1}
+
+-> {"op":"status"}
+<- {"ok":true,"pid":…,"owner_uid":…,"holdings":[…],"idle_seconds":…,"max_seconds":…,
+    "clock":"BOOTTIME","socket":{…},"session":{…}}
+```
+
+`material` is optional on `put` and this client never sends it, so `material_held` is always
+`false` and `get` carries no `material` key — that is the ticket, and it is the whole of what
+the daemon holds. Errors use the taxonomy below verbatim, and an unknown handle and another
+uid's handle return the SAME `access-denied`: distinguishing them would turn `get` into an
+enumeration oracle that says which tokens exist.
+
 Four rules the helper's agent client keeps, in order of how much they matter: **off unless the
 registry says otherwise**; **never start the daemon** (no fork, no exec, no socket activation, no
 creating the run directory); **never fail a verb because of the agent** (every call returns None
@@ -240,6 +420,14 @@ One shape, deliberately coarse so it cannot be used as an oracle (I6):
 `bad-credential` covers both a wrong password and a failed MAC, and the failure path has a
 constant time floor. The distinction is recorded in the audit log, not returned.
 
+Two of the eight are routinely confused and the difference is what an operator does next:
+**`invalid` means the request was malformed** — the caller can fix it and try again.
+**`unsupported` means the FORMAT cannot do this** — the request was correct and the answer will
+not change until the safe is a different file. Every place a backend cannot honour a
+well-formed request (`tags` and `custom` on PWS3, `otpauth://hotp`, writing a KDBX3) answers
+`unsupported` with the format's own reason, never `invalid`, because `invalid` reads as "you
+typed that wrong".
+
 ## Non-negotiables
 
 1. No secret on argv, in the environment, or in a temp file (I10).
@@ -253,3 +441,5 @@ constant time floor. The distinction is recorded in the audit log, not returned.
 6. Access class is enforced in the helper on every verb, never in the browser (I3).
 7. The audit log records verb, safe, uid and outcome — never a value, never a traceback (I15).
 8. No `set -x` in any wrapper. No CSP relaxation in `manifest.json` (I9).
+9. **The passphrase is prompted on EVERY unlock** (I18), which the agent's ticket keeps true
+   by construction rather than by policy.

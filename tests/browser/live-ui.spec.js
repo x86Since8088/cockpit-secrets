@@ -49,8 +49,8 @@ const ITEMS = {
     2: "The safe list renders both classes, admin first, unreachable disabled with a reason",
     3: "The unlock flow end to end: wrong, right, entries, reveal, re-mask, copy, clear",
     4: "I11 — nothing is left in the browser after a successful unlock",
-    5: "The passphrase is demanded EVERY time: lock, then operate again",
-    6: "Full management: add, edit, custom field, attach, download, history, save, reopen",
+    5: "The passphrase is demanded EVERY time: after a lock, after a page reload, and in a fresh tab",
+    6: "Full management in BOTH formats: add, edit, custom field, attach, list, download, history, save, reopen",
     7: "The conflict path surfaces a decision, not an alert",
     10: "Accessibility: keyboard-only unlock with a focus trap, and usable at 200%"
 };
@@ -74,12 +74,58 @@ function pickSafe(list, want) {
     return null;
 }
 
+/* One writable, reachable, passphrase-bearing safe PER FORMAT.
+ *
+ * Item 6 says "both formats", and a KDBX file and a Password Safe v3 file do
+ * not merely differ in their bytes: a PWS3 record is a list of TYPED fields, so
+ * custom fields are `unsupported` and only one attachment can exist. Driving
+ * one format and reporting "management works" would be a claim about half the
+ * program. One safe per format is the smallest set that cannot say that. */
+function pickPerFormat(list) {
+    const out = [];
+    const seen = {};
+    for (const s of ((list && list.safes) || [])) {
+        if (!reachable(s)) continue;
+        if (s.mode === "ro") continue;
+        if (!H.safePassphrase(s.id)) continue;
+        const f = String(s.format || "?");
+        if (seen[f]) continue;
+        seen[f] = 1;
+        out.push(s);
+    }
+    return out;
+}
+
 /* The card for one registry id. `.sec-safe-id` carries the id verbatim, which
  * is what makes a card addressable without depending on its label. */
 function cardFor(frame, id) {
     return frame.locator(".sec-safe").filter({
         has: frame.locator(`.sec-safe-id:text-is("${id}")`)
     });
+}
+
+/* WAIT FOR THE LIST TO HAVE LANDED, not merely for the page to have started.
+ *
+ * `openPlugin()` returns as soon as init() has rewritten #sec-sub from the
+ * schema — which is a DIFFERENT verb from `list`, answered by a different
+ * helper process. Counting cards straight after it reads an empty #sec-safes
+ * that still says "Loading the safe registry…", and an assertion about how many
+ * safes are unreachable then passes or fails on which spawn won a race.
+ *
+ * Measured, not theorised: this is exactly how item 2 read "cptest sees 0
+ * safe(s) rendered unreachable" against a page that a moment later showed two
+ * (artifacts/02-safes-nonadmin.png from that run is the "Loading…" state).
+ * A settled list is one with cards, an explicit empty-registry line, or an
+ * error — all three are answers; "Loading…" is not. */
+async function waitForSafeList(frame, timeout) {
+    await frame.waitForFunction(() => {
+        const host = document.getElementById("sec-safes");
+        if (!host) return false;
+        if (host.querySelector(".sec-safe")) return true;
+        if (host.querySelector(".sec-alert")) return true;
+        const t = (host.textContent || "").trim();
+        return !!t && !/^Loading/i.test(t);
+    }, null, { timeout: timeout || 30000 });
 }
 
 async function openUnlockDialog(frame, id) {
@@ -92,6 +138,62 @@ async function openUnlockDialog(frame, id) {
 async function submitUnlock(frame, passphrase) {
     await frame.locator(".sec-modal input[type=password]").last().fill(passphrase);
     await frame.locator('.sec-modal button:text-is("Unlock")').last().click();
+}
+
+/* WHAT THE UNLOCK ACTUALLY DID — the browse view, or the helper's error code.
+ *
+ * `submit()` in secrets.js clears the dialog's error host and disables Unlock
+ * before it spawns, so by the time this starts polling the PREVIOUS attempt's
+ * alert is already gone and what it reads is this attempt's answer. */
+async function unlockOutcome(frame, timeout) {
+    const h = await frame.waitForFunction(() => {
+        const v = document.getElementById("sec-browse-view");
+        if (v && !v.hidden) return { ok: true, code: "", detail: "" };
+        const modal = document.querySelector(".sec-backdrop .sec-modal");
+        if (!modal) return null;
+        const a = modal.querySelector(".sec-alert.err");
+        if (!a) return null;
+        const c = a.querySelector(".sec-code");
+        return { ok: false,
+                 code: String((c && c.textContent) || "").trim(),
+                 detail: String(a.textContent || "").trim().slice(0, 240) };
+    }, null, { timeout: timeout || 120000 }).catch(() => null);
+    return h ? h.jsonValue() : null;
+}
+
+/* Unlock with the CORRECT passphrase, waiting out I16's backoff.
+ *
+ * ONE WRONG PASSPHRASE IS ENOUGH TO REFUSE THE RIGHT ONE, and that is the
+ * program working. `lockout_fail()` writes locked_until = now + 2 s
+ * (LOCKOUT_BASE_SECONDS) after a single failure, so item 3's correct attempt —
+ * typed a second later, because a screenshot and four assertions happen in
+ * between — comes back `locked-out`, not unlocked. Measured on the first live
+ * run of this suite: "too many failed unlock attempts for this safe; try again
+ * in 1 seconds", and the suite then sat on #sec-browse-view for its whole
+ * 120 s timeout and reported the walkthrough as aborted.
+ *
+ * The wait is taken from the helper's OWN sentence rather than from a constant
+ * copied out of secrets-admin: a suite that hard-coded 2 s would keep passing
+ * after the backoff policy changed, which is the failure this file exists to
+ * avoid. The retry budget is bounded, and a refusal that is not `locked-out` is
+ * returned immediately — a wrong passphrase must never be retried. */
+async function unlockAndWaitOutBackoff(frame, pass, it, budgetMs) {
+    const deadline = Date.now() + (budgetMs || 180000);
+    let waited = 0;
+    for (;;) {
+        await submitUnlock(frame, pass);
+        const out = await unlockOutcome(frame);
+        if (!out) return { ok: false, code: "timeout", detail: "", waited };
+        if (out.ok || out.code !== "locked-out") return Object.assign(out, { waited });
+        const m = /in (\d+) second/.exec(out.detail);
+        const pause = (m ? Math.max(1, Number(m[1])) : 3) * 1000 + 750;
+        if (Date.now() + pause > deadline) return Object.assign(out, { waited });
+        if (it) it.note("the helper is in its I16 backoff (" +
+                        JSON.stringify(out.detail.slice(0, 90)) +
+                        ") — waiting it out and trying the correct passphrase again");
+        waited += pause;
+        await frame.page().waitForTimeout(pause);
+    }
 }
 
 async function inBrowseView(frame) {
@@ -137,11 +239,30 @@ async function setLabelledFile(frame, label, file) {
 }
 
 /* The dialog's run button. verbDialog builds it as `primary`, or `danger` for a
- * verb the helper marked destructive, so both have to be accepted. */
+ * verb the helper marked destructive, so both have to be accepted — but it is
+ * found by WHERE it is, not only by its class.
+ *
+ * THIS SELECTOR USED TO CLICK THE WRONG BUTTON, and the failure was silent.
+ * It was `.sec-modal button.primary, button.danger` filtered on "not Cancel",
+ * first match — which was fine until the custom-field row editor arrived and
+ * put a `danger tiny` "Remove" button in the form ABOVE the action row. From
+ * then on every Add and every Edit in this suite clicked Remove: the row
+ * vanished, the dialog stayed open, no error was shown because nothing had gone
+ * wrong, and the assertion failed thirty seconds later as "the entry never
+ * appeared in the listing". Measured with a probe that dumped the modal's
+ * buttons before and after the click — three Show/Generate pairs before, two
+ * after, and no Remove.
+ *
+ * actionRow() puts the dialog's own buttons in `.sec-form-actions`, so that is
+ * where the run button is looked for. The old selector is kept as a fallback
+ * for a dialog built without an action row, but scoped to the LAST such button
+ * so an in-form control cannot win it. */
 function runButton(frame) {
-    return frame.locator(".sec-modal").last()
-                .locator("button.primary, button.danger")
-                .filter({ hasNotText: "Cancel" }).first();
+    const modal = frame.locator(".sec-modal").last();
+    const inActions = modal.locator(".sec-form-actions button.primary, .sec-form-actions button.danger")
+                           .filter({ hasNotText: "Cancel" });
+    return inActions.or(modal.locator("button.primary, button.danger")
+                             .filter({ hasNotText: "Cancel" }).last()).first();
 }
 
 /* Drive one verb the way devtools would: the page's own bridge, the page's own
@@ -210,13 +331,26 @@ async function main() {
         frame = await H.openPlugin(page);
 
         await item1(page, frame);
+        await waitForSafeList(frame);
+        /* THE BASELINE FOR I11, taken before a single safe has been opened.
+         * The storage areas belong to Cockpit's origin and are not empty, so
+         * the only honest form of "this page stored nothing" is a difference
+         * against what was already there. Everything item 4 and item 5 assert
+         * about storage is measured against this snapshot. */
+        const storage0 = await readStorage(frame);
+        console.log("   storage before any unlock: local " +
+                    JSON.stringify(Object.keys(storage0.local)) + ", session " +
+                    JSON.stringify(Object.keys(storage0.session)));
         const list = await H.liveList(frame);
         H.writeArtifact("live-list.json", JSON.stringify(list, null, 2) + "\n");
         await item2(browser, page, frame, list);
         state = await item3(page, frame, list);
+        if (state) state.storage0 = storage0;
         await item4(page, frame, state);
-        await item5(page, frame, state);
-        await item6(page, frame, state);
+        /* item 5 navigates: it reloads the page and opens a second tab, so the
+         * frame handle it hands back is the live one and the old one is gone. */
+        frame = (await item5(ctx, page, frame, state)) || frame;
+        await item6(page, frame, state, list);
         await item7(browser, page, frame, state, password);
         await item10(page, frame, state);
     } catch (e) {
@@ -364,6 +498,12 @@ async function item2(browser, page, frame, list) {
         try {
             const p2 = await H.login(ctx2, H.CFG.user, upw);
             const f2 = await H.openPlugin(p2);
+            /* openPlugin() returns when the SCHEMA has landed; the safe list is
+             * a different verb and a different helper process. Counting cards
+             * here without waiting read "0 unreachable" off a page still saying
+             * "Loading the safe registry…" — a false FAIL that this suite has
+             * now made twice, once for #sec-safes and once here. */
+            await waitForSafeList(f2);
             const n = await f2.locator(".sec-safe.unreachable").count();
             it.ok(n > 0, H.CFG.user + " sees " + n + " safe(s) rendered unreachable");
             if (n > 0) await assertDisabledCard(f2, it, H.CFG.user);
@@ -443,10 +583,23 @@ async function item3(page, frame, list) {
           JSON.stringify(detail.slice(0, 180)));
     it.shot(await H.shot(page, "03-bad-credential"));
 
-    /* --- the right passphrase unlocks ----------------------------------- */
-    await submitUnlock(frame, pass);
-    await frame.waitForSelector("#sec-browse-view:not([hidden])", { timeout: 120000 });
-    it.ok(await inBrowseView(frame), "the correct passphrase unlocks and the browse view opens");
+    /* --- the right passphrase unlocks -----------------------------------
+     * Through unlockAndWaitOutBackoff, because the wrong attempt above has
+     * just armed I16's backoff and the correct passphrase is legitimately
+     * refused inside it. Waiting it out is not a workaround: the refusal IS
+     * the feature, and the assertion that matters is that the correct
+     * passphrase opens the safe once the window has passed. */
+    const opened = await unlockAndWaitOutBackoff(frame, pass, it);
+    if (opened && opened.waited)
+        it.note("waited " + Math.round(opened.waited / 1000) + " s of I16 backoff, " +
+                "armed by this item's own single wrong attempt");
+    it.ok(!!(opened && opened.ok),
+          "the correct passphrase unlocks and the browse view opens" +
+          (opened && !opened.ok ? " — got " + JSON.stringify(opened.code + ": " + opened.detail) : ""));
+    if (!(opened && opened.ok)) {
+        it.done();
+        return null;
+    }
 
     await frame.waitForSelector("#sec-entries table.sec tbody tr", { timeout: 60000 });
     const rows = await frame.locator("#sec-entries table.sec tbody tr").count();
@@ -460,19 +613,37 @@ async function item3(page, frame, list) {
         return { safe, pass, pwHandle, revealed: null };
     }
 
-    /* --- reveal shows a value and re-masks on its countdown -------------- */
-    await frame.locator("#sec-entries table.sec tbody tr").first()
-               .locator("td button.sec-btn.link").click();
-    await frame.waitForSelector("#sec-detail .sec-reveal", { timeout: 20000 });
-    const widget = frame.locator("#sec-detail .sec-reveal").filter({
-        has: frame.locator('.sec-reveal-label:text-is("Password")')
-    }).first();
-    it.ok((await widget.count()) > 0, "the detail pane offers a Password reveal control");
-
-    const masked = (await widget.locator(".sec-value").innerText()).trim();
-    await widget.locator('button:text-is("Reveal")').click();
-    await widget.locator(".sec-value:not(.masked)").waitFor({ timeout: 30000 });
-    const shown = await widget.locator(".sec-value").innerText();
+    /* --- reveal shows a value and re-masks on its countdown --------------
+     *
+     * NOT simply the first row. This suite ADDS entries — item 6 adds one per
+     * format and item 7 adds two more to make its conflict — and item 7's are
+     * created with a title and nothing else, because a title is all a conflict
+     * needs. Sorted into the listing they come first, so a second run of this
+     * suite revealed the Password of an entry that has none and read "Reveal
+     * shows a value (0 characters)". That was a true statement about the entry
+     * and a useless test of the control, so the entry is now CHOSEN: walk the
+     * listing until one has a password to show, and say so if none does. */
+    let widget = null, masked = null, shown = "";
+    const consider = Math.min(rows, 6);
+    for (let i = 0; i < consider; i++) {
+        await frame.locator("#sec-entries table.sec tbody tr").nth(i)
+                   .locator("td button.sec-btn.link").click();
+        await frame.waitForSelector("#sec-detail .sec-reveal", { timeout: 20000 });
+        const w = frame.locator("#sec-detail .sec-reveal").filter({
+            has: frame.locator('.sec-reveal-label:text-is("Password")')
+        }).first();
+        if (!(await w.count())) continue;
+        const m = (await w.locator(".sec-value").innerText()).trim();
+        await w.locator('button:text-is("Reveal")').click();
+        await w.locator(".sec-value:not(.masked)").waitFor({ timeout: 30000 });
+        const v = await w.locator(".sec-value").innerText();
+        if (v.length && v !== m) { widget = w; masked = m; shown = v; break; }
+        it.note("entry " + (i + 1) + " of " + consider + " has an EMPTY password — the " +
+                "reveal answered and there was nothing in the field; trying the next entry");
+    }
+    it.ok(widget !== null, "the detail pane offers a Password reveal control and an entry " +
+          "with a password was found within the first " + consider + " row(s)");
+    if (!widget) { it.done(); return null; }
     it.ok(shown.length > 0 && shown !== masked,
           "Reveal shows a value (" + shown.length + " characters)");
     const cd = (await widget.locator(".sec-countdown").innerText()).trim();
@@ -517,26 +688,98 @@ async function item3(page, frame, list) {
     return { safe, pass, pwHandle, revealed: shown };
 }
 
+/* Both web-storage areas as {key: valueLENGTH}, plus the cookie NAMES.
+ *
+ * Lengths and names only. A helper written for an I11 test that returned the
+ * values would put every one of them into this suite's own memory and into any
+ * artefact that printed it, which is the hazard rather than a check of it. */
+async function readStorage(target) {
+    return target.evaluate(() => {
+        const dump = (s) => {
+            const o = {};
+            try {
+                for (let i = 0; i < s.length; i++) {
+                    const k = s.key(i);
+                    o[k] = String(s.getItem(k) || "").length;
+                }
+            } catch (e) { /* a storage area the browser refuses is not a leak */ }
+            return o;
+        };
+        return {
+            local: dump(window.localStorage),
+            session: dump(window.sessionStorage),
+            cookies: String(document.cookie || "").split(";")
+                        .map((c) => c.split("=")[0].trim()).filter(Boolean)
+        };
+    });
+}
+
+/* Which keys appeared between two readStorage() snapshots. A key whose VALUE
+ * changed counts too: overwriting Cockpit's own key with a passphrase would
+ * otherwise slip through a names-only comparison. */
+function storageAdded(before, after) {
+    const diff = (b, a) => Object.keys(a).filter(
+        (k) => !Object.prototype.hasOwnProperty.call(b, k) || b[k] !== a[k]);
+    return { local: diff(before.local, after.local),
+             session: diff(before.session, after.session) };
+}
+
+function sameKeys(a, b) {
+    const eq = (x, y) => {
+        const kx = Object.keys(x).sort(), ky = Object.keys(y).sort();
+        return kx.length === ky.length && kx.every((k, i) => k === ky[i]);
+    };
+    return eq(a.local, b.local) && eq(a.session, b.session);
+}
+
 /* ================================================================== item 4 */
 async function item4(page, frame, state) {
     const it = REC.item(4, ITEMS[4]);
     console.log("\n== 4. " + ITEMS[4] + " ==");
     if (!state) { it.skip("item 3 never reached a successful unlock"); it.done(); return; }
 
-    /* Storage areas in the plugin's frame AND in Cockpit's shell page. The
-     * areas are per-ORIGIN and the shell shares the origin, so a passphrase
-     * that leaked into either is readable by any XSS anywhere in Cockpit (I11);
-     * checking only the frame would miss half of the hazard. */
-    const inFrame = await frame.evaluate(() => ({
-        local: localStorage.length, session: sessionStorage.length, cookie: document.cookie
-    }));
-    const inShell = await page.evaluate(() => ({
-        local: localStorage.length, session: sessionStorage.length
-    }));
-    it.ok(inFrame.local === 0, "plugin frame localStorage.length === 0 (read " + inFrame.local + ")");
-    it.ok(inFrame.session === 0, "plugin frame sessionStorage.length === 0 (read " + inFrame.session + ")");
-    it.note("Cockpit's own shell holds " + inShell.local + " localStorage and " +
-            inShell.session + " sessionStorage key(s) — Cockpit's, not this page's");
+    /* THE STORAGE AREAS ARE THE ORIGIN'S, AND THE ORIGIN IS COCKPIT'S.
+     *
+     * This assertion used to read `localStorage.length === 0` in the plugin
+     * frame, and it FAILED on a page that had written nothing. A Cockpit
+     * package page is an iframe on the SAME origin as the shell
+     * (https://localhost:9090), so localStorage and sessionStorage are one
+     * shared area and Cockpit itself keeps things in it — measured on this
+     * host: the same three local and two session keys are visible from the
+     * shell page and from inside the plugin frame, and they are there before
+     * this package is ever opened. There is no way for this page to make that
+     * number zero and it was never this page's number to make.
+     *
+     * What I11 actually says is that THIS PAGE writes nothing there, so the
+     * check is a DIFFERENCE and not an absolute: nothing appeared in either
+     * area across the unlock, no key names this package, and no key or value
+     * anywhere holds the passphrase. A page that stashed a passphrase would
+     * fail the first of those, which is the one the old assertion was reaching
+     * for and missing. The key names are printed so a reader can see whose
+     * they are rather than taking "Cockpit's, not ours" on trust. */
+    const inFrame = await readStorage(frame);
+    const inShell = await readStorage(page);
+    const added = state.storage0 ? storageAdded(state.storage0, inFrame) : null;
+    it.note("storage in the plugin frame: local " + JSON.stringify(Object.keys(inFrame.local)) +
+            ", session " + JSON.stringify(Object.keys(inFrame.session)));
+    it.note("storage in Cockpit's shell page: local " + JSON.stringify(Object.keys(inShell.local)) +
+            ", session " + JSON.stringify(Object.keys(inShell.session)));
+    it.ok(sameKeys(inFrame, inShell),
+          "the plugin frame's storage IS Cockpit's — same origin, same keys — so the " +
+          "count can never be zero and the question is what THIS page added");
+    if (added) {
+        it.ok(!added.local.length && !added.session.length,
+              "the unlock added NOTHING to either storage area (" +
+              JSON.stringify(added.local) + " local, " + JSON.stringify(added.session) +
+              " session, against the baseline taken before any safe was opened)");
+    } else {
+        it.note("no pre-unlock storage baseline was captured, so 'added nothing' could not " +
+                "be checked as a difference; the ownership and passphrase checks below stand.");
+    }
+    const ours = Object.keys(inFrame.local).concat(Object.keys(inFrame.session))
+                       .filter((k) => /secret|^sec[-_.:]/i.test(k));
+    it.ok(!ours.length,
+          "no storage key belongs to this package (" + JSON.stringify(ours) + ")");
 
     /* IndexedDB: the storage area a "we used no localStorage" claim forgets. */
     const idb = await frame.evaluate(async () => {
@@ -602,10 +845,10 @@ async function item4(page, frame, state) {
 }
 
 /* ================================================================== item 5 */
-async function item5(page, frame, state) {
+async function item5(ctx, page, frame, state) {
     const it = REC.item(5, ITEMS[5]);
     console.log("\n== 5. " + ITEMS[5] + " ==");
-    if (!state) { it.skip("item 3 never reached a successful unlock"); it.done(); return; }
+    if (!state) { it.skip("item 3 never reached a successful unlock"); it.done(); return frame; }
     const admin = classOf(state.safe) === "admin" ? "require" : null;
 
     /* Lock through the control an operator would use. */
@@ -650,29 +893,203 @@ async function item5(page, frame, state) {
         it.note("the single-shot unlock used for the handle-replay control did not return a " +
                 "handle (" + JSON.stringify(uo) + "); the UI half of this item stands alone.");
     }
+
+    /* ---- ACROSS A PAGE RELOAD ------------------------------------------
+     * The lock above was a decision this page made. A reload is not: the whole
+     * of secrets.js is thrown away and rebuilt from the file Cockpit serves,
+     * and anything that survived it would have survived it in the BROWSER —
+     * which is the only place I11 says nothing may survive. So the safe must
+     * come back locked, and the next operation must ask again, with an empty
+     * box. Do it after leaving a safe unlocked, or the reload proves nothing:
+     * a page that was already on the safe list would look identical. */
+    await openUnlockDialog(frame, state.safe.id);
+    const reOpen = await unlockAndWaitOutBackoff(frame, state.pass, it);
+    if (!(reOpen && reOpen.ok)) {
+        it.fail("could not re-unlock the safe to set up the reload check: " +
+                JSON.stringify(reOpen && (reOpen.code + ": " + reOpen.detail)));
+        it.done();
+        return frame;
+    }
+    it.note("the safe is unlocked and the browse view is open — now reloading the page");
+
+    await page.reload({ waitUntil: "domcontentloaded" });
+    frame = await H.openPlugin(page);
+    await waitForSafeList(frame);
+    it.ok(!(await inBrowseView(frame)),
+          "after a full page reload the safe is LOCKED again — the browse view is gone");
+    await openUnlockDialog(frame, state.safe.id);
+    const boxR = frame.locator(".sec-modal input[type=password]").last();
+    it.ok(await boxR.isVisible(),
+          "the first operation after a reload demands the passphrase again");
+    it.ok((await boxR.inputValue()) === "",
+          "…and its box is EMPTY: a reload cannot restore what was never kept");
+    /* And the storage areas, at the one moment a "we remembered it" bug would
+     * have had to leave something behind to be able to skip this prompt. */
+    const afterReload = await readStorage(frame);
+    const addedR = state.storage0 ? storageAdded(state.storage0, afterReload)
+                                  : { local: [], session: [] };
+    const hitR = await frame.evaluate((needle) => {
+        const dump = (s) => {
+            let o = "";
+            for (let i = 0; i < s.length; i++) o += s.key(i) + "=" + s.getItem(s.key(i)) + "\n";
+            return o;
+        };
+        return dump(localStorage).indexOf(needle) >= 0 ||
+               dump(sessionStorage).indexOf(needle) >= 0 ||
+               document.cookie.indexOf(needle) >= 0;
+    }, state.pass);
+    /* Against the pre-unlock baseline, not against zero: the areas are
+     * Cockpit's own and were never empty (see item 4). */
+    it.ok(!addedR.local.length && !addedR.session.length && !hitR,
+          "nothing was carried across the reload — no storage key appeared or changed " +
+          "since before the first unlock (" + JSON.stringify(addedR.local) + " local, " +
+          JSON.stringify(addedR.session) + " session) and the passphrase is not in either " +
+          "area or in any cookie");
+    it.shot(await H.shot(page, "05-prompted-after-reload"));
+    await frame.locator('.sec-modal button:text-is("Cancel")').last().click();
+
+    /* ---- IN A FRESH TAB -------------------------------------------------
+     * Same Cockpit session, same cookie, same origin, a second page object —
+     * which is what an operator does when they open the console again in
+     * another tab. The storage areas are per-ORIGIN, so this is the check that
+     * would fail if a passphrase had been parked somewhere a second tab could
+     * read: the first tab's unlock must buy the second tab nothing. */
+    const tab2 = await ctx.newPage();
+    try {
+        H.watchConsole(tab2);
+        const f2 = await H.openPlugin(tab2);
+        await waitForSafeList(f2);
+        it.ok(!(await inBrowseView(f2)),
+              "a fresh tab in the same Cockpit session opens on the safe list, not into a safe");
+        await openUnlockDialog(f2, state.safe.id);
+        const box2 = f2.locator(".sec-modal input[type=password]").last();
+        it.ok(await box2.isVisible(),
+              "the fresh tab demands the passphrase for the same safe");
+        it.ok((await box2.inputValue()) === "",
+              "…and its box is EMPTY too — the first tab's unlock bought it nothing");
+        const s2 = await readStorage(f2);
+        const added2 = state.storage0 ? storageAdded(state.storage0, s2)
+                                      : { local: [], session: [] };
+        const hit2 = await f2.evaluate((needle) => {
+            const dump = (s) => {
+                let o = "";
+                for (let i = 0; i < s.length; i++) o += s.key(i) + "=" + s.getItem(s.key(i)) + "\n";
+                return o;
+            };
+            return dump(localStorage).indexOf(needle) >= 0 ||
+                   dump(sessionStorage).indexOf(needle) >= 0 ||
+                   document.cookie.indexOf(needle) >= 0 ||
+                   document.documentElement.outerHTML.indexOf(needle) >= 0;
+        }, state.pass);
+        /* sessionStorage is per-TAB, localStorage is per-origin — so this tab
+         * genuinely could have read anything the first one left in the shared
+         * area, and it found nothing to read. */
+        it.ok(!added2.local.length && !added2.session.length && !hit2,
+              "the fresh tab sees no key this session added (" + JSON.stringify(added2.local) +
+              " local, " + JSON.stringify(added2.session) + " session) and neither its " +
+              "storage nor its DOM holds the passphrase");
+        it.shot(await H.shot(tab2, "05-prompted-fresh-tab"));
+        await f2.locator('.sec-modal button:text-is("Cancel")').last().click();
+    } finally {
+        await tab2.close();
+    }
+
     it.done();
+    return frame;
 }
 
 /* ================================================================== item 6 */
-async function item6(page, frame, state) {
+/* FULL MANAGEMENT, ONCE PER FORMAT.
+ *
+ * This used to drive whichever safe item 3 happened to pick and report "full
+ * management" from it. That is a claim about half the program: a KDBX entry is
+ * a bag of named strings and a Password Safe v3 record is a list of TYPED
+ * fields, and the difference is visible in exactly the two capabilities this
+ * item exercises — custom fields do not exist in PWS3 at all, and a PWS3 record
+ * has room for exactly one attachment because a field type appears at most
+ * once. Both of those are answers the helper gives, and neither is observable
+ * from the other format. So the walkthrough runs the whole sequence against one
+ * writable safe of EACH registered format and reports per format.
+ */
+async function item6(page, frame, state, list) {
     const it = REC.item(6, ITEMS[6]);
     console.log("\n== 6. " + ITEMS[6] + " ==");
     if (!state) { it.skip("item 3 never reached a successful unlock"); it.done(); return; }
-    if (state.safe.mode === "ro") {
-        it.skip("safe “" + state.safe.id + "” is registered read-only, so nothing can be " +
-                "added, edited, attached or saved through it.");
+
+    const targets = pickPerFormat(list);
+    if (!targets.length) {
+        it.skip("no reachable, writable safe has a passphrase file in " + H.CFG.creds);
         it.done();
         return;
     }
+    it.note("driving " + targets.length + " safe(s), one per format: " +
+            JSON.stringify(targets.map((s) => s.id + " (" + s.format + ")")));
 
-    /* Unlock again. Because of item 5 this is a fresh passphrase prompt, which
-     * is exactly what it should be. */
-    await openUnlockDialog(frame, state.safe.id);
-    await submitUnlock(frame, state.pass);
-    await frame.waitForSelector("#sec-browse-view:not([hidden])", { timeout: 120000 });
+    for (const safe of targets) {
+        const pass = H.safePassphrase(safe.id);
+        console.log("\n   -- " + safe.id + " · " + safe.format + " --");
+        it.note("=== " + safe.format + " · " + safe.id + " ===");
+        try {
+            await manageOne(page, frame, it, safe, pass, state);
+        } catch (e) {
+            it.fail("management of “" + safe.id + "” (" + safe.format + ") aborted: " +
+                    String((e && e.message) || e));
+            it.shot(await H.shot(page, "06-abort-" + safe.format));
+            /* Get back to a known state so the NEXT format still runs: an
+             * abort inside one safe must not silently take the other with it. */
+            await backToSafeList(frame).catch(() => {});
+        }
+    }
+    /* Leave the page on the safe list whatever happened, so item 7 starts from
+     * a known state rather than inside whichever safe ran last. */
+    await backToSafeList(frame).catch(() => {});
+    it.done();
+}
 
-    const title = "live-walkthrough-" + Date.now();
-    state.title = title;
+/* Return the page to the safe list from wherever it is, discarding anything
+ * unsaved. Used between formats and after a failure. */
+async function backToSafeList(frame) {
+    for (let i = 0; i < 4; i++) {
+        const m = frame.locator(".sec-modal").last();
+        if (!(await frame.locator(".sec-modal").count())) break;
+        const cancel = m.locator('button:text-is("Cancel"), button:text-is("Close")').first();
+        if (await cancel.count()) await cancel.click().catch(() => {});
+        else break;
+    }
+    if (await inBrowseView(frame)) {
+        await frame.locator('#sec-browse-tools button:text-is("Lock")').click();
+        const d = frame.locator('.sec-modal:has-text("Lock with unsaved changes?")');
+        if (await d.count()) await d.locator('button:text-is("Discard and lock")').click();
+    }
+    await frame.waitForSelector("#sec-safes-view:not([hidden])", { timeout: 30000 });
+    await waitForSafeList(frame);
+}
+
+/* The whole management sequence against ONE safe. Every assertion carries the
+ * format, because "add worked" and "add worked for PWS3" are different facts
+ * and a report that merges them is the report this item exists to replace. */
+async function manageOne(page, frame, it, safe, pass, state) {
+    const fmt = String(safe.format || "?");
+    const tag = " [" + fmt + "]";
+    const shotName = (n) => "06-" + fmt + "-" + n;
+    const admin = classOf(safe) === "admin" ? "require" : null;
+
+    if (safe.mode === "ro") {
+        it.note("safe “" + safe.id + "” is registered read-only, so nothing can be added, " +
+                "edited, attached or saved through it — skipped" + tag);
+        return;
+    }
+
+    await backToSafeList(frame);
+    await openUnlockDialog(frame, safe.id);
+    const opened = await unlockAndWaitOutBackoff(frame, pass, it);
+    if (!(opened && opened.ok))
+        throw new Error("the safe would not unlock: " +
+                        JSON.stringify(opened && (opened.code + ": " + opened.detail)));
+    await frame.waitForSelector("#sec-entries table.sec tbody tr", { timeout: 60000 });
+
+    const title = "live-walkthrough-" + fmt + "-" + Date.now();
+    if (safe.id === state.safe.id) state.title = title;
 
     /* --- add ------------------------------------------------------------ */
     await frame.locator('#sec-browse-tools button:text-is("Add entry…")').click();
@@ -680,13 +1097,22 @@ async function item6(page, frame, state) {
     await fillLabelled(frame, "Title", title);
     await fillLabelled(frame, "Username", "walkthrough");
     await fillLabelled(frame, "Password", "first-value-" + Date.now());
+    /* Read the dialog's OWN answer instead of waiting blindly for the listing
+     * to grow. A refusal used to surface here as "timeout waiting for a row",
+     * which names the symptom and hides the helper's sentence — the least
+     * useful failure a suite can produce. */
     await runButton(frame).click();
-    await frame.locator(".sec-modal").last().waitFor({ state: "detached", timeout: 60000 })
-               .catch(() => {});
+    const addOut = await dialogOutcome(frame);
+    if (!(addOut && addOut.ok)) {
+        it.fail("Add entry was refused" + tag + ": " +
+                JSON.stringify(addOut && (addOut.code + ": " + addOut.detail)));
+        it.shot(await H.shot(page, shotName("add-refused")));
+        throw new Error("add refused: " + JSON.stringify(addOut));
+    }
     await frame.locator(`#sec-entries td button.sec-btn.link:text-is("${title}")`)
                .waitFor({ timeout: 30000 });
-    it.ok(true, "an entry was added and appears in the listing: " + title);
-    it.shot(await H.shot(page, "06-added"));
+    it.ok(true, "an entry was added and appears in the listing: " + title + tag);
+    it.shot(await H.shot(page, shotName("added")));
 
     /* --- edit ------------------------------------------------------------ */
     await frame.locator(`#sec-entries td button.sec-btn.link:text-is("${title}")`).click();
@@ -695,101 +1121,195 @@ async function item6(page, frame, state) {
     await frame.waitForSelector(".sec-modal", { timeout: 15000 });
     await fillLabelled(frame, "URL", "https://edt1.invalid/walkthrough");
     await runButton(frame).click();
-    await frame.locator(".sec-modal").last().waitFor({ state: "detached", timeout: 60000 })
-               .catch(() => {});
+    const editOut = await dialogOutcome(frame);
+    it.ok(!!(editOut && editOut.ok), "the edit was accepted" +
+          (editOut && !editOut.ok ? " — got " + JSON.stringify(editOut.code + ": " + editOut.detail) : "") + tag);
+    if (!(editOut && editOut.ok)) throw new Error("edit refused: " + JSON.stringify(editOut));
     await frame.locator(`#sec-entries td button.sec-btn.link:text-is("${title}")`).click();
     await frame.waitForSelector("#sec-detail h3", { timeout: 15000 });
     const detailText = await frame.locator("#sec-detail").innerText();
     it.ok(/edt1\.invalid\/walkthrough/.test(detailText),
-          "the edit took: the entry's URL now reads back from the helper");
+          "the edit took: the entry's URL now reads back from the helper" + tag);
 
     /* --- a custom field --------------------------------------------------
-     * The page renders only what the schema declares. The helper's `entry` and
-     * `changes` descriptors declare title/username/password/url/notes/tags/
-     * totp_uri/expires and NO custom-field control, so there is nothing for
-     * secrets.js to draw and no way to CREATE one from this page — only
-     * "Reveal a custom field…", which READS one that already exists. Whether
-     * that is a page bug or a helper bug is decided by driving the same verb
-     * through the bridge, below. */
-    const hasCustomControl = await frame.evaluate(() => {
-        const back = document.querySelectorAll(".sec-backdrop");
-        const scope = back.length ? back[back.length - 1] : document;
-        return Array.prototype.some.call(scope.querySelectorAll("label"),
-                                         (n) => /custom/i.test(n.textContent || ""));
-    });
-    it.ok(hasCustomControl, "the add/edit dialog offers a control that creates a custom field");
-    if (!hasCustomControl) {
-        const viaBridge = await spawnVerb(frame, "edit", {
-            safe: state.safe.id, password: state.pass,
-            uuid: await selectedUuid(frame, state),
-            changes: { custom: { "live-walkthrough": { value: "set-through-the-bridge",
-                                                       protected: true } } },
-            autosave: true
-        }, classOf(state.safe) === "admin" ? "require" : null);
-        const vb = parseMaybe(viaBridge.out);
-        it.note("the same edit verb, driven through cockpit.spawn with " +
-                "changes.custom, answers " + JSON.stringify(vb) +
-                " — so the BACKEND takes custom fields and the gap is in the schema " +
-                "descriptor for `entry`/`changes` in secrets-admin, not in secrets.js.");
-        it.shot(await H.shot(page, "06-no-custom-control"));
+     * The helper now declares `custom` on `entry` and `changes` as a KEYED MAP
+     * — control "json", type "object", a separate `key` descriptor and element
+     * `fields` — and secrets.js promotes that shape to a repeating row editor.
+     * The control is therefore a <fieldset>/<legend>, NOT a <label>: a group of
+     * controls answering one question has to be announced as one group. The
+     * old assertion here looked only at <label> and would have failed on a
+     * page that draws the control correctly, which is the worst kind of test.
+     *
+     * PWS3 is where this gets interesting. The descriptor is shared, so the
+     * control is drawn for both formats and the FORMAT is what refuses: a PWS3
+     * record is a list of typed fields with no name-keyed space, and the helper
+     * answers `unsupported` with that reason. Both outcomes are correct; which
+     * one is correct depends on the safe, so both are asserted. */
+    const cfName = "walkthrough token";
+    const cfValue = "custom-" + Date.now();
+    await frame.locator('#sec-detail button:text-is("Edit entry")').click();
+    await frame.waitForSelector(".sec-modal", { timeout: 15000 });
+    const rowsHost = await customRowsHostId(frame);
+    it.ok(!!rowsHost,
+          "the add/edit dialog offers a control that CREATES a custom field" +
+          (rowsHost ? "" : " — no fieldset or label naming one was drawn") + tag);
+    if (rowsHost) {
+        const drawn = await frame.evaluate((hid) => {
+            const h = document.getElementById(hid);
+            const fs = h && h.closest("fieldset");
+            return {
+                rows: h ? h.querySelectorAll(".sec-row").length : 0,
+                legend: fs ? (fs.querySelector("legend") || {}).textContent || "" : "",
+                addLabel: fs ? Array.prototype.map.call(fs.querySelectorAll(":scope > button"),
+                                                        (b) => b.textContent).join("|") : "",
+                json: !!(h && h.querySelector("textarea"))
+            };
+        }, rowsHost);
+        it.note("the custom-field control is a “" + String(drawn.legend).trim() +
+                "” row editor with " + drawn.rows + " empty row(s) and a “" +
+                drawn.addLabel + "” control — not a raw JSON textarea (" +
+                (drawn.json ? "a textarea IS present" : "no textarea") + ")" + tag);
+        it.ok(!drawn.json,
+              "control:\"json\" was promoted to a row editor, so the operator is not asked " +
+              "to type the helper's map by hand" + tag);
+
+        await fillRowField(frame, rowsHost, 0, "Field name", cfName);
+        await fillRowField(frame, rowsHost, 0, "Value", cfValue);
+        it.shot(await H.shot(page, shotName("custom-row")));
+        await runButton(frame).click();
+
+        const cfOutcome = await dialogOutcome(frame);
+        if (fmt === "psafe3") {
+            it.ok(cfOutcome && !cfOutcome.ok && cfOutcome.code === "unsupported",
+                  "Password Safe v3 refuses a custom field with `unsupported`, not with a " +
+                  "wrong-field error: " + JSON.stringify(cfOutcome && cfOutcome.code) + tag);
+            it.ok(cfOutcome && /typed fields|name-keyed|Password Safe/i.test(cfOutcome.detail),
+                  "…and the refusal is the FORMAT's reason, so an operator can tell it from " +
+                  "a bug: " + JSON.stringify(String((cfOutcome || {}).detail).slice(0, 150)) + tag);
+            it.shot(await H.shot(page, shotName("custom-unsupported")));
+            const c = frame.locator('.sec-modal button:text-is("Cancel")').last();
+            if (await c.count()) await c.click();
+        } else {
+            it.ok(!!(cfOutcome && cfOutcome.ok),
+                  "the custom field was written through the page" +
+                  (cfOutcome && !cfOutcome.ok
+                      ? " — got " + JSON.stringify(cfOutcome.code + ": " + cfOutcome.detail) : "") + tag);
+            if (cfOutcome && cfOutcome.ok) {
+                /* READ IT BACK THROUGH THE PAGE, not through the bridge. The
+                 * only door to a custom value is `reveal` with
+                 * field="custom:<name>", and it is the door with the countdown
+                 * and the audit line on it. */
+                await frame.locator(`#sec-entries td button.sec-btn.link:text-is("${title}")`).click();
+                await frame.waitForSelector("#sec-detail h3", { timeout: 15000 });
+                const opener = frame.locator('#sec-detail button:text-is("Reveal a custom field…")');
+                it.ok(await opener.count() > 0,
+                      "the detail pane offers “Reveal a custom field…”" + tag);
+                await opener.click();
+                await frame.waitForSelector('.sec-modal:has-text("Reveal a custom field")',
+                                            { timeout: 15000 });
+                await fillLabelled(frame, "Custom field name", cfName);
+                await frame.locator('.sec-modal button:text-is("Reveal")').last().click();
+                const w = frame.locator(".sec-modal .sec-reveal").last();
+                await w.locator("button:text-is(\"Reveal\")").click().catch(() => {});
+                await w.locator(".sec-value:not(.masked)").waitFor({ timeout: 30000 })
+                       .catch(() => {});
+                const got = (await w.locator(".sec-value").innerText().catch(() => "")).trim();
+                it.ok(got === cfValue,
+                      "reveal with field=\"custom:" + cfName + "\" reads back exactly what " +
+                      "the page wrote (" + got.length + " characters)" + tag);
+                it.shot(await H.shot(page, shotName("custom-revealed")));
+                const close = frame.locator('.sec-modal button:text-is("Close")').last();
+                if (await close.count()) await close.click();
+            } else {
+                const c = frame.locator('.sec-modal button:text-is("Cancel")').last();
+                if (await c.count()) await c.click();
+            }
+        }
+    } else {
+        const c = frame.locator('.sec-modal button:text-is("Cancel")').last();
+        if (await c.count()) await c.click();
     }
 
     /* --- attachment: upload ---------------------------------------------- */
-    const tmp = path.join(os.tmpdir(), "cockpit-secrets-live-attachment.txt");
-    const attachBody = "live walkthrough attachment " + Date.now() + "\n";
+    await frame.locator(`#sec-entries td button.sec-btn.link:text-is("${title}")`).click();
+    await frame.waitForSelector("#sec-detail h3", { timeout: 15000 });
+    const tmp = path.join(os.tmpdir(), "cockpit-secrets-live-attachment-" + fmt + ".txt");
+    const attachName = "walkthrough.txt";
+    const attachBody = "live walkthrough attachment " + fmt + " " + Date.now() + "\n";
     fs.writeFileSync(tmp, attachBody);
     const addAttach = frame.locator('#sec-detail button:text-is("Add an attachment…")');
     if (await addAttach.count()) {
         await addAttach.click();
         await frame.waitForSelector(".sec-modal", { timeout: 15000 });
-        await fillLabelled(frame, "Name", "walkthrough.txt");
+        await fillLabelled(frame, "Name", attachName);
         await setLabelledFile(frame, "Attachment content", tmp);
         await runButton(frame).click();
-        await frame.locator(".sec-modal").last().waitFor({ state: "detached", timeout: 60000 })
-                   .catch(() => {});
+        const attOut = await dialogOutcome(frame);
+        it.ok(!!(attOut && attOut.ok), "the upload was accepted" +
+              (attOut && !attOut.ok
+                  ? " — got " + JSON.stringify(attOut.code + ": " + attOut.detail) : "") + tag);
+        if (!(attOut && attOut.ok)) {
+            it.shot(await H.shot(page, shotName("attach-refused")));
+            throw new Error("attach-add refused: " + JSON.stringify(attOut));
+        }
         await frame.locator(`#sec-entries td button.sec-btn.link:text-is("${title}")`).click();
         await frame.waitForSelector("#sec-detail h4", { timeout: 15000 });
-        const txt = await frame.locator("#sec-detail").innerText();
-        it.ok(/Attachments/.test(txt) && !/^\s*None\.\s*$/m.test(txt),
-              "the attachment was added and the detail pane reports one");
-        it.shot(await H.shot(page, "06-attached"));
+        /* Scoped to the Attachments SECTION. The old form read the whole detail
+         * pane for the string "None." on its own line, which is written by more
+         * than one section, and failed on an entry whose attachment was
+         * present and listed a line later. An assertion about attachments has
+         * to read the attachments. */
+        it.ok(await frame.locator('#sec-detail h4:text-is("Attachments")').count() > 0,
+              "the detail pane draws an Attachments section" + tag);
+        it.note("the section reads: " +
+                JSON.stringify((await attachmentsSectionText(frame)).replace(/\s+/g, " ")
+                    .slice(0, 160)) + tag);
+        it.shot(await H.shot(page, shotName("attached")));
     } else {
-        it.fail("the detail pane offers no “Add an attachment…” control for a writable safe");
+        it.fail("the detail pane offers no “Add an attachment…” control for a writable safe" + tag);
+        return;
     }
 
-    /* --- attachment: download -------------------------------------------- */
-    /* The Download control only exists when the page knows the attachment's
-     * NAME. `entries` sends `attachments` as a COUNT (backends/kdbx.py:1796 —
-     * `len(entry.attachments)`) and the helper publishes no attach-list verb,
-     * so the page correctly says it cannot name one rather than guessing. That
-     * is a capability gap in secrets-admin, and the control below proves the
-     * bytes themselves are reachable. */
-    const dl = frame.locator('#sec-detail button:text-is("Download")');
-    if (await dl.count()) {
+    /* --- attachment: LIST, then download ---------------------------------
+     * This is the half that did not exist before. `entries` sends `attachments`
+     * as a COUNT, and attach-get takes a NAME; the helper now publishes
+     * `attach-list`, and secrets.js asks it automatically the first time an
+     * entry with a bare count is drawn. So the Download control should appear
+     * on its own — no operator action, no guessed filename.
+     *
+     * The name is read off the SCREEN and handed straight to the download, so
+     * what is asserted is the whole chain: count -> attach-list -> a name a
+     * person can see -> attach-get -> the bytes in the browser. */
+    const nameCell = frame.locator("#sec-detail .sec-file-row .sec-file-name");
+    const listed = await nameCell.first().waitFor({ timeout: 30000 })
+                                 .then(() => true).catch(() => false);
+    it.ok(listed,
+          "attach-list turned the count into a NAME on the card, with no operator action" + tag);
+    if (listed) {
+        const names = await nameCell.allInnerTexts();
+        it.ok(names.map((s) => s.trim()).indexOf(attachName) >= 0,
+              "the listed name is the one just uploaded: " + JSON.stringify(names) + tag);
+        it.ok(await frame.locator('#sec-detail button:text-is("List attachments")').count() > 0,
+              "a “List attachments” control is offered so a stale list can be re-asked" + tag);
+        const dl = frame.locator("#sec-detail .sec-file-row").filter({
+            has: frame.locator(`.sec-file-name:text-is("${attachName}")`)
+        }).locator('button:text-is("Download")');
+        it.ok(await dl.count() > 0, "…and that row offers Download" + tag);
         const [download] = await Promise.all([
             page.waitForEvent("download", { timeout: 30000 }),
             dl.first().click()
         ]);
-        const to = path.join(H.artifactsDir(), "06-downloaded-attachment.bin");
+        const to = path.join(H.artifactsDir(), "06-" + fmt + "-downloaded-attachment.bin");
         await download.saveAs(to);
         const got = fs.readFileSync(to, "utf8");
         it.ok(got === attachBody,
-              "the attachment downloaded through the Cockpit channel byte for byte");
-    } else {
-        const said = await frame.locator("#sec-detail").innerText();
-        const honest = /publishes no verb that lists them/.test(said);
-        it.ok(false, "no Download control is offered for the attachment just added — " +
-              "`entries` sends a COUNT, not names, and the helper publishes no " +
-              "attach-list verb, so the page cannot name the file to fetch" +
-              (honest ? " (the page says exactly that, rather than guessing a name)" : ""));
-        const via = await spawnVerb(frame, "attach-get", {
-            safe: state.safe.id, password: state.pass,
-            uuid: await selectedUuid(frame, state), name: "walkthrough.txt"
-        }, classOf(state.safe) === "admin" ? "require" : null);
-        const vo = parseMaybe(via.out);
-        it.note("attach-get for the same name, driven through cockpit.spawn, answers " +
-                JSON.stringify(vo && (vo.error || { name: vo.name, size: vo.size })) +
-                " — the bytes ARE reachable; only the NAME is unreachable from the page.");
+              "the attachment downloaded through the Cockpit channel byte for byte (" +
+              Buffer.byteLength(attachBody) + " bytes)" + tag);
+        const secText = await attachmentsSectionText(frame);
+        it.ok(!/(^|\n)\s*None\.\s*(\n|$)/.test(secText),
+              "the settled Attachments section does not read “None.” for an entry that has " +
+              "one: " + JSON.stringify(secText.replace(/\s+/g, " ").slice(0, 140)) + tag);
+        it.shot(await H.shot(page, shotName("downloaded")));
     }
 
     /* --- history ---------------------------------------------------------- */
@@ -799,51 +1319,153 @@ async function item6(page, frame, state) {
         await frame.waitForSelector("#sec-detail .sec-hist-row, #sec-detail .sec-alert.err",
                                     { timeout: 30000 }).catch(() => {});
         const nrows = await frame.locator("#sec-detail .sec-hist-row").count();
-        it.ok(nrows > 0, "history lists " + nrows + " previous version(s) after the edit");
+        const said = await frame.locator("#sec-detail").innerText();
         if (nrows > 0) {
+            it.ok(true, "history lists " + nrows + " previous version(s) after the edit" + tag);
             /* Never a password: the helper does not send one and the page has
              * nothing to mask. A history row that contained the value would be
              * the single worst regression in this program. */
             const hist = await frame.locator("#sec-detail .sec-hist-row").allInnerTexts();
             const leaked = state.revealed && hist.some((h) => h.indexOf(state.revealed) >= 0);
-            it.ok(!leaked, "no history row carries a password value");
+            it.ok(!leaked, "no history row carries a password value" + tag);
+        } else {
+            /* An empty history is an ANSWER for a format that keeps none, and
+             * it is only acceptable when the page says which it is. */
+            it.ok(/No previous versions are recorded|previous version/i.test(said),
+                  "the history control answered, and says plainly that this entry has no " +
+                  "recorded previous version rather than showing an empty panel" + tag);
+            it.note("no history rows for this entry" + tag + " — the entry was created by this " +
+                    "run, so whether one edit archives a version is the backend's decision.");
         }
-        it.shot(await H.shot(page, "06-history"));
+        it.shot(await H.shot(page, shotName("history")));
     } else {
-        it.fail("the detail pane offers no history control although the helper publishes the verb");
+        it.fail("the detail pane offers no history control although the helper publishes the verb" + tag);
     }
 
     /* --- save --------------------------------------------------------------
      * #sec-alerts holds ONE alert at a time and every mutation above has
      * already written one into it, so waiting for ".sec-alert.ok" to exist
      * returns instantly on the PREVIOUS result and reads the wrong sentence.
-     * Wait for the save's own wording instead. (Caught by running this spec's
-     * selectors against the package's stub harness.) */
+     * Wait for the save's own wording instead. */
     await frame.locator("#sec-save").click();
     const confirm = frame.locator('.sec-modal:has-text("Write the safe to disk?")');
     if (await confirm.count()) await confirm.locator('button:text-is("Save")').click();
     const saveOutcome = await waitForSaveOutcome(frame);
     const saidSave = String((saveOutcome && saveOutcome.text) || "");
     it.ok(!!saveOutcome && saveOutcome.ok,
-          "Save wrote the safe: " + JSON.stringify(saidSave.slice(0, 200)));
+          "Save wrote the safe: " + JSON.stringify(saidSave.slice(0, 200)) + tag);
     it.ok(/previous copy kept at/.test(saidSave),
-          "the save names the backup it took before the first new byte existed (I12)");
-    it.shot(await H.shot(page, "06-saved"));
+          "the save names the backup it took before the first new byte existed (I12)" + tag);
+    it.shot(await H.shot(page, shotName("saved")));
 
     /* --- reopen and confirm persistence ------------------------------------ */
-    await frame.locator('#sec-browse-tools button:text-is("Lock")').click();
-    const dirty2 = frame.locator('.sec-modal:has-text("Lock with unsaved changes?")');
-    if (await dirty2.count()) await dirty2.locator('button:text-is("Discard and lock")').click();
-    await frame.waitForSelector("#sec-safes-view:not([hidden])", { timeout: 30000 });
-    await openUnlockDialog(frame, state.safe.id);
-    await submitUnlock(frame, state.pass);
-    await frame.waitForSelector("#sec-browse-view:not([hidden])", { timeout: 120000 });
+    await backToSafeList(frame);
+    await openUnlockDialog(frame, safe.id);
+    const reopened = await unlockAndWaitOutBackoff(frame, pass, it);
+    if (!(reopened && reopened.ok))
+        throw new Error("the safe would not re-open after the save: " +
+                        JSON.stringify(reopened && (reopened.code + ": " + reopened.detail)));
     await frame.waitForSelector("#sec-entries table.sec tbody tr", { timeout: 60000 });
     const back = await frame.locator(`#sec-entries td button.sec-btn.link:text-is("${title}")`).count();
-    it.ok(back > 0, "after lock and a fresh unlock the entry is still there — it persisted to disk");
-    it.shot(await H.shot(page, "06-reopened"));
+    it.ok(back > 0,
+          "after lock and a fresh unlock the entry is still there — it persisted to disk" + tag);
 
-    it.done();
+    /* And the two things that were WRITTEN into it, read back off the reopened
+     * file rather than out of the page's memory. */
+    await frame.locator(`#sec-entries td button.sec-btn.link:text-is("${title}")`).click();
+    await frame.waitForSelector("#sec-detail h3", { timeout: 15000 });
+    const reListed = await frame.locator("#sec-detail .sec-file-row .sec-file-name")
+                                .first().waitFor({ timeout: 30000 })
+                                .then(() => true).catch(() => false);
+    it.ok(reListed, "the attachment survived the save and is listed again after reopening" + tag);
+    it.shot(await H.shot(page, shotName("reopened")));
+}
+
+/* The text of the detail pane's Attachments SECTION — from its <h4> to the next
+ * one. #sec-detail is a flat list of headings and blocks, so the section is the
+ * run between them; reading the whole pane instead is how an assertion about
+ * attachments ends up matching a sentence belonging to history or to tags. */
+async function attachmentsSectionText(frame) {
+    return frame.evaluate(() => {
+        const host = document.getElementById("sec-detail");
+        if (!host) return "";
+        let on = false, out = "";
+        for (const n of host.children) {
+            if (n.tagName === "H4") { on = /attachment/i.test(n.textContent || ""); continue; }
+            if (on) out += (n.innerText || n.textContent || "") + "\n";
+        }
+        return out.trim();
+    });
+}
+
+/* The row editor's host element id, for whichever control in the open dialog is
+ * the custom-field one.
+ *
+ * Found by SHAPE and by the legend text, in that order: a <fieldset class=
+ * "sec-rows"> whose legend names custom fields. Deliberately not by control id
+ * — the renderer mints those per control — and deliberately accepting a <label>
+ * as well, so a future renderer that draws it as a labelled control still
+ * satisfies "the dialog offers a way to create one". */
+async function customRowsHostId(frame) {
+    return frame.evaluate(() => {
+        const backs = document.querySelectorAll(".sec-backdrop");
+        const scope = backs.length ? backs[backs.length - 1] : document;
+        for (const fs of scope.querySelectorAll("fieldset.sec-rows")) {
+            const lg = fs.querySelector("legend");
+            if (lg && /custom/i.test(lg.textContent || "")) {
+                const host = fs.querySelector(".sec-rowlist");
+                if (host && host.id) return host.id;
+            }
+        }
+        /* A labelled control naming custom fields is also an answer. */
+        for (const l of scope.querySelectorAll("label[for]")) {
+            let t = "";
+            for (const n of l.childNodes) if (n.nodeType === 3) t += n.textContent;
+            if (/custom/i.test(t)) return l.getAttribute("for");
+        }
+        return null;
+    });
+}
+
+/* Fill one field of one row of a row editor, by the label the row draws. */
+async function fillRowField(frame, hostId, index, label, value) {
+    const id = await frame.evaluate(([hid, ix, want]) => {
+        const host = document.getElementById(hid);
+        if (!host) return null;
+        const row = host.querySelectorAll(".sec-row")[ix];
+        if (!row) return null;
+        for (const l of row.querySelectorAll("label[for]")) {
+            let t = "";
+            for (const n of l.childNodes) if (n.nodeType === 3) t += n.textContent;
+            if (t.trim().toLowerCase() === String(want).toLowerCase())
+                return l.getAttribute("for");
+        }
+        return null;
+    }, [hostId, index, label]);
+    if (!id) throw new Error("row " + index + " of “" + hostId + "” has no field labelled “" +
+                             label + "”");
+    await frame.locator("#" + id).fill(value);
+    return id;
+}
+
+/* WHAT THE OPEN DIALOG'S RUN BUTTON DID: it closed (success), or the helper's
+ * refusal is on it. Same shape as unlockOutcome and for the same reason — the
+ * dialog clears its error host before it spawns, so what this reads is this
+ * attempt's answer and not the last one's. */
+async function dialogOutcome(frame, timeout) {
+    const h = await frame.waitForFunction(() => {
+        const back = document.querySelectorAll(".sec-backdrop");
+        if (!back.length) return { ok: true, code: "", detail: "" };
+        const modal = back[back.length - 1].querySelector(".sec-modal");
+        if (!modal) return { ok: true, code: "", detail: "" };
+        const a = modal.querySelector(".sec-alert.err");
+        if (!a) return null;
+        const c = a.querySelector(".sec-code");
+        return { ok: false,
+                 code: String((c && c.textContent) || "").trim(),
+                 detail: String(a.textContent || "").trim().slice(0, 240) };
+    }, null, { timeout: timeout || 60000 }).catch(() => null);
+    return h ? h.jsonValue() : null;
 }
 
 /* The uuid of the entry the detail pane is showing.
@@ -896,8 +1518,10 @@ async function item7(browser, page, frame, state, accountPassword) {
         /* A: an unsaved change. */
         if (!(await inBrowseView(frame))) {
             await openUnlockDialog(frame, state.safe.id);
-            await submitUnlock(frame, state.pass);
-            await frame.waitForSelector("#sec-browse-view:not([hidden])", { timeout: 120000 });
+            const a = await unlockAndWaitOutBackoff(frame, state.pass, it);
+            if (!(a && a.ok))
+                throw new Error("session A could not unlock the safe: " +
+                                JSON.stringify(a && (a.code + ": " + a.detail)));
         }
         const aTitle = "conflict-A-" + Date.now();
         await addEntry(frame, aTitle);
@@ -905,8 +1529,10 @@ async function item7(browser, page, frame, state, accountPassword) {
 
         /* B: a change, saved — the file on disk moves under A. */
         await openUnlockDialog(frameB, state.safe.id);
-        await submitUnlock(frameB, state.pass);
-        await frameB.waitForSelector("#sec-browse-view:not([hidden])", { timeout: 120000 });
+        const bOpen = await unlockAndWaitOutBackoff(frameB, state.pass, it);
+        if (!(bOpen && bOpen.ok))
+            throw new Error("session B could not unlock the safe: " +
+                            JSON.stringify(bOpen && (bOpen.code + ": " + bOpen.detail)));
         const bTitle = "conflict-B-" + Date.now();
         await addEntry(frameB, bTitle);
         await frameB.locator("#sec-save").click();
@@ -1037,6 +1663,17 @@ async function item10(page, frame, state) {
         if (await d.count()) await d.locator('button:text-is("Discard and lock")').click();
         await frame.waitForSelector("#sec-safes-view:not([hidden])", { timeout: 30000 });
     }
+    /* Remember the control that opened it. modal() stashes document.activeElement
+     * and focuses it again on close, and a dialog that drops focus back to the
+     * top of the document is a keyboard user losing their place. */
+    const opener = cardFor(frame, state.safe.id).locator('button:text-is("Unlock…")');
+    await opener.focus();
+    const openerId = await frame.evaluate(() => {
+        const a = document.activeElement;
+        if (!a) return null;
+        a.setAttribute("data-live-opener", "1");
+        return true;
+    });
     await openUnlockDialog(frame, state.safe.id);
 
     /* Focus lands inside the dialog when it opens — modal() focuses the first
@@ -1045,32 +1682,67 @@ async function item10(page, frame, state) {
         !!(document.activeElement && document.activeElement.closest(".sec-modal")));
     it.ok(opened, "opening the dialog moves focus into it");
 
-    /* The trap. Tab more times than there are focusable controls and focus must
-     * still be inside: it wraps rather than walking out into the page behind. */
+    /* THE TRAP, DRIVEN AS A KEYBOARD USER DRIVES IT.
+     *
+     * `locator.press()` FOCUSES the element before it sends the key, so
+     * `.sec-modal.press("Tab")` put focus on the dialog container each time and
+     * then tabbed once from there. Forwards that looked like a pass — every
+     * press landed on the dialog's first control — and it never walked the
+     * trap at all; backwards it was a FAIL, because Shift+Tab from the
+     * container (tabindex -1, so not the `first` the handler compares against)
+     * legitimately steps out of the dialog and the assertion was asking the
+     * trap to catch a case it does not exist for. Measured on this host.
+     *
+     * page.keyboard sends to whatever is focused without touching focus, which
+     * is what a person pressing Tab does, so that is what is used here. */
+    const kb = frame.page().keyboard;
     const n = await frame.evaluate(() => {
         const m = document.querySelector(".sec-backdrop .sec-modal");
         return m ? m.querySelectorAll("a[href], button, input, select, textarea, [tabindex]").length : 0;
     });
-    let escaped = null;
-    for (let i = 0; i < n + 3; i++) {
-        await frame.locator(".sec-modal").last().press("Tab");
-        const inside = await frame.evaluate(() =>
-            !!(document.activeElement && document.activeElement.closest(".sec-modal")));
-        if (!inside) { escaped = i; break; }
-    }
-    it.ok(escaped === null,
-          "Tab pressed " + (n + 3) + " times never leaves the dialog (focus trap holds)");
-
-    /* And backwards: Shift+Tab off the first control wraps to the last. */
-    await frame.evaluate(() => {
+    const focusFirst = () => frame.evaluate(() => {
         const m = document.querySelector(".sec-backdrop .sec-modal");
         const f = m.querySelectorAll("a[href], button, input, select, textarea, [tabindex]");
-        for (const n of f) if (!n.disabled && n.tabIndex !== -1 && n.offsetParent !== null) { n.focus(); return; }
+        for (const x of f)
+            if (!x.disabled && x.tabIndex !== -1 && x.offsetParent !== null) { x.focus(); return x.tagName; }
+        return null;
     });
-    await frame.locator(".sec-modal").last().press("Shift+Tab");
-    const backWrapped = await frame.evaluate(() =>
-        !!(document.activeElement && document.activeElement.closest(".sec-modal")));
-    it.ok(backWrapped, "Shift+Tab from the first control wraps to the last, still inside");
+    await focusFirst();
+    let escaped = null;
+    const seen = [];
+    for (let i = 0; i < n + 3; i++) {
+        await kb.press("Tab");
+        const where = await frame.evaluate(() => {
+            const a = document.activeElement;
+            return { inside: !!(a && a.closest(".sec-modal")),
+                     what: a ? (a.tagName + (a.type ? ":" + a.type : "")) : "(none)" };
+        });
+        seen.push(where.what);
+        if (!where.inside) { escaped = i; break; }
+    }
+    it.ok(escaped === null,
+          "Tab pressed " + (n + 3) + " times from the first control never leaves the dialog — " +
+          "it wrapped instead (focus walked " + JSON.stringify(seen.slice(0, 6)) + "…)");
+
+    /* And backwards: Shift+Tab off the first control wraps to the last. */
+    await focusFirst();
+    await kb.press("Shift+Tab");
+    const backWrapped = await frame.evaluate(() => {
+        const a = document.activeElement;
+        const m = document.querySelector(".sec-backdrop .sec-modal");
+        if (!a || !m || !a.closest(".sec-modal")) return { inside: false, last: false, what: a ? a.tagName : "(none)" };
+        const f = Array.prototype.filter.call(
+            m.querySelectorAll("a[href], button, input, select, textarea, [tabindex]"),
+            (x) => !x.disabled && x.tabIndex !== -1 && x.offsetParent !== null);
+        return { inside: true, last: f.length > 0 && f[f.length - 1] === a,
+                 what: a.tagName + (a.type ? ":" + a.type : "") };
+    });
+    it.ok(backWrapped.inside,
+          "Shift+Tab from the first control stays inside the dialog (landed on " +
+          backWrapped.what + ")");
+    it.ok(backWrapped.last,
+          "…and it wrapped to the LAST control, which is what makes the trap a loop " +
+          "rather than a wall");
 
     /* Keyboard-only unlock: tab to the passphrase box, type, press Enter. The
      * dialog has no <form>, so Enter is handled explicitly — which is exactly
@@ -1091,11 +1763,28 @@ async function item10(page, frame, state) {
     /* Escape closes an ordinary dialog. Checked on one that is allowed to be
      * dismissed — the conflict dialog is deliberately not, and item 7 checks
      * that side of it. */
-    await frame.locator('#sec-browse-tools button:text-is("Generate password…")').click();
+    const gen = frame.locator('#sec-browse-tools button:text-is("Generate password…")');
+    await gen.focus();
+    await gen.click();
     await frame.waitForSelector(".sec-modal", { timeout: 15000 });
-    await frame.locator(".sec-modal").last().press("Escape");
+    await frame.page().keyboard.press("Escape");
     const closed = await frame.locator(".sec-modal").count();
     it.ok(closed === 0, "Escape closes an ordinary dialog");
+
+    /* FOCUS RESTORE. modal() remembers what was focused when it opened and
+     * focuses it again on close. Without that, dismissing a dialog drops a
+     * keyboard user at the top of the document with no idea where they were —
+     * which is a WCAG 2.4.3 failure and is invisible to every test that only
+     * checks that the dialog went away. */
+    const restored = await frame.evaluate(() => {
+        const a = document.activeElement;
+        return { tag: a ? a.tagName : "(none)",
+                 text: a ? (a.textContent || "").trim().slice(0, 40) : "",
+                 isBody: !a || a === document.body };
+    });
+    it.ok(!restored.isBody && /Generate password/.test(restored.text),
+          "closing the dialog puts focus back on the control that opened it (" +
+          JSON.stringify(restored.tag + " “" + restored.text + "”") + ")");
 
     it.done();
 }
@@ -1141,6 +1830,7 @@ function finish() {
 }
 
 if (require.main === module) main();
-module.exports = { classOf, reachable, pickSafe, cardFor, openUnlockDialog, submitUnlock,
-                   waitForSaveOutcome,
+module.exports = { classOf, reachable, pickSafe, pickPerFormat, cardFor, openUnlockDialog,
+                   submitUnlock, unlockOutcome, unlockAndWaitOutBackoff, waitForSafeList,
+                   waitForSaveOutcome, inBrowseView,
                    spawnVerb, parseMaybe, controlIdByLabel, fillLabelled, runButton, ITEMS };
