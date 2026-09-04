@@ -1,0 +1,23 @@
+# Never let a real safe, a key, or a decrypted anything into the repo.
+*.kdbx
+*.kdb
+*.psafe3
+*.psafe3.bak
+*.key
+*.keyx
+*.pem
+*.p12
+*.lock
+*.plk
+!tests/fixtures/**/*.kdbx
+!tests/fixtures/**/*.psafe3
+!tests/fixtures/**/*.key
+secrets.log
+audit/
+backups/
+node_modules/
+__pycache__/
+*.pyc
+.playwright/
+test-results/
+_test_output.txt
