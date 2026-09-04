@@ -48,6 +48,19 @@
 # credentials path and every argument it sees into whatever log caught it.
 set -Eeuo pipefail
 
+# EVERY FILE THIS SUITE CREATES IS PRIVATE BEFORE IT EXISTS.
+#
+# The artefacts include a screenshot taken deliberately between "Reveal" and
+# the countdown ending — i.e. a picture of an unmasked password — and the
+# decrypted body of a downloaded attachment. Those two were written by
+# Playwright, which has no mode option on `page.screenshot()` or
+# `download.saveAs()`, so they landed under this host's 0002 umask as
+# -rw-rw-r-- on an SMB-exported tree while the harmless console log was 0600.
+# live-harness.js now chmods each artefact as it is written; this line is the
+# belt to that brace, and it is what covers a writer nobody remembered to route
+# through the helper.
+umask 077
+
 HERE="$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")" && pwd)"
 SRC="$(cd -- "$HERE/../.." && pwd)"
 ART="$HERE/artifacts"

@@ -43,20 +43,28 @@ on this host.
 Reproduce §2–§7 with the two commands below. Their results on this host, on the
 day this file was written:
 
-| Command | Result |
+| Command | Result (re-run from a clean tree, 2026-09-04, VERSION 0.2.1) |
 |---|---|
-| `./validate.sh` | OK — 19 syntax checks, 11 standing bans |
+| `./validate.sh` | OK — **47 PASS / 0 FAIL**, plus `Ran 38 tests … OK` |
 | `./check.sh` | `secrets.js syntax OK` |
-| `python3 backends/base.py` | self-check PASS |
-| `python3 -m backends.psafe3` | self-check PASS |
-| twofish ECB vectors, both providers | PASS — 728 vectors × 2 providers, 0 failures |
-| `tests/integration/flow.py` | PASS (6 s) |
-| `tests/integration/conformance.py` | PASS (1 s) |
+| `python3 backends/base.py` | PASS — 118 checks, 0 failures |
+| `python3 -m backends.psafe3` | PASS — 18 checks, `psafe3 self-check: OK` |
+| `python3 -m backends.kdbx` | PASS — 28 checks, `kdbx self-check: OK` |
+| `python3 agent/secrets_agent.py --selfcheck` | PASS — 61 checks, 0 failures |
+| twofish ECB vectors, both providers | PASS — 728 vectors × 2 providers, encrypt **and** decrypt, 0 failures |
+| `tests/integration/flow.py` | PASS — 86 checks, 0 failures (10 s) |
+| `tests/integration/conformance.py` | PASS — 83 checks, 0 failures (2 s) |
 | `tests/integration/properties.py` | PASS — 27 checks, 0 failures (18 s) |
-| `tests/integration/corpus_vs_helper.py` | PASS — 67 checks, 0 failures (82 s) |
+| `tests/integration/newverbs.py` | PASS — 220 checks, 0 failures (12 s) |
+| `tests/integration/agent_cycle.py` | PASS — 45 checks, 0 failures (6 s) |
+| `tests/integration/adversarial.py` | PASS — 73 checks, 0 failures (13 s) |
+| `tests/integration/corpus_vs_helper.py` | PASS — 67 checks, 0 failures (83 s) |
+| `tests/corpus/gen_corpus.py --check` | PASS — 67 cases, 0 disagreed with their sidecar |
 | `tests/oracle/build.sh` | PASS — the Go oracle's known-answer vectors |
-| `tests/fixtures/gen_fixtures.sh` | PASS — every fixture re-verified by `keepassxc-cli` |
-| `node tests/browser/ui.spec.js` | **124 passed, 0 failed** |
+| `tests/fixtures/gen_fixtures.sh` | PASS — 33 checks; every fixture re-verified by `keepassxc-cli` |
+| `node tests/browser/ui.spec.js` | **244 passed, 0 failed** |
+| `./run_tests.sh` | **17 of 17 stages PASS**, exit 0 |
+| `./tests/browser/run-live.sh` (the LIVE page) | **129/130** — one FAIL, and it is a defect in the test: KNOWN_ISSUES **I42** |
 | the KDBX interop matrix (§2.2) | **14/14** |
 | the PWS3 oracle matrix (§3.2) | **7/7** |
 
@@ -419,6 +427,17 @@ fixed inside `backends/kdbx.py` rather than reported and lived with.
    `not-found` and none returns the sentinel, while the plain name `Lab Ticket`
    still returns `LAB-4711`. *Anyone else passing caller-supplied text to a
    pykeepass `find_*` / `set_custom_property` call has the same bug.*
+
+   **That warning was right and was not acted on.** `KdbxBackend.add()` was the
+   other call site: `PyKeePass.add_entry` opens by calling
+   `find_entries(title=…, username=…)` unconditionally, before it even looks at
+   `force_creation`, so an entry titled `a"b` — a legal KeePass title — answered
+   `internal / "the KDBX engine could not open this database"`, which was both a
+   verb the caller could not use and a sentence that was false. Fixed in the
+   same way (`add_entry` is called with constant empty strings and the two
+   fields are written by `_set_field`), and `validate.sh` now BANS the four
+   pykeepass names from `backends/kdbx.py` outright rather than warning about
+   them in prose. See KNOWN_ISSUES I32.
 2. **`delete_binary()` corrupts attachment references.** It renumbers via
    `find_attachments()`, which does not descend into `History`, leaving
    `Binary/Value/@Ref` attributes pointing one slot too high — at someone
@@ -465,11 +484,21 @@ should be quoted as compatibility.
 | **KDBX 3.x + Twofish decrypts a real file** | the *primitive* is verified, and by a genuinely third party: `backends/kdbx._decrypt_prefix()` — Botan's `BlockCipher("Twofish")` with CBC composed by hand — was fed ciphertext produced by **Perl `Crypt::Twofish` 2.18** and returned the plaintext exactly, for both the full 48-byte buffer and the 32-byte prefix `_verify_kdbx3()` actually asks for | **No KDBX 3.x + Twofish file exists.** `keepassxc-cli` cannot create one (no cipher switch), so the header parse, the stream-start-bytes check and the block-digest walk *around* that primitive have never run on a real Twofish KDBX3 database |
 | **KDBX 4 + Twofish, beyond the one fixture** | `lab-kdbx40-twofish-argon2d.kdbx` opens here and in `keepassxc-cli`, which confirms `Cipher: Twofish 256-bit` | that fixture's container was **written by this project**, not by KeePassXC — `keepassxc-cli` cannot create a Twofish database at all. A foreign reader accepting our file is real evidence; a foreign *writer* producing one for us to read does not exist on this host, so the read path has never seen Twofish bytes laid out by someone else |
 | **KDBX 4 + AES-KDF** | nothing | **no such file exists on this host and none can be made here.** `keepassxc-cli db-create` always writes KDBX 3.1 + AES-KDF and `db-edit` has no KDF switch; `tests/fixtures/kdbx_reformat.py` deliberately refuses `--kdf aeskdf`, on the grounds that a 3.1 + AES-KDF fixture straight out of `db-create` has better provenance than anything it could synthesise. So AES-KDF is verified **only** in its KDBX 3.1 form (1 000 000 rounds, read-only), and the KDBX 4 combination — which `Limits.check_aeskdf_rounds` clamps and the writer would emit — has never been read or written |
-| **The `export` verb's ALLOWED path** | the refusal: a user-class safe gets `access-denied` naming the reason | export is admin-class, and **nothing in the standing suite runs as euid 0.** The allowing side needs the `/srv/jobs` root runner and is a root job, not a test |
-| **The `access: "admin"` class in general** | the refusing side, driven directly as a non-admin | same reason. Everything here runs unescalated, so `access: "admin"` is only ever proved to *refuse* |
-| **`superuser: "require"` under a real Cockpit bridge** | that the page asks for it, recorded by the browser stub | the browser suite stubs `cockpit.spawn`; **no test has ever run against a real bridge**, so the escalation path is unexercised end to end |
+| **A `.psafe3` this program wrote is one this program can read back** | KDBX only. `_verify_own_output` re-opens every KDBX save through the reader before it is written, so a KDBX file this program writes is one it can open | **not true of PWS3.** `backends/psafe3.py` has no such check and its once-per-session losslessness guard latches after the first save, so a second save in one session can write a Password Safe file this program's own reader then refuses. Reproduced 2026-09-04; see KNOWN_ISSUES I41. A foreign reader's view of such a file is unknown, because none was produced for `keepassxc-cli` (which cannot read PWS3 anyway) or for the Password Safe GUI (which cannot be driven here) |
 | **A `.psafe3` written by the real Password Safe GUI** | nothing | see §3.3. `pwsafe` maps no window headlessly (proved against an `xmessage` control on the same Xvfb) and `--validate` never returns. This needs a human at a GUI |
 | **KeePass 2.x (the C# implementation) reading our files** | nothing | not installed here, and not installable offline. `keepassxc-cli` is a different implementation of the same format, not the reference one |
+
+### 8a. What moved OUT of §8 on 2026-09-04, and the evidence that moved it
+
+Three rows in the table above were true when they were written and are not true any more. They
+are recorded here rather than silently deleted, because "this used to be unverified and here is
+what changed" is the only form of that claim a reader can check.
+
+| Row, as it read | What it says now, and the evidence |
+|---|---|
+| *"`superuser: "require"` under a real Cockpit bridge — the browser suite stubs `cockpit.spawn`; **no test has ever run against a real bridge**"* | **VERIFIED.** `tests/browser/live-access.spec.js` item 9 drives live Cockpit 360 at `https://localhost:9090` signed in as a real account, with nothing stubbed. Both directions hold: with administrative access off, the bridge refuses immediately and **draws no prompt anywhere** (measured — the escalation dialog belongs to Cockpit's shell and nothing a package page can reach makes it appear); after Cockpit's own header control grants it, `cockpit.permission.allowed === true` and the admin-class safe opens. 22/22, run twice from a reset state on 2026-09-04 |
+| *"the `access: "admin"` class in general — only ever proved to *refuse*"* | **VERIFIED in both directions.** The refusing side: all 33 verbs driven as `cptest` (uid 1005, not in `sudo`) against a real root-owned admin safe, every one `access-denied`, plus the same refusal for autosave mutations carrying the correct passphrase. The allowing side: item 9 above renders 6 entry rows out of a root-owned KDBX the driving account cannot read unescalated |
+| *"the `export` verb's ALLOWED path — nothing in the standing suite runs as euid 0"* | **VERIFIED, and this row was already stale.** `tests/integration/newverbs.py` runs the export allow-path inside `unshare --map-root-user`, where `os.geteuid()` really is 0: the file lands 0600 in a 0700 directory under `export_dir`, named helper-side, content absent from the reply, audit line carrying the name and row count and no value. Re-run green in the re-gate (220 checks, 0 failures). What is still **not** covered is the SUDO_UID / group-membership branch of `gate()`, because inside that namespace the caller's real uid is 0 too — that half needs the `/srv/jobs` runner, and it is exercised there for the lockout path only (KNOWN_ISSUES I40) |
 
 ---
 
@@ -498,3 +527,107 @@ should be quoted as compatibility.
       grep -rn --include='*.yaml' 'transport: "\(tcp\|udp\)"' function-map/
 
   finds nothing.
+
+---
+
+## 10. Divergences introduced by the adversarial review
+
+Three places where this package now deliberately does something KeePassXC does not, or stops
+doing something it used to. Each is here because "we differ from the reference" is exactly the
+kind of fact §7 exists to record, and because two of the three are visible in bytes an operator
+may hand to another tool.
+
+### 10.1 The decompression ratio guard no longer refuses ordinary content
+
+§4 records the ratio guard as the one place where the foreign oracle is silent — KeePassXC has
+no decompression cap, so the corpus's compression bombs open there and must be refused here.
+That is still true, and both bombs are still refused. What is no longer true is that the RATIO
+is the thing doing it.
+
+DEFLATE cannot expand a stream by more than 1032:1. Measured on this host with zlib 1.3,
+`zlib.compress(b"\0" * n, 9)` reaches 1028:1 for every n from 1 MiB to 256 MiB. A threshold of
+200:1 therefore never separated a bomb from ordinary compressible content — it only decided how
+compressible a legitimate attachment was allowed to be, and it decided wrong in both directions:
+
+* a KDBX 4 database this package wrote, carrying one ordinary 8 MiB log file as an attachment,
+  was refused by this package at every subsequent unlock and read by `keepassxc-cli` perfectly;
+* KDBX 3.1 databases written by `keepassxc-cli 2.7.10`, whose attachments are gzipped one by one
+  in the binary pool, were refused at `fields`, `attach_list`, `attach_get` and `export_plain`.
+
+Both are now accepted, which is a **compliance improvement**, not a relaxation: what replaced
+the ratio is an absolute cap enforced incrementally (so peak memory is bounded whatever the
+ratio), structural caps on what the payload may CONTAIN (a field value over
+`MAX_FIELD_BYTES`, a pooled binary over `MAX_ATTACHMENT_BYTES`, more than `MAX_ENTRIES` entries
+or `MAX_GROUPS` groups), and a wall-clock budget over the parse. The structural caps are the
+ones that refuse the corpus bombs, and they refuse them for a reason that is true of the file
+rather than true of its compressor. See KNOWN_ISSUES I23 and I25.
+
+The read and write limits are now the same number: `_check_text` has always enforced
+`MAX_FIELD_BYTES` on the write path, and the structural cap enforces it on the read path. That
+is what makes "this package cannot write a file its own reader refuses" a property rather than a
+hope — and `_verify_own_output` proves it per save by re-opening the bytes before they replace
+anything (I24).
+
+### 10.2 CSV export neutralises formula-leading cells; KeePassXC does not
+
+`export --format csv` in KeePassXC 2.7.10 writes field values verbatim. This package prefixes an
+apostrophe to any cell beginning with `=`, `+`, `-`, `@`, TAB or CR, because a spreadsheet hands
+such a cell to its formula parser even inside RFC-4180 quotes and the export is the one artefact
+that holds every credential in the safe at once (CWE-1236; KNOWN_ISSUES I31).
+
+**What this costs the round trip.** `_export_csv`'s column set is still KeePassXC's ten columns
+in KeePassXC's order, so the file still imports. But a value legitimately beginning with one of
+those characters gains a leading apostrophe, and KeePassXC's CSV importer will import the
+apostrophe as part of the value. A password like `-hunter2` therefore needs one leading
+apostrophe stripped on the far side.
+
+The export reply says so, per export: it carries `neutralised: N` and a warning naming the
+characters. `N` is 0 for every ordinary database, so the noise is paid only when it is the answer
+to a real question. The trade-off, and the two alternatives that were rejected, are argued in
+docs/RESIDUAL-RISK.md §2.
+
+### 10.3 A repeated field name is refused, as KeePassXC refuses it
+
+KeePassXC 2.7.10 refuses to open a KDBX whose entry carries two `<String>` elements with the same
+`<Key>`: *"Error while reading the database: Duplicate custom attribute found"*. This package
+used to open such a file and show the FIRST value. It now refuses the field, at every read and
+every write, which brings it into line with the reference — and, more importantly, stops `edit`
+from reporting a password rotation that only touched one of the two copies. See KNOWN_ISSUES
+I29.
+
+For PWS3 the same rule is applied to a repeated record field type, per formatV3.txt §3.3. One
+half of the original finding is **not** claimed, because it could not be checked: that pwsafe's
+`CItem::SetField` keeps the LAST occurrence. There is no pwsafe source or GUI on this host, and
+`tests/oracle/pws3_oracle` is this project's own Go writer — §3.3 already records that gap. The
+verified reference disagreement is the KDBX one.
+
+### 10.4 The hardware-token challenge does not rotate, and now says so
+
+§2.3 describes the challenge-response construction. What it did not say, and what
+`docs/RESIDUAL-RISK.md §1` now argues in full, is that KeePassXC's `Kdbx4Writer` calls
+`Kdf::randomizeSeed()` on every save while `_serialize` deliberately does not — so the token's
+20-byte answer for a given file is a constant here and a per-save value there. `probe` and
+`unlock` both warn about it now. It is not mechanically fixed; the reasoning is in the residual
+register rather than hidden in a docstring.
+
+### 10.5 A Password Safe file this program writes may not be one it can read
+
+Found by the 2026-09-04 re-gate; **this is an open defect, not a deliberate divergence**, and it
+is in this section because it is a statement about bytes another tool may be handed.
+
+§10.1 and KNOWN_ISSUES I23 state the principle: *"the read and write limits are now the same
+number and this program cannot write a file its own reader refuses."* That is true for KDBX,
+where `_verify_own_output` re-opens every save through the reader before the bytes reach disk.
+It is **not** true for Password Safe v3, which has no such check and whose once-per-session
+losslessness guard latches after the first save.
+
+Measured: a second save in one session wrote a `.psafe3` carrying a 5 MiB field — legal in the
+format, over this program's own 4 MiB per-field cap — reported `{"ok": true, "bytes": 5244200}`,
+and the resulting file answered `bad-credential` on reopen. Whether the real Password Safe GUI
+would open that file is **unknown**: formatV3.txt sets no per-field maximum, so a compliant
+reader plausibly would, which would make it a file this program wrote, cannot read, and would
+tell the operator was protected by the wrong passphrase. Nothing on this host can settle that —
+see §3.3 and RESIDUAL-RISK §3.5.
+
+Tracked as KNOWN_ISSUES I41 with the fix shape. Until it is closed, the honest form of the §10.1
+claim is *"for KDBX."*

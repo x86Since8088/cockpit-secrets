@@ -114,8 +114,10 @@ from .base import (
     Limits,
     NotFound,
     Secret,
+    SecretsError,
     Unsupported,
     Backend,
+    CsvWriter,
     atomic_replace,
     constant_time_eq,
     open_safe_fd,
@@ -236,6 +238,45 @@ _BAD_CRED = ("the passphrase, key file or file integrity check did not match "
 #: mean something. The absolute `MAX_INNER_BYTES` cap applies at every size.
 _RATIO_FLOOR_BYTES = 1024 * 1024
 
+#: THE MAXIMUM EXPANSION A SINGLE DEFLATE MEMBER CAN PHYSICALLY PRODUCE.
+#:
+#: This number is why the ratio guard is no longer a bomb defence. DEFLATE's
+#: best case is one 258-byte match per few output bits, which caps expansion at
+#: 1032:1; measured on this host with zlib 1.3, `zlib.compress(b"\0" * n, 9)`
+#: tops out at 1028:1 for every n from 1 MiB to 256 MiB. A gzip stream therefore
+#: cannot expand further than this no matter who wrote it, and a threshold below
+#: it does not separate a bomb from ordinary compressible content — it only
+#: decides how compressible a legitimate attachment is allowed to be.
+#:
+#: It decided wrong. An 8 MiB log file — one repeated line, well under
+#: `Limits.MAX_ATTACHMENT_BYTES` — compresses at 258:1 inside the inner payload,
+#: so `attach_add` + `save()` answered `{"ok": true}` and wrote a database that
+#: every later `unlock` refused with "expansion ratio 258:1 is over the 200:1
+#: limit", while KeePassXC read the same file perfectly. The same guard refused
+#: valid KDBX 3.1 databases written by keepassxc-cli, whose attachments are
+#: gzipped one by one in the binary pool.
+#:
+#: What replaces it, and why each piece is sound where a ratio is not:
+#:
+#:   * the ABSOLUTE cap (`Limits.MAX_INNER_BYTES`), enforced INCREMENTALLY by
+#:     `decompressobj().decompress(data, max_length)` — memory never exceeds the
+#:     cap, whatever the ratio, so "expands until the allocator gives up" is
+#:     impossible by construction rather than by threshold;
+#:   * the STRUCTURAL caps in `_reject_hostile_xml` — a `<Value>` over
+#:     `Limits.MAX_FIELD_BYTES`, a pooled binary over
+#:     `Limits.MAX_ATTACHMENT_BYTES`, more than `Limits.MAX_ENTRIES` entries or
+#:     `Limits.MAX_GROUPS` groups. These describe what the CONTENT is, which a
+#:     ratio never could: they refuse the corpus's 64 MiB single-value bomb and
+#:     admit a 32 MiB attachment, and those two are byte-identical to a ratio;
+#:   * `Limits.parse_budget()`, which bounds the wall clock of everything
+#:     downstream of the inflate.
+#:
+#: The check below is kept because it still asserts something true — a stream
+#: that expands past what DEFLATE can produce is not a DEFLATE stream, so it is
+#: a corruption or library-behaviour check now, not a security control, and the
+#: comment says so rather than letting a future reader mistake it for one.
+_DEFLATE_MAX_RATIO = 1032
+
 
 # ===========================================================================
 # 1. XML and decompression hardening, by interposition  (I8)
@@ -280,7 +321,7 @@ def _hardened_parser(**kwargs):
     )
 
 
-def _reject_hostile_xml(root, what):
+def _reject_hostile_xml(root, what, structural=False):
     """Refuse a parsed document that carries a DTD or any entity reference.
 
     `resolve_entities=False` stops the *expansion*; it leaves the entity
@@ -292,6 +333,11 @@ def _reject_hostile_xml(root, what):
 
     Raises `Invalid`, never `BadCredential`: the file authenticated, it is the
     *shape* we are rejecting, and saying so leaks nothing about the passphrase.
+
+    `structural=True` additionally enforces the SIZE AND COUNT clamps in
+    `Limits` against the document itself — see `_assert_structural_limits`. It
+    is set only for the decrypted inner payload, because those clamps describe
+    a KeePass database and mean nothing for a key file.
     """
     tree = root.getroottree() if hasattr(root, "getroottree") else root
     docinfo = getattr(tree, "docinfo", None)
@@ -305,19 +351,78 @@ def _reject_hostile_xml(root, what):
     # exactly the kind of thing that gets renamed and would turn this refusal
     # into an AttributeError at the worst possible moment. iter() over the
     # whole tree is bounded by huge_tree=False.
+    #
+    # The structural clamps ride along in the SAME walk. Not for speed — the
+    # walk is cheap — but so that "we looked at every node" is one loop with one
+    # exit rather than two passes that can drift apart.
     entity_tag = getattr(etree, "Entity", None)
+    entries = groups = 0
+    max_field = Limits.MAX_FIELD_BYTES
+    # A pooled binary is base64 in the XML, which is 4 bytes of text per 3 bytes
+    # of attachment. Comparing text length against the raw-byte limit would
+    # refuse a legal attachment a third under it.
+    max_binary = Limits.MAX_ATTACHMENT_BYTES * 4 // 3 + 8
     for node in tree.iter():
-        if entity_tag is not None and node.tag is entity_tag:
+        tag = node.tag
+        if entity_tag is not None and tag is entity_tag:
             raise Invalid("%s contains an XML entity reference; refused (I8)"
                           % what)
+        if not structural or not isinstance(tag, str):
+            continue
+        if tag == "Entry":
+            entries += 1
+            if entries > Limits.MAX_ENTRIES:
+                raise Invalid("this database declares more than %d entries"
+                              % Limits.MAX_ENTRIES)
+        elif tag == "Group":
+            groups += 1
+            if groups > Limits.MAX_GROUPS:
+                raise Invalid("this database declares more than %d groups"
+                              % Limits.MAX_GROUPS)
+        elif tag in ("Value", "Binary"):
+            text = node.text
+            if text is None:
+                continue
+            if tag == "Binary":
+                # KDBX 3.1 keeps attachment bodies as base64 text directly on
+                # `Meta/Binaries/Binary`. (KDBX 4 moved them to the inner
+                # header, where MAX_INNER_BYTES is the bound.) An entry's own
+                # `<Binary><Key/><Value Ref="0"/></Binary>` carries no text and
+                # falls out at the `text is None` test above.
+                if len(text) > max_binary:
+                    raise Invalid(
+                        "this database carries an attachment of %d bytes, over "
+                        "the %d byte limit" % (len(text), max_binary))
+                continue
+            # `Binary/Value` is an attachment reference or, in KDBX 3.1, the
+            # base64 body itself; `String/Value` is a field. Two different
+            # limits, told apart by the parent, because a 32 MiB attachment and
+            # a 32 MiB "password" are not the same claim about a database.
+            parent = node.getparent()
+            ptag = parent.tag if parent is not None else None
+            limit, kind = ((max_binary, "attachment")
+                           if ptag == "Binary"
+                           else (max_field, "field value"))
+            if len(text) > limit:
+                raise Invalid(
+                    "this database carries a %s of %d bytes, over the %d byte "
+                    "limit" % (kind, len(text), limit))
     return root
 
 
-def _parse_xml_hardened(data, what="XML document"):
+def _parse_xml_hardened(data, what="XML document", structural=False):
     """Parse bytes with the hardened parser and the structural refusal.
 
     Returns an `lxml` ElementTree (what `etree.parse` returns), because that is
     what pykeepass stores as the payload and later calls `.xpath()` on.
+
+    `structural=True` is set by the one caller that is parsing a KeePass
+    database rather than a key file. It is what makes `Limits.MAX_ENTRIES` mean
+    what its docstring in base.py claims — "stops a file that claims 10^9
+    records and makes the helper build the list before anything notices". The
+    count used to be checked only in `unlock()`, AFTER `PyKeePass(...)` had
+    parsed the whole payload AND run its protected-value pass over it, which is
+    the expensive part and the part an attacker controls the size of.
     """
     if isinstance(data, (bytearray, memoryview)):
         data = bytes(data)
@@ -336,7 +441,7 @@ def _parse_xml_hardened(data, what="XML document"):
         # after decryption that document is the safe's contents (I15).
         raise Invalid("%s is not well-formed XML (line %s)"
                       % (what, getattr(exc, "lineno", "?")))
-    _reject_hostile_xml(tree.getroot(), what)
+    _reject_hostile_xml(tree.getroot(), what, structural=structural)
     return tree
 
 
@@ -363,11 +468,15 @@ def _bounded_decompress(data, wbits):
     if len(out) > Limits.MAX_INNER_BYTES:
         raise Invalid("compressed payload expands past the %d byte limit"
                       % Limits.MAX_INNER_BYTES)
+    # See `_DEFLATE_MAX_RATIO`: this is a "these bytes are not a deflate
+    # stream" assertion, not the bomb defence. The bomb defence is the
+    # incremental cap above plus the structural caps in `_reject_hostile_xml`.
+    ratio_limit = max(Limits.MAX_DECOMPRESS_RATIO, _DEFLATE_MAX_RATIO)
     if (len(out) > _RATIO_FLOOR_BYTES
-            and len(out) > Limits.MAX_DECOMPRESS_RATIO * max(1, len(data))):
+            and len(out) > ratio_limit * max(1, len(data))):
         raise Invalid("compressed payload expansion ratio %d:1 is over the "
                       "%d:1 limit" % (len(out) // max(1, len(data)),
-                                      Limits.MAX_DECOMPRESS_RATIO))
+                                      ratio_limit))
     return out
 
 
@@ -407,7 +516,8 @@ class _HardenedEtree:
             # validate. Nothing in our call graph does that; refuse rather than
             # quietly open it (I4).
             raise Invalid("hardened XML parser refuses to open a path")
-        return _parse_xml_hardened(data, "the decrypted inner payload")
+        return _parse_xml_hardened(data, "the decrypted inner payload",
+                                   structural=True)
 
     def fromstring(self, text, parser=None, base_url=None):
         """pykeepass calls this on key-file bytes. Returns the ROOT element."""
@@ -1232,11 +1342,62 @@ def _field_element(entry, key):
     Comparing element text in Python has neither problem, needs no escaping
     scheme to get right, and cannot be re-broken by a future edit.
     """
+    # REFUSE A REPEATED KEY RATHER THAN PICK ONE.
+    #
+    # `_read_header` already applies this rule one layer up, with the reason
+    # written out there: "A duplicated header field is a parser differential
+    # waiting to happen ... Refuse rather than pick." The same hazard is
+    # sharper down here, because down here the differing values are
+    # CREDENTIALS. Measured on a database with two `<String><Key>Password`
+    # elements: this function's first-match answer showed the FIRST value while
+    # keepassxc-cli 2.7.10 refused the file outright ("Duplicate custom
+    # attribute found"), so a safe supplied by A3 displayed a password no
+    # reference implementation would ever show. The write path was worse:
+    # `edit` rewrote the first copy and reported `{"changed": ["password"]}`
+    # while the second copy — the one another reader might use — kept the old
+    # value, i.e. a credential rotation that silently did nothing.
+    #
+    # The refusal lives HERE, not only in a scan at unlock, because every read
+    # and every write of a string field goes through this function. A check
+    # placed anywhere else is a check some future path can be added around.
+    found = None
     for string_el in entry._element.findall("String"):
         key_el = string_el.find("Key")
         if key_el is not None and key_el.text == key:
-            return string_el
-    return None
+            if found is not None:
+                raise Invalid(
+                    "this entry carries more than one field with the same "
+                    "name; refusing to guess which one is meant")
+            found = string_el
+    return found
+
+
+def _assert_unique_fields(entry):
+    """Refuse an entry carrying two `<String>` elements with the same `<Key>`.
+
+    `_field_element` already refuses when a duplicated key is READ, and that is
+    the enforcement point no path can be added around. This is the one that
+    catches the case where nothing reads the duplicated key at all: `edit` sets
+    the six core fields through pykeepass's own property setters (so that the
+    OTP and tag semantics stay pykeepass's rather than ours), and those setters
+    do their own first-match update. Without this scan, rotating a password on
+    an entry with two `<String><Key>Password` elements rewrote the first copy,
+    answered `{"changed": ["password"]}`, and left the second — the one another
+    reader might use — holding the old value.
+
+    Called from `_entry()`, which every uuid-addressed verb goes through, so
+    "no verb operates on an entry whose fields are ambiguous" is a property of
+    one function rather than a rule each verb has to remember.
+    """
+    seen = set()
+    for string_el in entry._element.findall("String"):
+        key_el = string_el.find("Key")
+        if key_el is None:
+            continue
+        if key_el.text in seen:
+            raise Invalid("this entry carries more than one field with the "
+                          "same name; refusing to guess which one is meant")
+        seen.add(key_el.text)
 
 
 def _field_value(entry, key):
@@ -1316,6 +1477,13 @@ def _attachment_bytes(attachment, strict=True):
     there. pykeepass answers that with an `IndexError`, which would leave a
     verb raising an untyped exception; `strict=False` is for the listing paths,
     where one broken reference must not make the whole entry unreadable.
+
+    `SecretsError` is in the tolerant list, and that omission was a real bug:
+    reading a KDBX 3.1 attachment INFLATES it, so `_bounded_decompress` can
+    refuse from inside this call. Catching only the four builtin types meant an
+    `Invalid` flew straight out of `attach_list()` and `fields()` — the two
+    paths whose whole contract is "one broken attachment must not make the
+    entry unreadable" — and took the entry's name and every other field with it.
     """
     try:
         return attachment.binary or b""
@@ -1323,6 +1491,10 @@ def _attachment_bytes(attachment, strict=True):
         if strict:
             raise Invalid("this attachment points at a binary that is not in "
                           "the database")
+        return b""
+    except SecretsError:
+        if strict:
+            raise
         return b""
 
 
@@ -1462,6 +1634,7 @@ class KdbxBackend(Backend):
         if self.entry.get("yubikey_slot"):
             try:
                 yubikey = challenge_for(self.entry)
+                warnings.append(_YUBIKEY_CONSTANT_CHALLENGE_WARNING)
             except Unsupported as exc:
                 warnings.append("hardware key unavailable: %s" % exc.detail)
 
@@ -1526,12 +1699,29 @@ class KdbxBackend(Backend):
                 "this database is KDBX %s; writes stay off until the "
                 "round-trip check confirms nothing would be lost"
                 % hdr.version)
+        if self.entry.get("yubikey_slot") and hdr.major >= 4:
+            # Said at unlock as well as at probe: the probe warning is shown
+            # before the token is touched, and a caller that goes straight to
+            # `unlock` (the agent, a script, the integration suite) never sees
+            # it. A property this important should not depend on which door was
+            # used. See `_YUBIKEY_CONSTANT_CHALLENGE_WARNING`.
+            warnings.append(_YUBIKEY_CONSTANT_CHALLENGE_WARNING)
 
         # Only now is it safe to let a parser near the plaintext. pykeepass
         # gets the transformed key and NOT the passphrase, so the master
         # passphrase never becomes an unwipeable `str` in this process (I14).
         try:
-            kp = PyKeePass(io.BytesIO(data), transformed_key=transformed)
+            # The MAC has verified, so these bytes are "ours" in the I6 sense —
+            # but a file the operator can open is still a file an attacker may
+            # have shaped (A3), and everything from here to `_reindex()` is
+            # iteration over structure the attacker chose. The budget is the
+            # only bound on that stretch: the KDF clamps are spent, the size
+            # caps are spent, and `MAX_ENTRIES` bounds the COUNT but not the
+            # per-entry cost. Measured before it existed: 100 000 entries whose
+            # protected values fail to decode took 46 s at 100% CPU and were
+            # then accepted.
+            with Limits.parse_budget(what="opening this database"):
+                kp = PyKeePass(io.BytesIO(data), transformed_key=transformed)
         except (Invalid, Unsupported):
             raise
         except Exception as exc:
@@ -1641,6 +1831,18 @@ class KdbxBackend(Backend):
         if isinstance(exc, (ValueError, OverflowError, IndexError,
                             UnicodeDecodeError, struct.error, binascii.Error)):
             return Invalid("this database is malformed or truncated")
+        # An lxml XPath error is never a statement about the FILE — it is a
+        # statement about a query we built, i.e. about the request. Belt to the
+        # brace in `add()`, which no longer puts caller text in a query at all:
+        # if some future call site reintroduces one, the caller learns their
+        # input was rejected instead of being told, falsely, that their database
+        # will not open. `XPathError` is the base of `XPathEvalError` and of
+        # `XPathSyntaxError`, and it is a `LookupError` subclass, so it must be
+        # tested before any broad builtin class above it — it is not, today,
+        # because none of those catch it.
+        xpath_error = getattr(etree, "XPathError", None)
+        if xpath_error is not None and isinstance(exc, xpath_error):
+            return Invalid("that name cannot be used here")
         return Internal("the KDBX engine could not open this database")
 
     # -- indexing ----------------------------------------------------------
@@ -1697,6 +1899,7 @@ class KdbxBackend(Backend):
         found = self._index.get(uuid)
         if found is None:
             raise NotFound("no such entry")
+        _assert_unique_fields(found)
         return found
 
     def _group(self, uuid):
@@ -2149,8 +2352,31 @@ class KdbxBackend(Backend):
         expiry = (_parse_iso(want_expiry, "expires")
                   if want_expiry else None)
         try:
+            # THE TWO EMPTY STRINGS ARE THE FIX, not a tidy-up.
+            #
+            # `PyKeePass.add_entry` opens by calling `find_entries(title=...,
+            # username=...)` — unconditionally, before it even looks at
+            # `force_creation` — and `_find` formats those caller-supplied
+            # strings straight into an XPath predicate. That is the second half
+            # of the defect docs/COMPATIBILITY.md §7 documents for `reveal()`
+            # and then warns about in general: "Anyone else passing
+            # caller-supplied text to a pykeepass find_* / set_custom_property
+            # call has the same bug." `add` was that call site and was never
+            # hardened. Measured: an entry titled `a"b` — a perfectly legal
+            # KeePass title — answered {"error": "internal", "detail": "the
+            # KDBX engine could not open this database"}, which is both a verb
+            # the caller cannot use and a sentence that is not true.
+            #
+            # Passing a CONSTANT removes the caller's text from the query
+            # altogether, which is better than any escaping scheme because
+            # there is nothing left to get right. (`None` would skip the filter
+            # entirely, which is tidier still, but pykeepass then hands `None`
+            # to `E.Value()` and lxml refuses it — so the constant is the empty
+            # string, and the two fields are written immediately afterwards by
+            # `_set_field`, which compares element text in Python. That is the
+            # same technique §7 used to fix `reveal()`.)
             new = self._kp.add_entry(
-                dest, title, username, password, url=url, notes=notes,
+                dest, "", "", password, url=url, notes=notes,
                 expiry_time=expiry, tags=tags, otp=otp,
                 icon=entry.get("icon") or None,
                 # KeePass itself permits two entries with the same title in one
@@ -2159,6 +2385,8 @@ class KdbxBackend(Backend):
                 force_creation=True)
         except Exception as exc:
             raise self._map_pykeepass_error(exc)
+        _set_field(new, "Title", title, False)
+        _set_field(new, "UserName", username, False)
         # Same shape and the same validator as `edit`'s `changes.custom`, so a
         # custom field can be created WITH the entry rather than only bolted on
         # by a second verb afterwards. The isinstance check is not decoration:
@@ -2802,7 +3030,12 @@ class KdbxBackend(Backend):
         # for. A password can contain a comma, a quote, a newline and a NUL-
         # adjacent control character; quoting everything is the only setting
         # under which the file a migrator reads back is the file we meant.
-        writer = csv.writer(buf, quoting=csv.QUOTE_ALL, lineterminator="\r\n")
+        #
+        # RFC-4180 quoting is NOT a formula-injection defence — a spreadsheet
+        # parses a quoted cell that begins with `=` as a formula just the same.
+        # `CsvWriter` is `csv.writer` with `csv_cell` applied to every field;
+        # see its docstring for the hazard and the fidelity cost.
+        writer = CsvWriter(buf)
         writer.writerow(self._CSV_KEEPASSXC + self._CSV_EXTRA)
         for entry in self._export_entries():
             custom = {name: value for name, value, _p in
@@ -2825,6 +3058,10 @@ class KdbxBackend(Backend):
                 json.dumps(custom, ensure_ascii=False, sort_keys=True)
                 if custom else "",
             ])
+        # Read by the `export` verb so the operator is TOLD that cells were
+        # changed rather than discovering an apostrophe later. See
+        # base.CsvWriter / base.csv_cell for why the change is made at all.
+        self.last_export_neutralised = writer.neutralised
         return buf.getvalue().encode("utf-8")
 
     def _export_xml(self):
@@ -2941,20 +3178,116 @@ class KdbxBackend(Backend):
                               for old in entry.history]
         return row
 
+    @staticmethod
+    def verify_structure(data):
+        """See `Backend.verify_structure`. Walks the file, decrypts nothing.
+
+        KDBX4 is fully checkable without a key: the outer header ends with a
+        SHA-256 and an HMAC, and the payload is a chain of
+        `hmac(32) | length(u32 LE) | bytes` blocks ending in a zero-length one.
+        Walking those lengths proves the file is whole, and none of it needs
+        the transformed key — the MACs are simply not compared.
+
+        KDBX 3.x has no block framing (the whole payload is one CBC stream), so
+        the strongest key-free statement available is that the ciphertext is
+        present and a whole number of cipher blocks. That is weaker, and saying
+        so here is better than implying a check we cannot make.
+        """
+        hdr = _read_header(data)          # raises Invalid on a short header
+        if hdr.major < 4:
+            body = len(data) - hdr.end
+            if body <= 0:
+                raise Invalid("this file has a KDBX header and no payload")
+            if body % 16:
+                raise Invalid("this KDBX 3.x payload is not a whole number of "
+                              "cipher blocks; the file is truncated")
+            return
+        end = hdr.end
+        if len(data) < end + 64:
+            raise Invalid("this file is truncated before its header hashes")
+        off = end + 64
+        index = 0
+        while True:
+            if off + 36 > len(data):
+                raise Invalid("this KDBX payload is truncated")
+            blen = struct.unpack_from("<I", data, off + 32)[0]
+            Limits.check_length(blen, len(data) - (off + 36),
+                                "KDBX payload block")
+            off += 36 + blen
+            index += 1
+            if blen == 0:
+                break
+            if index > 1 + (Limits.MAX_SAFE_BYTES // 1024):
+                raise Invalid("this KDBX payload has an implausible block "
+                              "count")
+        if off != len(data):
+            # Trailing bytes after the terminator mean the file is not the
+            # thing it claims to be — a concatenation, or a partially
+            # overwritten generation.
+            raise Invalid("this KDBX file carries %d bytes after the end of "
+                          "its payload" % (len(data) - off))
+
     def _verify_own_output(self, data):
-        """Re-run the full MAC verification over bytes we just built.
+        """Prove we can READ what we are about to write, before we write it.
 
         A writer and a reader that share a bug round-trip perfectly (I19), so
         this is not evidence of compliance — the interop oracle is. What it IS
         evidence of is that the bytes about to replace a working database are
-        internally consistent, which is the failure this catches: a truncated
-        build, a mismatched seed, a construct edge case.
+        ones THIS PROGRAM can open again, which is a promise the operator is
+        entitled to and which this method used not to keep.
+
+        It used to run only `_verify_kdbx4`/`_verify_kdbx3` — header hash and
+        per-block HMAC. Those never decompress and never parse, so every
+        refusal that lives downstream of them was invisible here. Measured: one
+        `attach_add` of an ordinary 8 MiB log file (well inside
+        `Limits.MAX_ATTACHMENT_BYTES`) produced a 33 KB database that passed
+        every MAC, was written over the live safe with `{"ok": true}`, and was
+        then refused by our own `unlock` at every later attempt. The round-trip
+        guard that would have caught it — `_assert_lossless` — had latched
+        `self._lossless = True` before the attachment existed and short-circuits
+        on every later call, so it never looked at the mutated database at all.
+        That latch is right for its own job (an EARLY warning that this file
+        cannot be written at all) and wrong as a pre-write check, so the
+        pre-write check now stands on its own and runs EVERY time:
+
+          1. the MACs, as before — a truncated build or a mismatched seed;
+          2. a full re-open through the SAME reader path a later `unlock` uses,
+             including `_bounded_decompress` and the hardened XML parser, so any
+             read-side refusal is a save that fails rather than a safe that is
+             gone;
+          3. `_diff_xml` against the tree we are serialising, so I22's "a save
+             must not silently drop a field" holds for THESE bytes rather than
+             for the state the database happened to be in at the first mutation.
+
+        The cost is one symmetric decrypt and one parse per save, with no KDF —
+        the same price `_assert_lossless` already pays once, now paid each time
+        a database is written. A save is not a hot path, and the alternative is
+        the failure above.
         """
         hdr = _read_header(data)
         if hdr.major >= 4:
             _verify_kdbx4(data, hdr, self._tk.bytes)
         else:
             _verify_kdbx3(data, hdr, self._tk.bytes)
+        try:
+            with Limits.parse_budget(what="verifying the database we built"):
+                probe = PyKeePass(io.BytesIO(data),
+                                  transformed_key=self._tk.bytes)
+        except SecretsError as exc:
+            # The reader refused our own output. Conflict, not Internal: this
+            # is the same class of "this database cannot be written" answer
+            # `_fail_lossless` gives, the live file is untouched, and the detail
+            # names what the reader objected to so the operator can undo the
+            # change that caused it.
+            raise Conflict("the database we built cannot be read back, so it "
+                           "was not written: %s" % exc.detail)
+        except Exception as exc:
+            raise Conflict("the database we built cannot be read back, so it "
+                           "was not written: %s"
+                           % self._map_pykeepass_error(exc).detail)
+        lost = _diff_xml(self._kp.tree.getroot(), probe.tree.getroot())
+        if lost:
+            self._fail_lossless("; ".join(lost[:5]), lost[0])
 
     def lock(self):
         """Drop the decrypted database and every key derived from it.
@@ -3111,6 +3444,29 @@ _KDBX3_WARNING = (
     "this is a KDBX 3.x database: the format has no authenticated encryption, "
     "so a tampered file decrypts to attacker-influenced data with nothing to "
     "detect it. It is open read-only. Use the KDBX 4 upgrade to write to it.")
+
+#: Said at every unlock of a safe whose registry entry declares a hardware
+#: token, because the operator's mental model of a second factor ("the token has
+#: to be present each time") is not what this file actually gives them.
+#:
+#: The challenge IS the KDF seed (see `_challenge_bytes`), and `_serialize`
+#: deliberately does not rotate the KDF seed — it cannot, because a new seed is
+#: a new challenge and computing the answer to it needs the token again at SAVE
+#: time, which this protocol has no round for. KeePassXC's `Kdbx4Writer` calls
+#: `Kdf::randomizeSeed()` on every save and re-challenges the token, so under
+#: KeePassXC a captured 20-byte answer stops working at the operator's next
+#: save; here it keeps working for as long as the file exists.
+#:
+#: docs/RESIDUAL-RISK.md carries the argument for why the two available
+#: mechanical fixes — a second challenge round in the unlock protocol, or
+#: holding the composite key and paying a full KDF on every save — were judged
+#: worse than saying this out loud. Saying nothing was not one of the options.
+_YUBIKEY_CONSTANT_CHALLENGE_WARNING = (
+    "this safe's hardware-token challenge is its KDF seed, and this program "
+    "does not rotate that seed when it saves: the token's answer for this file "
+    "is the same value every time, so anyone who observes it once can open the "
+    "file until the file is re-keyed elsewhere. KeePassXC rotates the seed on "
+    "every save and retires the previous answer.")
 
 
 def _totp_remaining(otp):

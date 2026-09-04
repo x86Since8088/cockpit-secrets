@@ -57,10 +57,12 @@ import ctypes.util
 import errno
 import hashlib
 import hmac
+import json
 import os
 import re
 import resource
 import secrets as _sysrandom
+import signal
 import stat
 import sys
 import time
@@ -157,9 +159,24 @@ def _redaction_candidates(item):
     ):
         if len(decoded) >= REDACT_MIN_LEN:
             out.append(decoded)
-            # repr() of the value as it would appear inside a Python traceback
-            # or a json.dumps() of a request body.
+            # repr() of the value as it would appear inside a Python traceback.
             out.append(repr(decoded)[1:-1])
+            # json.dumps() of the value, which is NOT the same string as repr()
+            # and is the form the two blanket filters actually see. `emit()`
+            # and `audit()` both call redact() on the OUTPUT of json.dumps, so
+            # a secret containing a character json escapes and repr does not
+            # was passed through untouched. Measured before this line existed:
+            # a passphrase containing `"` came back as `\"` and a passphrase
+            # containing NUL came back as a JSON \\u0000 escape, and neither matched any
+            # candidate. repr() switches to single quotes rather than escaping
+            # a double quote, and renders NUL as \x00, so it can never stand in
+            # for this. Both settings of `ensure_ascii` are generated because
+            # both are reachable: emit() passes False, and any other json.dumps
+            # in the program defaults to True.
+            for esc in (json.dumps(decoded, ensure_ascii=False)[1:-1],
+                        json.dumps(decoded, ensure_ascii=True)[1:-1]):
+                if len(esc) >= REDACT_MIN_LEN:
+                    out.append(esc)
     out.append(base64.b64encode(raw).decode("ascii"))
     out.append(binascii.hexlify(raw).decode("ascii"))
     return [c for c in out if len(c) >= REDACT_MIN_LEN]
@@ -635,6 +652,23 @@ class Limits:
     #: illegal one fails as an allocation error rather than an OOM kill.
     KDF_MAX_RSS_BYTES = 1536 * 1024 * 1024
 
+    #: Wall-clock budget for turning an AUTHENTICATED payload into an in-memory
+    #: database — decompression, the XML parse, the protected-value pass and the
+    #: index build. Everything upstream of this is bounded by a size or a
+    #: parameter clamp; this stretch was bounded by nothing at all, and the cost
+    #: is not a function of any number we check. Measured: a 3.8 MB KDBX4 file
+    #: carrying MAX_ENTRIES protected values that fail to decode spent 46 s of
+    #: 100%-CPU and 313 MB of RSS inside `PyKeePass(...)` and was then ACCEPTED,
+    #: because pykeepass evaluates `tree.getpath(elem)` — which is O(position) —
+    #: once per failing value. No clamp catches that, and the next quadratic in
+    #: a dependency will not be caught by a clamp either.
+    #:
+    #: 20 s matches KDF_WALL_CLOCK_SECONDS deliberately: the two budgets bound
+    #: the two halves of one unlock, and an operator should not have to learn
+    #: two numbers. Unlike the KDF budget this one is PREEMPTIVE where it can be
+    #: (see `parse_budget`).
+    PARSE_WALL_CLOCK_SECONDS = 20.0
+
     # -- file and payload sizes -------------------------------------------
     #: Largest safe file we will open at all. Stops "point the registry at a
     #: 40 GiB file and watch the helper read it to compute a fingerprint".
@@ -766,6 +800,37 @@ class Limits:
         return _KdfBudget(cls.KDF_WALL_CLOCK_SECONDS if seconds is None
                           else seconds)
 
+    @classmethod
+    def parse_budget(cls, seconds=None, what="opening this database"):
+        """Context manager that STOPS work which overran its budget.
+
+        Usage:
+
+            with Limits.parse_budget():
+                kp = PyKeePass(io.BytesIO(data), transformed_key=tk)
+
+        The difference from `kdf_budget`, and the reason both exist: a KDF is a
+        single C call that Python cannot interrupt, so that budget can only
+        detect an overrun afterwards. Turning a payload into a database is
+        Python-level iteration over attacker-shaped structure, and Python-level
+        code IS interruptible — so this one arms `setitimer(ITIMER_REAL)` and
+        raises out of the loop, which is the difference between refusing a
+        hostile file in 20 s and returning a handle after 46 s of burnt CPU.
+
+        The exception it raises derives from `BaseException`, not `Exception`.
+        That is load-bearing: this fires deep inside pykeepass and construct,
+        both of which have broad `except Exception` handlers that would
+        otherwise swallow the timeout and carry on with a half-built tree.
+
+        FAILS OPEN, ONCE, AND SAYS SO: `signal.setitimer` only works on the main
+        thread of the main interpreter. When it is unavailable the budget
+        degrades to the same after-the-fact refusal `kdf_budget` gives — the
+        work still finishes, but the result is still discarded and the caller
+        still gets a typed error rather than an answer it waited minutes for.
+        """
+        return _ParseBudget(cls.PARSE_WALL_CLOCK_SECONDS if seconds is None
+                            else seconds, what)
+
 
 class _KdfBudget:
     """Implementation detail of Limits.kdf_budget(); see that docstring."""
@@ -786,6 +851,64 @@ class _KdfBudget:
         if exc_type is None and self.elapsed > self.seconds:
             raise Invalid("key derivation exceeded its %.1fs budget"
                           % self.seconds)
+        return False
+
+
+class _ParseTimeout(BaseException):
+    """Raised by the SIGALRM handler `_ParseBudget` installs.
+
+    Derives from `BaseException` on purpose — see `Limits.parse_budget`. It is
+    never allowed to escape `_ParseBudget.__exit__`, which converts it to the
+    `Invalid` the caller's taxonomy expects.
+    """
+
+
+class _ParseBudget:
+    """Implementation detail of Limits.parse_budget(); see that docstring."""
+
+    __slots__ = ("seconds", "what", "started", "elapsed", "_armed", "_prev")
+
+    def __init__(self, seconds, what):
+        self.seconds = float(seconds)
+        self.what = what
+        self.started = 0.0
+        self.elapsed = 0.0
+        self._armed = False
+        self._prev = None
+
+    def _fire(self, _signum, _frame):
+        raise _ParseTimeout()
+
+    def __enter__(self):
+        self.started = time.monotonic()
+        try:
+            self._prev = signal.signal(signal.SIGALRM, self._fire)
+            signal.setitimer(signal.ITIMER_REAL, self.seconds)
+            self._armed = True
+        except (ValueError, OSError, AttributeError):
+            # Not the main thread, or no SIGALRM. Degrade, do not fail.
+            self._armed = False
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self._armed:
+            try:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+                signal.signal(signal.SIGALRM, self._prev or signal.SIG_DFL)
+            except (ValueError, OSError):
+                pass
+            self._armed = False
+        self.elapsed = time.monotonic() - self.started
+        if exc_type is _ParseTimeout:
+            raise Invalid("%s exceeded its %.1fs budget" % (self.what,
+                                                            self.seconds))
+        if exc_type is None and self.elapsed > self.seconds:
+            # The preemptive path was unavailable (or the overrun happened
+            # inside a C call the signal could not interrupt). Discard the
+            # result anyway: an answer that took longer than the budget is an
+            # answer the budget said not to give.
+            raise Invalid("%s exceeded its %.1fs budget" % (self.what,
+                                                            self.seconds))
         return False
 
 
@@ -1238,8 +1361,125 @@ def open_safe_fd(path, *, expect_uid=None, want_write=False):
 
 
 # ===========================================================================
+# CSV export — formula neutralisation  (CWE-1236)
+# ===========================================================================
+
+#: A cell beginning with one of these is handed to the spreadsheet's FORMULA
+#: parser, not its text parser — Excel and LibreOffice both do it, and both do
+#: it inside RFC-4180 quotes, so `csv.QUOTE_ALL` is not a defence against it and
+#: never was. TAB and CR are here because a leading one is stripped before the
+#: first significant character is looked at.
+CSV_FORMULA_LEAD = ("=", "+", "-", "@", "\t", "\r")
+
+#: What we put in front of such a cell. A leading apostrophe is the "this cell
+#: is text" marker in every spreadsheet that has this problem, and it is not
+#: displayed. See `csv_cell` for what it costs.
+CSV_TEXT_PREFIX = "'"
+
+
+def csv_cell(value):
+    """One CSV cell, with a leading formula character neutralised.
+
+    THE HAZARD. An export is "the entire safe in plaintext" and the one thing
+    an operator does with it is open it in a spreadsheet. A field value under
+    an attacker's control (A3 — a malicious or corrupted safe) that begins with
+    `=` is not data there, it is code: `=WEBSERVICE("http://…"&D2)` reads the
+    neighbouring Password cell and sends it out, and `=cmd|' /C calc'!A0` is a
+    DDE launch. Measured before this function existed: a URL of
+    `=cmd|' /C calc'!A0` was written to the export verbatim, quoted and
+    otherwise untouched.
+
+    WHAT IT COSTS, stated because it is a real cost and not a rounding error.
+    There is no neutralisation a plain CSV reader can undo unambiguously, so a
+    legitimate value that begins with one of these characters — a password like
+    `-hunter2` is the realistic case — gains a leading apostrophe in the export.
+    The alternatives were weighed and rejected:
+
+      * leave the bytes alone, as KeePassXC's exporter does, and document the
+        hazard. That keeps byte-fidelity and leaves an exfiltration primitive
+        in the one artefact that contains every credential at once.
+      * refuse to export an entry whose field looks like a formula. That turns
+        a hostile safe into a denial of the operator's own recovery path.
+
+    So the mangling is accepted, and made LOUD rather than silent: the export
+    verb reports how many cells were neutralised, `_export_csv` counts them,
+    docs/COMPATIBILITY.md records the divergence from KeePassXC's CSV, and the
+    change is visible in the file itself. An operator re-importing into a
+    password manager strips one leading apostrophe.
+    """
+    if not isinstance(value, str):
+        value = "" if value is None else str(value)
+    if value.startswith(CSV_FORMULA_LEAD):
+        return CSV_TEXT_PREFIX + value
+    return value
+
+
+class CsvWriter:
+    """`csv.writer` with `csv_cell` applied to every field, and a count.
+
+    A helper function that each call site has to remember to call is a rule;
+    this is the rule made structural. `validate.sh` bans `csv.writer(` outside
+    this file so a new export format cannot quietly reintroduce the raw writer.
+
+    `neutralised` is the number of cells that were changed, which the `export`
+    verb reports so the operator is told rather than surprised.
+    """
+
+    __slots__ = ("_w", "neutralised")
+
+    def __init__(self, fileobj):
+        import csv as _csv
+        self._w = _csv.writer(fileobj, quoting=_csv.QUOTE_ALL,
+                              lineterminator="\r\n")
+        self.neutralised = 0
+
+    def writerow(self, row):
+        out = []
+        for cell in row:
+            safe = csv_cell(cell)
+            if safe is not cell and safe != cell:
+                self.neutralised += 1
+            out.append(safe)
+        return self._w.writerow(out)
+
+
+# ===========================================================================
 # atomic_replace — the durable write primitive  (I12, I13)
 # ===========================================================================
+
+def write_all(fd, data):
+    """`write(2)` until every byte is out. The ONLY way this program writes.
+
+    `os.write()` returns how many bytes the kernel actually took, and it is
+    allowed to take fewer than it was offered — a short write. On a healthy
+    filesystem it almost never happens, which is precisely why a call site that
+    ignores the return value passes every test and then loses data the one time
+    the disk is full or the quota is hit.
+
+    This existed as an open-coded `while written < len(data)` loop in
+    `atomic_replace` and in the export writer, and as a plain `os.write()` that
+    advanced by the length of the buffer it READ in `_ring_backup` — the one
+    data-carrying write in the program that did not loop. That asymmetry cost a
+    silently truncated backup generation that the ring then presented as a good
+    one. One function, used everywhere, is what stops the next call site from
+    getting the same detail wrong; `validate.sh` bans a bare `os.write(` of
+    caller data outside this file for the same reason.
+
+    Returns the number of bytes written, which always equals `len(data)` —
+    anything else raises out of `os.write` itself.
+    """
+    view = memoryview(data)
+    total = len(view)
+    written = 0
+    while written < total:
+        n = os.write(fd, view[written:])
+        if n <= 0:
+            # write(2) returning 0 for a non-empty buffer is not something a
+            # regular file does, but a loop that trusts it would spin forever.
+            raise Internal("a write of %d bytes made no progress" % total)
+        written += n
+    return written
+
 
 def backup_dir_for(path, backup_dir):
     """Where a safe's backup ring lives. Default `<path>.bak.d/`, per
@@ -1318,18 +1558,53 @@ def _ring_backup(src_fd, path, backup_dir, keep):
             continue
     if bfd is None:
         raise Internal("could not create a backup generation")
+    # A GENERATION IS EITHER COMPLETE OR IT IS NOT IN THE RING.
+    #
+    # This loop used to be `os.write(bfd, chunk); off += len(chunk)` — it
+    # advanced by the bytes READ, not the bytes WRITTEN. os.write() is a thin
+    # wrapper over write(2) and write(2) is permitted to write fewer bytes than
+    # it was given; on a filesystem that is nearly full it does exactly that
+    # once and then fails. The result was a TRUNCATED generation that was
+    # fsync'd, named, listed by the `backups` verb with a plausible size, and
+    # accepted by `restore-backup` — which then wrote it over the live safe.
+    # Measured on a 256 KiB tmpfs: a 4661-byte fixture produced a 4096-byte
+    # "generation", restore-backup reported {"ok": true}, and the safe no
+    # longer opened. Worse, some of those saves returned "saved": true, so the
+    # operator was never told. `write_all` fixes the accounting; the size
+    # assertion and the unlink below make the invariant unconditional, because
+    # a ring whose members are only PROBABLY complete is not an undo.
     try:
-        os.fchmod(bfd, 0o600)          # explicit: never rely on umask alone
-        off = 0
-        while off < st.st_size:
-            chunk = os.pread(src_fd, min(1 << 20, st.st_size - off), off)
-            if not chunk:
-                break
-            os.write(bfd, chunk)
-            off += len(chunk)
-        os.fsync(bfd)                  # a backup that is not on disk is not one
-    finally:
-        os.close(bfd)
+        try:
+            os.fchmod(bfd, 0o600)      # explicit: never rely on umask alone
+            off = 0
+            while off < st.st_size:
+                chunk = os.pread(src_fd, min(1 << 20, st.st_size - off), off)
+                if not chunk:
+                    break
+                write_all(bfd, chunk)
+                off += len(chunk)
+            os.fsync(bfd)              # a backup that is not on disk is not one
+            written = os.fstat(bfd).st_size
+            if off != st.st_size or written != st.st_size:
+                raise Internal(
+                    "the backup generation is short (%d of %d bytes); nothing "
+                    "was written" % (written, st.st_size))
+        finally:
+            os.close(bfd)
+    except BaseException as exc:
+        # Remove the partial generation. Leaving it would put a file the ring
+        # cannot distinguish from a good one where the only undo lives.
+        try:
+            os.unlink(dest)
+        except OSError:
+            pass
+        if isinstance(exc, OSError):
+            # ENOSPC/EDQUOT/EIO on the ring is the operator's most likely
+            # cause and `internal / OSError` tells them nothing. Name the
+            # class of failure; never the path (I15).
+            raise Internal("the backup generation could not be written: %s"
+                           % errno.errorcode.get(exc.errno, "OSError"))
+        raise
 
     # Prune oldest-first. The name embeds a UTC timestamp, so lexical order is
     # chronological order.
@@ -1457,11 +1732,15 @@ def atomic_replace(path, data, *, backup_dir=None, keep=None,
         os.fchmod(tfd, mode)           # explicit; umask must not get a vote
 
         # ---- 4. write and fsync ------------------------------------------
-        written = 0
-        view = memoryview(data)
-        while written < len(data):
-            written += os.write(tfd, view[written:])
+        write_all(tfd, data)
         os.fsync(tfd)
+        # The same assertion the ring gets: a short write here would publish a
+        # truncated safe by os.replace, which is the one outcome this whole
+        # function exists to make impossible.
+        if os.fstat(tfd).st_size != len(data):
+            raise Internal("the temporary file is short (%d of %d bytes); "
+                           "nothing was written"
+                           % (os.fstat(tfd).st_size, len(data)))
         os.close(tfd)
         tfd = None
 
@@ -1650,8 +1929,21 @@ class LockFile:
                          os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
         except OSError:
             return None
+        # The read has to be guarded too, and separately. `os.open` on a
+        # DIRECTORY succeeds — O_NOFOLLOW does not exclude one — and the
+        # `os.read` that follows then raises IsADirectoryError. That exception
+        # was raised INSIDE the `except FileExistsError` handler of acquire(),
+        # where the sibling `except OSError` of the same try statement cannot
+        # catch it, so it escaped as `internal / IsADirectoryError` BEFORE the
+        # `override_stale` branch was ever consulted: the documented escape
+        # hatch could not be used, and the safe stayed un-savable until someone
+        # removed the directory by hand. Returning None here puts the caller
+        # back on the ordinary "unnamed holder" path, and acquire() names the
+        # real obstruction separately.
         try:
             raw = os.read(fd, 4096)
+        except OSError:
+            return None
         finally:
             os.close(fd)
         text = raw.decode("utf-8", "replace")
@@ -1670,6 +1962,10 @@ class LockFile:
             return False
         try:
             raw = os.read(fd, 4096)
+        except OSError:
+            # Same hazard as _read_holder: the path may not be a regular file.
+            # "Not ours" is the safe answer — release() then leaves it alone.
+            return False
         finally:
             os.close(fd)
         return self._token.encode("ascii") in raw
@@ -1683,6 +1979,19 @@ class LockFile:
                          os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
                          | os.O_NOFOLLOW, 0o600)
         except FileExistsError:
+            # What is actually in the way? A directory (or a fifo, or a device)
+            # at the lock path is DEBRIS, not a holder, and answering "locked by
+            # another client" for it sends the operator to close a client that
+            # is not running. Named before the holder is read, so both the
+            # plain and the override branch get the accurate message.
+            try:
+                mode = os.lstat(self.lock_path).st_mode
+            except OSError:
+                mode = stat.S_IFREG
+            if not (stat.S_ISREG(mode) or stat.S_ISLNK(mode)):
+                raise Conflict(
+                    "the lock path exists but is not a lock file; remove it by "
+                    "hand — this is not something an override can clear")
             self.holder = self._read_holder()
             if not self.override_stale:
                 raise Conflict("the safe is locked by %s; close it there, or "
@@ -1692,6 +2001,16 @@ class LockFile:
             # a loop here would race two overriding callers against each other.
             try:
                 os.unlink(self.lock_path)
+            except IsADirectoryError:
+                # Debris, not a lock. `os.unlink` cannot remove a directory and
+                # `os.rmdir` would delete something we did not create and know
+                # nothing about, so say exactly what is in the way and let a
+                # human decide. Conflict, not Internal: the save did not fail
+                # for an unknown reason, it failed because the lock path is
+                # occupied — the same class of event as a real holder.
+                raise Conflict(
+                    "the lock path is a directory, not a lock file; remove it "
+                    "by hand — this is not something an override can clear")
             except OSError:
                 raise Conflict("the stale lock could not be removed")
             try:
@@ -1703,9 +2022,30 @@ class LockFile:
         except OSError as exc:
             raise Internal("lock file could not be created: %s"
                            % errno.errorcode.get(exc.errno, "OSError"))
+        # A LOCK FILE WE FAILED TO WRITE MUST NOT SURVIVE US.
+        #
+        # `os.open(O_CREAT|O_EXCL)` above has already created the file. If the
+        # payload write then fails — a completely full filesystem is the case
+        # that happens — the exception leaves `acquire()` from inside
+        # `__enter__`, so Python never calls `__exit__` and `release()` never
+        # runs. Nothing else in the program removes a lock file. Measured on a
+        # 0-byte-free tmpfs: the save failed, a zero-length `.kdbx.lock` stayed
+        # behind, and every later save answered `conflict / locked by an
+        # unnamed process` — long after the disk was free — with `override_stale`
+        # as the only way out, which is exactly the habit I13 needs operators
+        # NOT to acquire. Unlinking what we just created is the whole fix.
         try:
             os.fchmod(fd, 0o600)
-            os.write(fd, self._payload())
+            write_all(fd, self._payload())
+        except BaseException as exc:
+            try:
+                os.unlink(self.lock_path)
+            except OSError:
+                pass
+            if isinstance(exc, OSError):
+                raise Internal("the lock file could not be written: %s"
+                               % errno.errorcode.get(exc.errno, "OSError"))
+            raise
         finally:
             os.close(fd)
         self._created = True
@@ -1877,6 +2217,32 @@ class Backend(abc.ABC):
         """
         if not self.unlocked:
             raise AccessDenied("this safe is not unlocked")
+
+    @staticmethod
+    def verify_structure(data):
+        """Prove bytes are a COMPLETE file of this format. NO CREDENTIAL.
+
+        Deliberately not abstract and deliberately not a stub that returns
+        True: the default refuses, so a format that has not implemented this
+        cannot be silently treated as verified.
+
+        WHY IT EXISTS. `restore-backup` takes no passphrase — by design, since
+        the usual reason to restore is that the live file no longer opens — so
+        it cannot decrypt a generation to check it. What it CAN do is ask the
+        format whether these bytes are structurally whole, and until this
+        existed it did not: `_read_backup` bounded a generation only from below
+        by "not empty" and then checked four bytes of magic. A file truncated
+        at 4096 bytes of 4661 keeps its magic, so it passed, and
+        `restore-backup` wrote it over the live safe, which then did not open.
+        The comment above `_SAFE_MAGIC` claimed the magic check "does prove it
+        is not a truncated file". This is the function that makes that sentence
+        true.
+
+        Raises `Invalid` with an operator-safe reason; returns None on success.
+        Must never need a key, must never decrypt, and must be O(file).
+        """
+        raise Unsupported("this format cannot check a file for completeness "
+                          "without opening it")
 
     def require_writable(self):
         """`AccessDenied` when the REGISTRY forbids writes (`mode: "ro"`).

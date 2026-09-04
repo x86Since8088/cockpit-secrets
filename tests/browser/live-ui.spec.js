@@ -1300,7 +1300,11 @@ async function manageOne(page, frame, it, safe, pass, state) {
             dl.first().click()
         ]);
         const to = path.join(H.artifactsDir(), "06-" + fmt + "-downloaded-attachment.bin");
-        await download.saveAs(to);
+        /* Through the harness, never the raw Playwright call: that one
+         * creates the file under the process umask, and this file holds the
+         * DECRYPTED attachment body. H.saveDownload chmods it 0600 — see
+         * `lockDown` in live-harness.js. */
+        await H.saveDownload(download, to);
         const got = fs.readFileSync(to, "utf8");
         it.ok(got === attachBody,
               "the attachment downloaded through the Cockpit channel byte for byte (" +

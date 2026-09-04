@@ -93,7 +93,7 @@ from datetime import datetime, timezone
 
 from .base import (
     AccessDenied, BadCredential, Conflict, Invalid, NotFound, Unsupported,
-    Backend, LockFile, Limits, Secret,
+    Backend, CsvWriter, LockFile, Limits, Secret,
     atomic_replace, constant_time_eq, open_safe_fd, redact, register_backend,
     validate_new_path, VERSION,
 )
@@ -991,26 +991,57 @@ class Pws3Db:
     # -- record helpers ----------------------------------------------------
 
     @staticmethod
-    def field_get(record, ftype):
-        for f in record:
+    def _one(record, ftype):
+        """Index of the ONE field of this type, or -1. Refuses a repeat.
+
+        REFUSE A REPEATED FIELD TYPE RATHER THAN PICK ONE. formatV3.txt §3.3
+        gives every record field type at most one occurrence — 0x11 (Empty
+        Groups) is repeatable and is a HEADER field, reached through
+        `header_get`, not this — so a record carrying two 0x06 (Password)
+        fields is a file that is telling two different readers two different
+        things.
+
+        These three helpers used to answer with the FIRST match, and that is a
+        parser differential of exactly the kind `_read_header` in the KDBX
+        backend refuses one layer up ("Refuse rather than pick"). Measured on a
+        record built with two 0x06 fields: `reveal` returned the first value,
+        and — worse — `field_set` rewrote only the first, so an operator
+        rotating a compromised password got `{"changed": ["password"]}` back
+        while the second copy kept the old value. A rotation that silently did
+        nothing is a worse outcome than a refusal an operator can see.
+
+        Written once and used by all three accessors so a read and a write can
+        never disagree about which copy is "the" field.
+        """
+        found = -1
+        for i, f in enumerate(record):
             if f.type == ftype:
-                return f.data
-        return None
+                if found >= 0:
+                    raise Invalid(
+                        "this record carries more than one 0x%02x field; "
+                        "refusing to guess which one is meant" % ftype)
+                found = i
+        return found
+
+    @staticmethod
+    def field_get(record, ftype):
+        i = Pws3Db._one(record, ftype)
+        return record[i].data if i >= 0 else None
 
     @staticmethod
     def field_set(record, ftype, data):
-        for f in record:
-            if f.type == ftype:
-                f.data = bytes(data)
-                return
+        i = Pws3Db._one(record, ftype)
+        if i >= 0:
+            record[i].data = bytes(data)
+            return
         record.append(Field(ftype, data))
 
     @staticmethod
     def field_del(record, ftype):
-        for i, f in enumerate(record):
-            if f.type == ftype:
-                del record[i]
-                return True
+        i = Pws3Db._one(record, ftype)
+        if i >= 0:
+            del record[i]
+            return True
         return False
 
     def record_id(self, index):
@@ -1640,6 +1671,19 @@ class Psafe3Backend(Backend):
             "warnings": warnings,
         }
 
+    @staticmethod
+    def verify_structure(data):
+        """See `Backend.verify_structure`. `_split_prefix` already IS this.
+
+        PWS3 is the easier of the two formats to prove complete without a key:
+        §2.10 puts an UNENCRYPTED `PWS3-EOFPWS3-EOF` block immediately before
+        the 32-byte HMAC, so a truncated file is one whose last 48 bytes do not
+        end that way. `_split_prefix` checks that, the tag, the minimum length
+        and the cipher-block alignment, and it needs no credential to do any of
+        it — which is exactly the contract here.
+        """
+        _split_prefix(data)
+
     def unlock(self, password, keyfile=None, session=None, *,
                yubikey_response=None):
         """Derive, verify, parse — in that order, and nothing escapes early.
@@ -1682,6 +1726,28 @@ class Psafe3Backend(Backend):
         db = None
         try:
             db = _decode(env, key)
+        except Exception:
+            key.zero()
+            raise
+
+        # Refuse a repeated record field type HERE as well as in `_one`, so the
+        # operator learns at open time rather than at the first `reveal` of the
+        # one field that happens to be doubled. `_one` is the enforcement point
+        # no path can be added around; this is the one that gives a useful
+        # answer. Only types the format defines are scanned: an unknown
+        # repeated type is a field we do not read, and refusing it would invent
+        # a rule about data we deliberately preserve unchanged (I22).
+        try:
+            for record in db.records:
+                seen = set()
+                for f in record:
+                    if f.type in RECORD_FIELDS:
+                        if f.type in seen:
+                            raise Invalid(
+                                "a record in this database carries more than "
+                                "one 0x%02x field; refusing to guess which one "
+                                "is meant" % f.type)
+                        seen.add(f.type)
         except Exception:
             key.zero()
             raise
@@ -2800,8 +2866,11 @@ class Psafe3Backend(Backend):
         buf = io.StringIO()
         # QUOTE_ALL and CRLF: RFC 4180, and the only setting under which a
         # password containing a comma, a quote or a newline reads back as the
-        # value we wrote.
-        writer = csv.writer(buf, quoting=csv.QUOTE_ALL, lineterminator="\r\n")
+        # value we wrote. It is NOT a formula-injection defence — a spreadsheet
+        # parses a quoted cell beginning with `=` as a formula just the same —
+        # so the writer is `CsvWriter`, which neutralises those. See
+        # base.csv_cell for the hazard and for what the neutralisation costs.
+        writer = CsvWriter(buf)
         writer.writerow(list(self._CSV_CORE_FIELDS)
                         + list(self._CSV_CORE_DERIVED) + extra)
         for record in self._db.records:
@@ -2818,6 +2887,9 @@ class Psafe3Backend(Backend):
             ]
             row += [self._export_value(record, name) for name in extra]
             writer.writerow(row)
+        # Read by the `export` verb so the operator is told rather than
+        # surprised. Same contract as the KDBX backend's.
+        self.last_export_neutralised = writer.neutralised
         return buf.getvalue().encode("utf-8")
 
     def _export_value(self, record, name):

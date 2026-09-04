@@ -182,6 +182,99 @@ if bad:
     else fail "I4 a verb declares a path-shaped request field"; fi
 else skip "I4 secrets-admin not executable yet"; fi
 
+# ---- bans added after the adversarial review ------------------------------
+#
+# Each of these five is a mistake that WAS made, survived every gate, and was
+# found by an attacker rather than by a test. They are here because each one is
+# cheap to grep for and expensive to find any other way.
+
+# DURABILITY-1 — `os.write()` is allowed to write FEWER bytes than it was given.
+# `_ring_backup` advanced by the bytes it had READ, so one short write on a
+# nearly full filesystem produced a TRUNCATED backup generation that was
+# fsync'd, named, listed by the `backups` verb with a plausible size, and
+# accepted by `restore-backup` — which then wrote it over the live safe. Every
+# other data-carrying write in the program looped correctly, which is exactly
+# why nothing caught the one that did not.
+#
+# `backends/base.py` is NOT exempt — it is where the bug was. The rule is that
+# the WHOLE PROGRAM contains exactly one code line calling os.write(), and it
+# is the one inside write_all() that loops on the return value. A first version
+# of this ban exempted base.py and passed with the bug put back, which is why
+# the check counts rather than describes. tests/ban_os_write.py does the count.
+if compgen -G "backends/*.py" >/dev/null; then
+    if python3 tests/ban_os_write.py; then
+        pass "DURABILITY-1 the only os.write() in the program is write_all()'s"
+    else
+        fail "DURABILITY-1 a bare os.write() outside write_all() (a short write is silent data loss)"
+    fi
+    # …and write_all must still be the thing that loops.
+    if grep -q 'while written < total' backends/base.py; then
+        pass "DURABILITY-1 write_all() loops on the return value"
+    else
+        fail "DURABILITY-1 write_all() no longer loops on os.write()'s return"
+    fi
+else skip "DURABILITY-1 no backends/ yet"; fi
+
+# LEAKAGE-03 — RFC-4180 quoting is not a formula-injection defence. A spreadsheet
+# parses a QUOTED cell beginning with = + - @ TAB or CR as a formula, so an
+# attacker-controlled field value became `=WEBSERVICE(...)` in the one artefact
+# that holds every credential in the safe at once. `base.CsvWriter` neutralises
+# every cell; a raw `csv.writer` anywhere else is the hazard walking back in
+# through a new export format.
+ban 'csv\.writer\(' backends/kdbx.py backends/psafe3.py secrets-admin agent/*.py \
+    -- "LEAKAGE-03 no raw csv.writer outside base.CsvWriter (formula injection)"
+
+# LEAKAGE-04 — pykeepass formats caller-supplied text straight into an XPath
+# predicate. docs/COMPATIBILITY.md §7 fixed `reveal()` and warned that "anyone
+# else passing caller-supplied text to a pykeepass find_* / set_custom_property
+# call has the same bug"; `add()` was that call site and was not hardened, so a
+# legal entry title containing a double quote answered `internal`. Field access
+# is done by comparing element text in Python, and these names must not come
+# back.
+ban '\.(find_entries|find_groups|find_attachments|set_custom_property)\(' \
+    backends/kdbx.py \
+    -- "LEAKAGE-04 no pykeepass find_*/set_custom_property (XPath injection)"
+# The `add` call site specifically: the two positional strings after the
+# destination group must be constants, because add_entry searches on them
+# BEFORE it looks at force_creation.
+if [[ -f backends/kdbx.py ]]; then
+    if grep -q 'add_entry(' backends/kdbx.py \
+       && ! grep -q 'dest, "", "", password' backends/kdbx.py; then
+        fail "LEAKAGE-04 add_entry() is called with caller text as title/username"
+        grep -n -A2 'add_entry(' backends/kdbx.py | sed 's/^/        /' | head -6
+    else pass "LEAKAGE-04 add_entry() is called with constant title/username"; fi
+else skip "LEAKAGE-04 backends/kdbx.py not written yet"; fi
+
+# LEAKAGE-02 — `page.screenshot()` and `download.saveAs()` create their file
+# under the process umask; Playwright offers no mode option on either. The two
+# artefacts that hold ACTUAL secret material — a screenshot taken deliberately
+# between Reveal and the countdown ending, and a decrypted attachment body —
+# were therefore the two written group- and world-readable, while the harmless
+# console log was 0600. Every writer goes through `lockDown()`, and the runner
+# sets a private umask as the belt to that brace.
+if [[ -f tests/browser/live-harness.js ]]; then
+    ok=1
+    grep -q 'function lockDown(' tests/browser/live-harness.js || ok=0
+    grep -q 'umask 077' tests/browser/run-live.sh 2>/dev/null || ok=0
+    grep -q 'download\.saveAs(' tests/browser/live-ui.spec.js 2>/dev/null && ok=0
+    if ((ok)); then pass "LEAKAGE-02 live artefacts are chmod'ed 0600 as they are written"
+    else fail "LEAKAGE-02 a live-suite artefact writer bypasses lockDown()/umask 077"; fi
+else skip "LEAKAGE-02 no live browser harness yet"; fi
+
+# INPUT-2 — `internal` is reserved for "we do not know what went wrong", and for
+# a REQUEST FRAME we always do: the caller sent it. json.loads raises
+# RecursionError (a RuntimeError, not a ValueError) on a deeply nested body, so
+# 100 000 open brackets answered `internal`. The handler must stay.
+if [[ -f secrets-admin ]]; then
+    # The HANDLER line, not the word: the comment beside it explains why
+    # RecursionError is not a ValueError, and a grep for the name alone
+    # passed with the handler deleted and the comment left behind.
+    if grep -A24 'def parse_request' secrets-admin \
+       | grep -q '^ *except RecursionError:'; then
+        pass 'INPUT-2 parse_request answers invalid for a body it cannot parse'
+    else fail "INPUT-2 parse_request no longer catches RecursionError"; fi
+else skip "INPUT-2 secrets-admin not written yet"; fi
+
 # Not a KNOWN_ISSUES hazard, just a trap that cost real time: a stray NUL byte
 # in a source file parses fine, passes both gates, and makes grep treat the
 # file as binary — so every ban above it silently stops matching. A ban that

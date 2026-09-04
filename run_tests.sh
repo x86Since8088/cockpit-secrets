@@ -102,6 +102,12 @@ run "integration: the second-wave verbs"       900 \
     python3 tests/integration/newverbs.py
 run "integration: the unlock agent, end to end" 300 \
     python3 tests/integration/agent_cycle.py
+# The confirmed adversarial findings, at the layer only the real helper can
+# reach: a request frame, a backup ring several processes have taken turns
+# with, an export artefact on disk. The per-cause guards for the same findings
+# are unit tests in tests/test_regressions.py, which validate.sh runs.
+run "integration: the adversarial findings"    600 \
+    python3 tests/integration/adversarial.py
 
 if ((QUICK)); then
     skip "integration: corpus vs the helper" "--quick"

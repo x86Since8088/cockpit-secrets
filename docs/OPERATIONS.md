@@ -323,6 +323,18 @@ taken from a request, or a traceback. A redaction filter runs over everything
 the helper writes, and a unit test feeds a known passphrase through every log
 call and greps the output for it (I15).
 
+That filter is a **safety net, not the rule** — the rule is that a value never
+reaches a log call at all — and it is worth knowing exactly how far the net
+reaches. It matches literal text, and `emit()` and `audit()` apply it to the
+output of `json.dumps`, so a secret has to be matched in its JSON-escaped form
+as well as its raw one. Until 0.2.1 it was not: a passphrase containing a double
+quote or a NUL byte matched none of the filter's candidates, because `repr()` —
+which was a candidate — renders both differently from JSON. No path in the
+program actually put such a value in a response, and none does now; the hole was
+in the last line of defence rather than in the line in front of it. Both JSON
+renderings are candidates now (KNOWN_ISSUES I30), and the project's own
+self-check no longer proves the point with an alphanumeric sentinel alone.
+
 ```bash
 secrets-admin audit-tail --n 50        # the supported reader; metadata only
 
@@ -426,6 +438,16 @@ The three read-only causes are deliberately three different error codes:
 | registry `"mode": "ro"` | `access-denied` |
 | the format cannot be written safely (KDBX3, I20) | `unsupported` |
 | the lossless guard would drop a field (I22) | `conflict` |
+| the bytes we built cannot be read back (I24) | `conflict` |
+| the lock path holds something that is not a lock file (I28) | `conflict` |
+| the backup generation could not be written — a full disk (I26) | `internal`, naming the errno |
+
+The third of those is new in 0.2.1 and is the one to read twice if you see it.
+`conflict: the database we built cannot be read back, so it was not written: …`
+means the save produced bytes that this program's own reader refuses, and it
+refused to publish them. **The live safe is untouched.** The detail names what
+the reader objected to; that is the thing to fix (usually an oversized field or
+attachment), and until it is fixed the safe is exactly as it was.
 
 ---
 

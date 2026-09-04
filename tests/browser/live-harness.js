@@ -374,20 +374,48 @@ function artifactsDir() {
     return ARTIFACTS;
 }
 
+/* EVERY artefact this suite leaves on disk goes through here.
+ *
+ * `writeArtifact` passed { mode: 0o600 } and the two writers that produce
+ * artefacts containing ACTUAL SECRET MATERIAL did not: `page.screenshot({path})`
+ * and `download.saveAs()` both create their file under the process umask, which
+ * is 0002 on this host, and run-live.sh set none. So the console log - which
+ * holds no secret - was 0600, while `03-revealed.png` (a screenshot of an
+ * UNMASKED password field, taken deliberately between Reveal and the countdown
+ * ending) and the downloaded attachment body were -rw-rw-r-- on an SMB-exported
+ * tree. artifacts/.gitignore states in the same directory that "the suite writes
+ * them 0600 for the same reason".
+ *
+ * A helper each writer must remember to call is a rule; a single chokepoint is
+ * the rule made structural. run-live.sh also sets `umask 077` so a writer added
+ * tomorrow is private before this function ever sees it. */
+function lockDown(file) {
+    try { fs.chmodSync(file, 0o600); } catch (e) { /* the file may not exist */ }
+    return file;
+}
+
 async function shot(pageOrFrame, name) {
     const dir = artifactsDir();
     const file = path.join(dir, name.replace(/[^A-Za-z0-9._-]/g, "_") + ".png");
     /* A frame cannot be screenshotted; its page can. */
     const page = pageOrFrame.page ? pageOrFrame.page() : pageOrFrame;
     try { await page.screenshot({ path: file, fullPage: false }); } catch (e) { return null; }
+    lockDown(file);
     return path.basename(file);
+}
+
+/* Playwright's download.saveAs() has no mode option either. */
+async function saveDownload(download, file) {
+    await download.saveAs(file);
+    lockDown(file);
+    return file;
 }
 
 function writeArtifact(name, text) {
     const dir = artifactsDir();
     const file = path.join(dir, name.replace(/[^A-Za-z0-9._-]/g, "_"));
     fs.writeFileSync(file, text, { mode: 0o600 });
-    return path.basename(file);
+    return lockDown(file) && path.basename(file);
 }
 
 /* --------------------------------------------------------------- reading --- */
@@ -410,5 +438,6 @@ module.exports = {
     requirePlaywright, preconditions, credential, safePassphrase, checkLogin,
     Recorder, launch, newContext, watchConsole, cspFromConsole, cspFromEvents,
     login, openPlugin, adminAccessState, shot, writeArtifact, artifactsDir,
+    saveDownload, lockDown,
     liveList, consoleFor, consoleNotFor, PKG_MARKER
 };
