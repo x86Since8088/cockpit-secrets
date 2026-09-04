@@ -1,0 +1,81 @@
+# cockpit-secrets - prerequisite manifest
+# Version: 0.1.0
+#
+# OS packages, not pip packages: everything below is distro-packaged and is
+# installed with apt. There is no pip install step, no virtualenv, no vendored
+# wheel, and no npm - the Cockpit page is plain HTML/CSS/JS with no build step
+# and the helper is Python 3 against the distro's own modules.
+#
+# Reference versions were read off edt1 with `dpkg-query -W` on 2026-09-04, not
+# copied from a changelog. Minimums are the oldest version the code is written
+# against; where a minimum is the reference version it means "not tested older,
+# do not assume it works".
+#
+# Format:  package  minimum  reference(edt1)  # why it is here
+#
+# ======================================================================
+# RUNTIME - needed on any host that serves the page
+# ======================================================================
+cockpit                >=266     360-1               # the session, the bridge and the page host
+cockpit-bridge         >=266     360-1               # forks secrets-admin and carries its stdin/stdout
+cockpit-ws             >=266     360-1               # TLS + auth in front of the bridge; we do not re-implement either
+python3                >=3.9     3.14.4              # the helper. Standard library only, apart from the modules below
+python3-pykeepass      >=4.1.1   4.1.1.post1-1       # the KDBX engine: KDBX3 + KDBX4, attachments, history, custom fields.
+                                                     #   In-process, so the passphrase never becomes a process argument or a
+                                                     #   terminal transcript. THIS PACKAGE IS WHY THE PROJECT IS GPL-3.0.
+python3-argon2         >=21.3    25.1.0-2            # the KDBX4 KDF (Argon2id/d). Parameters come from the file and are
+                                                     #   clamped before it runs (I7)
+python3-lxml           >=4.9     6.0.2-1build1       # pykeepass parses the decrypted inner XML with it. Constructed
+                                                     #   explicitly with resolve_entities=False / no_network / no DTD (I8)
+python3-construct      >=2.10    2.10.68+dfsg1-3     # pykeepass's binary-structure dependency
+python3-botan          >=3.0     3.10.0+dfsg-2       # Twofish for Password Safe v3, via botan3.BlockCipher (NOT
+                                                     #   SymmetricCipher, which has no Twofish - see docs/HOST-FACTS.md).
+                                                     #   An audited general-purpose library instead of a random PyPI wheel
+python3-cryptography   >=41      46.0.5-1ubuntu2     # SHA-256, HMAC-SHA256, AES. Comparison is always hmac.compare_digest
+python3-pyotp          >=2.9     2.9.0-2build1       # TOTP codes from KeePassXC otp: URIs and KeePass TimeOtp-* fields
+python3-jsonschema     >=4.0     4.19.2-6ubuntu2     # validates every registry entry against
+                                                     #   schema/safe-registry.schema.json before it is trusted (I1).
+                                                     #   If it is ever absent the helper must DROP every entry it cannot
+                                                     #   validate - an unvalidated entry is an unvalidated access class
+
+# ======================================================================
+# TEST ONLY - and keepassxc-full most of all
+# ======================================================================
+#
+#   *** keepassxc-full MUST NEVER BECOME A RUNTIME DEPENDENCY. ***
+#
+# keepassxc-cli is here as an INTEROP ORACLE: files we write must open in it and
+# files it writes must open in ours (docs/KNOWN_ISSUES.md I19 - a reader and a
+# writer that share a bug round-trip perfectly and interoperate with nothing).
+# It is not the engine, and driving it would mean either a pty or piping the
+# master passphrase into a child process on every operation and screen-scraping
+# human-formatted output - a process boundary the secret would have to cross for
+# no gain over an in-process library (docs/UPSTREAM-REVIEW.md 2.2).
+#
+# If you ever find `keepassxc-cli` in a runtime code path, that is a bug, not an
+# optimisation. The test suite greps for it.
+#
+keepassxc-full         >=2.7     2.7.10+dfsg1-2ubuntu1  # TEST ONLY - the KDBX interop oracle
+passwordsafe           >=1.20    1.22.0+dfsg-1          # TEST ONLY - and it is the GUI only. Ubuntu ships no Password Safe
+                                                        #   CLI, which is why PWS3 is implemented from formatV3.txt and why
+                                                        #   its oracle is weaker than KDBX's. Said plainly, not papered over
+libcrypt-twofish-perl  >=2.18    2.18-1build6           # TEST ONLY - a third independent Twofish to cross-check vectors
+python3-pytest         >=7.0     9.0.2-4                # TEST ONLY - the unit suite (unittest also works)
+gjs                    >=1.70    1.88.0-1               # TEST/BUILD ONLY - check.sh parses each .js before install.sh
+                                                        #   copies it. There is no build step, so this is the only gate
+                                                        #   between a stray paren and a blank panel in the browser
+xvfb                   >=1.20    2:21.1.22-1ubuntu1     # TEST ONLY - a headless attempt at `pwsafe --validate` as a
+                                                        #   foreign check on a .psafe3 we wrote
+
+# Not apt-managed, test only: node v22 and a cached Playwright chromium for the
+# browser suite (storage-is-empty-after-unlock, no CSP violation, reveal expiry).
+
+# ======================================================================
+# Deliberately NOT required
+# ======================================================================
+# python3-pycryptodome   - no Twofish; Botan covers what we need
+# argon2 / WASM in the browser - would need wasm-unsafe-eval in the manifest CSP.
+#                          No browser-side crypto at all (I9)
+# any pip/PyPI package   - nothing here is installed outside the distro
+# a Password Safe CLI    - there is not one packaged. See docs/COMPATIBILITY.md
+#                          for what that costs us in interop evidence

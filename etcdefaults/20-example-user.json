@@ -1,0 +1,23 @@
+{
+  "id": "example-user",
+  "label": "EXAMPLE - copy this file, do not use it (user class)",
+  "format": "psafe3",
+  "path": "/home/example/.local/share/cockpit-secrets/example-user.psafe3",
+  "access": "user",
+  "owner": null,
+  "groups": [],
+  "mode": "ro",
+  "password_required": true,
+  "keyfile": null,
+  "yubikey_slot": null,
+  "agent": {
+    "enabled": false,
+    "idle_seconds": 300,
+    "max_seconds": 3600
+  },
+  "export_allowed": false,
+  "backup": {
+    "keep": 10,
+    "dir": null
+  }
+}

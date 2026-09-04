@@ -1,0 +1,128 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  kdbx-content.xml — the CONTENT of every KDBX fixture in this directory.
+
+  This file is INPUT to `keepassxc-cli import`, which is what actually writes
+  the .kdbx files. Nothing here is a KDBX: this is a KeePass2 XML document that
+  KeePassXC 2.7.10 parses and re-encodes, so the databases in this directory are
+  produced by KeePassXC and not by us (docs/KNOWN_ISSUES.md I19 — a fixture our
+  own writer produced would prove nothing about our own writer).
+
+  EVERY value here is a deliberate throwaway. There is no real credential in
+  this tree and there must never be one. See README.md.
+
+  What each element is here to exercise:
+    Lab / Lab.Nested            a nested group, two levels deep
+    Router.Password             the sentinel SENTINEL-DO-NOT-LEAK-8f3a2b — the
+                                string the leak tests grep the whole system for
+    Router."Lab Ticket"         a plain custom field
+    Router."API Token"          a PROTECTED custom field (ProtectInMemory)
+    Router.Tags                 entry tags (KDBX 4.0 and later)
+    TOTP Demo.otp               a KeePassXC-style otpauth:// TOTP attribute
+    Ünïcødé …                   non-ASCII in title, username, notes and a
+                                custom field, incl. astral-plane emoji
+    Expiring Account            an entry with Expires=True in the past
+    Staging.Moved Entry         the entry `gen_fixtures.sh` moves into Archive
+                                for the 4.1 fixtures, which is what makes
+                                KeePassXC write PreviousParentGroup and stamp
+                                the file as KDBX 4.1 (see README.md)
+    Archive                     an empty group, and the move target
+-->
+<KeePassFile>
+	<Meta>
+		<Generator>cockpit-secrets tests/fixtures/gen_fixtures.sh</Generator>
+		<DatabaseName>cockpit-secrets fixture</DatabaseName>
+		<DatabaseDescription>Throwaway test safe. Contains no real credential.</DatabaseDescription>
+		<DefaultUserName>fixture</DefaultUserName>
+		<MemoryProtection>
+			<ProtectTitle>False</ProtectTitle>
+			<ProtectUserName>False</ProtectUserName>
+			<ProtectPassword>True</ProtectPassword>
+			<ProtectURL>False</ProtectURL>
+			<ProtectNotes>False</ProtectNotes>
+		</MemoryProtection>
+		<RecycleBinEnabled>True</RecycleBinEnabled>
+		<HistoryMaxItems>10</HistoryMaxItems>
+	</Meta>
+	<Root>
+		<Group>
+			<Name>Passwords</Name>
+			<Notes>Root group of the fixture database.</Notes>
+
+			<Entry>
+				<String><Key>Title</Key><Value>TOTP Demo</Value></String>
+				<String><Key>UserName</Key><Value>totpuser</Value></String>
+				<String><Key>Password</Key><Value ProtectInMemory="True">totp-entry-pass</Value></String>
+				<String><Key>URL</Key><Value>https://totp.fixture.invalid/</Value></String>
+				<String><Key>Notes</Key><Value>RFC 6238 seed below is the RFC's own example seed.</Value></String>
+				<!-- JBSWY3DPEHPK3PXP is the canonical "Hello!" test seed used in
+				     every TOTP tutorial; it is not a secret. -->
+				<String><Key>otp</Key><Value ProtectInMemory="True">otpauth://totp/cockpit-secrets:totpuser?secret=JBSWY3DPEHPK3PXP&amp;issuer=cockpit-secrets&amp;period=30&amp;digits=6&amp;algorithm=SHA1</Value></String>
+			</Entry>
+
+			<Entry>
+				<String><Key>Title</Key><Value>Ünïcødé — 日本語 🔐</Value></String>
+				<String><Key>UserName</Key><Value>ユーザー</Value></String>
+				<String><Key>Password</Key><Value ProtectInMemory="True">пароль-ﬁ-Ǆ-🔑</Value></String>
+				<String><Key>URL</Key><Value>https://xn--gckvb8fzb.invalid/</Value></String>
+				<String><Key>Notes</Key><Value>Mixed scripts, combining marks (é = e + U+0301: é), an astral emoji, and a right-to-left run: ‏عربى‏.</Value></String>
+				<String><Key>Feld mit Ümlaut</Key><Value>Wert mit ß und 漢字</Value></String>
+			</Entry>
+
+			<Entry>
+				<String><Key>Title</Key><Value>Expiring Account</Value></String>
+				<String><Key>UserName</Key><Value>expired</Value></String>
+				<String><Key>Password</Key><Value ProtectInMemory="True">already-expired</Value></String>
+				<String><Key>Notes</Key><Value>Expiry is in the past on purpose.</Value></String>
+				<Times>
+					<Expires>True</Expires>
+					<ExpiryTime>2020-01-01T00:00:00Z</ExpiryTime>
+				</Times>
+			</Entry>
+
+			<Group>
+				<Name>Lab</Name>
+				<Notes>First level of the nested group.</Notes>
+				<Group>
+					<Name>Nested</Name>
+					<Notes>Second level of the nested group.</Notes>
+					<Entry>
+						<String><Key>Title</Key><Value>Router</Value></String>
+						<String><Key>UserName</Key><Value>admin</Value></String>
+						<!-- THE SENTINEL. Unique across the whole repository, so a
+						     test can grep logs, /proc, browser storage and the audit
+						     trail for it and prove nothing leaked. -->
+						<String><Key>Password</Key><Value ProtectInMemory="True">SENTINEL-DO-NOT-LEAK-8f3a2b</Value></String>
+						<String><Key>URL</Key><Value>https://router.lab.invalid/</Value></String>
+						<String><Key>Notes</Key><Value>Throwaway fixture entry. The password is a sentinel, not a credential.</Value></String>
+						<String><Key>Lab Ticket</Key><Value>LAB-4711</Value></String>
+						<String><Key>API Token</Key><Value ProtectInMemory="True">tok-protected-do-not-leak-4c9d1e</Value></String>
+						<Tags>fixture,sentinel,lab</Tags>
+					</Entry>
+					<Entry>
+						<String><Key>Title</Key><Value>Switch</Value></String>
+						<String><Key>UserName</Key><Value>operator</Value></String>
+						<String><Key>Password</Key><Value ProtectInMemory="True">switch-pass-2</Value></String>
+						<String><Key>URL</Key><Value>https://switch.lab.invalid/</Value></String>
+					</Entry>
+				</Group>
+			</Group>
+
+			<Group>
+				<Name>Staging</Name>
+				<Entry>
+					<String><Key>Title</Key><Value>Moved Entry</Value></String>
+					<String><Key>UserName</Key><Value>mover</Value></String>
+					<String><Key>Password</Key><Value ProtectInMemory="True">moved-entry-pass</Value></String>
+					<String><Key>Notes</Key><Value>gen_fixtures.sh moves this into Archive for the 4.1 fixtures.</Value></String>
+				</Entry>
+			</Group>
+
+			<Group>
+				<Name>Archive</Name>
+				<Notes>Empty on purpose; the move target for the 4.1 fixtures.</Notes>
+			</Group>
+		</Group>
+		<DeletedObjects/>
+	</Root>
+</KeePassFile>

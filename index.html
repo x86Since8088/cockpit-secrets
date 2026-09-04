@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>Secrets</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <!-- Every rule and every line of code on this page is an external file.
+         Cockpit's default policy is default-src 'self' and this package adds
+         NO relaxation of it (I9), so an inline stylesheet or an inline script
+         element would simply not run and the page would render blank. -->
+    <link rel="stylesheet" href="secrets.css">
+    <script src="../base1/cockpit.js"></script>
+    <script src="secrets.js" defer></script>
+</head>
+<body>
+    <a class="sec-skip" href="#sec-main">Skip to content</a>
+
+    <div class="sec-page">
+
+        <header class="sec-topbar">
+            <div class="sec-topbar-title">
+                <h1>Secrets</h1>
+                <span id="sec-sub" class="sec-subtle">loading&#8230;</span>
+            </div>
+            <div class="sec-topbar-actions">
+                <span id="sec-dirty" class="sec-dirty" hidden></span>
+                <span id="sec-clip" class="sec-clip" hidden></span>
+                <span id="sec-session" class="sec-session" hidden></span>
+                <button type="button" id="sec-lock" class="sec-btn danger" hidden>Lock</button>
+                <button type="button" id="sec-refresh" class="sec-btn">Refresh</button>
+            </div>
+        </header>
+
+        <!-- Errors are assertive: a failed unlock or a save conflict must
+             interrupt a screen reader, not wait in a queue. -->
+        <div id="sec-alerts" role="alert" aria-live="assertive" aria-atomic="true"></div>
+        <!-- Status is polite: reveal countdowns, clipboard state, lock notices.
+             The visible countdown digits are aria-hidden and this region gets
+             one sentence per state change instead of one per second. -->
+        <div id="sec-live" class="sec-visually-hidden" role="status" aria-live="polite" aria-atomic="true"></div>
+
+        <div id="sec-banners"></div>
+
+        <main id="sec-main" tabindex="-1">
+
+            <section id="sec-safes-view" aria-labelledby="sec-safes-h">
+                <h2 id="sec-safes-h">Safes</h2>
+                <div id="sec-safes" class="sec-safes">
+                    <p class="sec-subtle">Loading the safe registry&#8230;</p>
+                </div>
+            </section>
+
+            <section id="sec-browse-view" aria-labelledby="sec-browse-h" hidden>
+                <div class="sec-browse-head">
+                    <h2 id="sec-browse-h">Safe</h2>
+                    <div id="sec-browse-meta" class="sec-browse-meta"></div>
+                </div>
+                <div id="sec-browse-warnings"></div>
+                <div id="sec-browse-tools" class="sec-tools"></div>
+                <div class="sec-split">
+                    <nav id="sec-tree" class="sec-tree" aria-label="Groups"></nav>
+                    <div id="sec-entries" class="sec-entries"></div>
+                    <aside id="sec-detail" class="sec-detail" aria-label="Entry details"></aside>
+                </div>
+            </section>
+
+        </main>
+
+        <footer class="sec-footer">
+            <p><strong>The passphrase is asked for every time a safe is opened.</strong> There is
+            no &#8220;remember&#8221; option here and nowhere to put one: one unlock lives inside one
+            short-lived helper process, and closing this page, locking, or letting the session
+            expire ends it.</p>
+            <p><strong>Nothing about a safe is kept in this browser.</strong> The passphrase goes
+            into one variable, is written to the helper&#8217;s standard input, and is overwritten.
+            No browser storage area, no cookie and no hidden field is used.</p>
+            <p><strong>Copying to the clipboard is best-effort.</strong> The clipboard is a shared
+            operating-system resource: this page clears it when the countdown ends and when the
+            page is hidden, but another application may already have read it, and a clipboard
+            manager may keep its own copy that this page cannot reach.</p>
+            <p><strong>What is greyed out here is decoration.</strong> The helper re-derives the
+            caller&#8217;s identity from the kernel and re-checks the access class on every verb;
+            that is what refuses a safe you may not open, not this page.</p>
+        </footer>
+    </div>
+
+    <div id="sec-modal-host"></div>
+</body>
+</html>

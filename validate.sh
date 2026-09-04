@@ -45,7 +45,12 @@ else
     skip "no *.js yet"
 fi
 
-pys=(secrets-admin backends/*.py agent/*.py tests/*.py)
+# tests/integration/*.py is in this list but NOT in the unittest discovery
+# below: those scripts drive the real helper against real fixtures and take
+# about two minutes, which is more than this gate's whole budget. run_tests.sh
+# runs them; this gate only checks they parse, because a syntax error there
+# should not have to wait for the full suite to surface.
+pys=(secrets-admin backends/*.py agent/*.py tests/*.py tests/integration/*.py)
 found_py=0
 for f in "${pys[@]}"; do
     [[ -f $f ]] || continue

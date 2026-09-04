@@ -1,0 +1,111 @@
+{
+  "_comment": "Index of the throwaway fixture corpus for cockpit-secrets. Every passphrase here is public on purpose; none of these safes holds a real credential. Tests should read this file instead of hardcoding names, passphrases or digests. Rebuild with ./gen_fixtures.sh --build --force.",
+  "sentinel": "SENTINEL-DO-NOT-LEAK-8f3a2b",
+  "sentinel_entry": "/Lab/Nested/Router",
+  "attachments": [
+    "notes.txt",
+    "blob.bin"
+  ],
+  "totp_entry": "/TOTP Demo",
+  "totp_seed": "JBSWY3DPEHPK3PXP",
+  "unicode_entry": "/Ünïcødé — 日本語 🔐",
+  "moved_entry_41": "/Archive/Moved Entry",
+  "moved_entry_pre41": "/Staging/Moved Entry",
+  "fixtures": [
+    {
+      "file": "lab-kdbx31-aes256-aeskdf.kdbx",
+      "format": "kdbx",
+      "format_version": "3.1",
+      "cipher": "AES-256",
+      "kdf": "AES-KDF",
+      "password_required": true,
+      "password": "fixture-pass-do-not-reuse",
+      "keyfile": null,
+      "bytes": 4318,
+      "sha256": "f6ceb12446af90cad33cc99e94ee898662b3b049e4da24b9d43c9f885b133867",
+      "produced_by": "keepassxc-cli 2.7.10 — `import` of kdbx-content.xml, then two `attachment-import` calls. Every byte written by KeePassXC."
+    },
+    {
+      "file": "lab-kdbx40-aes256-argon2d.kdbx",
+      "format": "kdbx",
+      "format_version": "4.0",
+      "cipher": "AES-256",
+      "kdf": "Argon2d",
+      "password_required": true,
+      "password": "fixture-pass-do-not-reuse",
+      "keyfile": null,
+      "bytes": 4629,
+      "sha256": "4d1fb4306bc0611580b608c67790078049ec53edd10ed277c2de0999e23ecbfc",
+      "produced_by": "keepassxc-cli 2.7.10 — `merge` of the 3.1 fixture into an EMPTY header built by kdbx_reformat.py (pykeepass). KeePassXC wrote the final file."
+    },
+    {
+      "file": "lab-kdbx41-aes256-argon2id.kdbx",
+      "format": "kdbx",
+      "format_version": "4.1",
+      "cipher": "AES-256",
+      "kdf": "Argon2id",
+      "password_required": true,
+      "password": "fixture-pass-do-not-reuse",
+      "keyfile": null,
+      "bytes": 4661,
+      "sha256": "b395b11491e9da49a97afdbaef3d019617e6395110123b2bd235435596783bdb",
+      "produced_by": "keepassxc-cli 2.7.10 — `merge` as above, then `mv` (which records PreviousParentGroup, a 4.1-only element, so KeePassXC stamps the file 4.1)."
+    },
+    {
+      "file": "lab-kdbx41-chacha20-argon2d.kdbx",
+      "format": "kdbx",
+      "format_version": "4.1",
+      "cipher": "ChaCha20",
+      "kdf": "Argon2d",
+      "password_required": true,
+      "password": "fixture-pass-do-not-reuse",
+      "keyfile": null,
+      "bytes": 4526,
+      "sha256": "1cbb0d2b7b833069c57b2db3a125930e05dc49da0ce36c0904117d6518547a1f",
+      "produced_by": "keepassxc-cli 2.7.10 — `merge` + `mv` as above, into a ChaCha20/Argon2d header."
+    },
+    {
+      "file": "lab-kdbx41-password-and-keyfile.kdbx",
+      "format": "kdbx",
+      "format_version": "4.1",
+      "cipher": "AES-256",
+      "kdf": "Argon2id",
+      "password_required": true,
+      "password": "fixture-pass-do-not-reuse",
+      "keyfile": "lab-kdbx41-password-and-keyfile.keyx",
+      "bytes": 4613,
+      "sha256": "417b2cfebf9c9d5fac82413e5b2c30bea479300cd5257845f3b69bdcaec64782",
+      "produced_by": "keepassxc-cli 2.7.10 — `db-edit --set-key-file` on the 4.1 AES/Argon2id fixture. KeePassXC generated the key file itself.",
+      "keyfile_bytes": 278,
+      "keyfile_sha256": "585f5a599085e01cd2276a5c3f28a34a8cbd278838a02798e6c27d0df74084e5"
+    },
+    {
+      "file": "lab-kdbx41-keyfile-only.kdbx",
+      "format": "kdbx",
+      "format_version": "4.1",
+      "cipher": "AES-256",
+      "kdf": "Argon2id",
+      "password_required": false,
+      "password": null,
+      "keyfile": "lab-kdbx41-keyfile-only.keyx",
+      "bytes": 4389,
+      "sha256": "c2299622dc4287e7e368f24ad6bb0f9984647c425532d0f046492d1a74a69698",
+      "produced_by": "keepassxc-cli 2.7.10 — `db-edit --set-key-file --unset-password`. Opens with the key file alone; password_required is false.",
+      "keyfile_bytes": 278,
+      "keyfile_sha256": "d805b7b16b0d42da4e9a83e2241fb024fc93e58c38089577c461203e163a19de"
+    },
+    {
+      "file": "lab-pws3.psafe3",
+      "format": "psafe3",
+      "format_version": "0x0311",
+      "cipher": "Twofish-CBC",
+      "kdf": "SHA-256 key stretch, ITER=262144",
+      "password_required": true,
+      "password": "fixture-pass-do-not-reuse",
+      "keyfile": null,
+      "bytes": 1560,
+      "sha256": "75f6c686e5c4428fb4842eb01817a23878628d6bf78127b9ee3fbc38a67e9bf0",
+      "produced_by": "tests/oracle/pws3_oracle — our own independent Go implementation. There is NO foreign PWS3 writer on this host: Ubuntu's passwordsafe package ships only the GUI, and pwsafe --validate cannot be driven headlessly (see README.md). This fixture is therefore weaker evidence than the KDBX ones, and I19 says to state that rather than imply parity."
+    }
+  ]
+}

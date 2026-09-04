@@ -1,0 +1,3 @@
+cockpit-secrets fixture attachment.
+This file is throwaway test data and contains no credential.
+It exists so the attachment code path has something to carry.

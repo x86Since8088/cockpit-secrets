@@ -1,0 +1,89 @@
+{
+  "_comment": [
+    "Content of lab-pws3.psafe3, fed to tests/oracle/pws3_oracle `write`.",
+    "Every value is a deliberate throwaway; there is no real credential here.",
+    "Field type numbers are formatV3.txt section 3.2 (header) and 3.3 (records).",
+    "This file mirrors kdbx-content.xml so a test can compare the two formats",
+    "entry for entry: same sentinel, same nesting, same non-ASCII, same shapes."
+  ],
+  "iter": 262144,
+  "version": 785,
+
+  "header": [
+    { "_": "0x06 What performed last save",
+      "type": 6, "text": "cockpit-secrets pws3_oracle 1.0.0" },
+    { "_": "0x07 Last saved by user",
+      "type": 7, "text": "fixture" },
+    { "_": "0x08 Last saved on host",
+      "type": 8, "text": "edt1" },
+    { "_": "0x09 Database name",
+      "type": 9, "text": "cockpit-secrets fixture" },
+    { "_": "0x0a Database description",
+      "type": 10, "text": "Throwaway test safe. Contains no real credential." },
+    { "_": "0x04 Timestamp of last save, a 32-bit LE time_t (section 3.1.3)",
+      "type": 4, "time": "2026-09-04T00:00:00Z" },
+    { "_": "0x01 Database UUID",
+      "type": 1, "uuid": "5f1c0d9e-7b42-4a11-9c3e-0d1a2b3c4d5e" },
+    { "_": "0x11 Empty group. Section 3.2[16] says this header field MAY repeat, which is the only one that may — the two entries below exist to prove a reader keeps both instead of collapsing them.",
+      "type": 17, "text": "Empty" },
+    { "_": "0x11 Empty group, second occurrence",
+      "type": 17, "text": "Empty.Deeper" }
+  ],
+
+  "records": [
+    {
+      "_": "The sentinel record. Mirrors Lab/Nested/Router in kdbx-content.xml.",
+      "fields": [
+        { "type": 1, "uuid": "1a2b3c4d-5e6f-4071-8293-a4b5c6d7e8f9" },
+        { "_": "0x02 Group: dots are the hierarchy separator (section 3.3[2])",
+          "type": 2, "text": "Lab.Nested" },
+        { "type": 3, "text": "Router" },
+        { "type": 4, "text": "admin" },
+        { "_": "0x06 Password — THE SENTINEL, unique across this repository",
+          "type": 6, "text": "SENTINEL-DO-NOT-LEAK-8f3a2b" },
+        { "type": 13, "text": "https://router.lab.invalid/" },
+        { "_": "0x05 Notes, deliberately longer than the 11 bytes that fit in a field's first block, so the multi-block path is exercised",
+          "type": 5, "text": "Throwaway fixture entry. The password is a sentinel, not a credential. This note runs well past the eleven bytes that fit in the first block of a field so that the continuation blocks described in formatV3.txt section 3 are exercised." },
+        { "type": 7, "time": "2026-01-01T00:00:00Z" },
+        { "type": 12, "time": "2026-09-04T00:00:00Z" },
+        { "_": "0x0a Password expiry time, in the past on purpose",
+          "type": 10, "time": "2020-01-01T00:00:00Z" }
+      ]
+    },
+    {
+      "_": "Non-ASCII everywhere. Mirrors the Ünïcødé entry in kdbx-content.xml.",
+      "fields": [
+        { "type": 1, "uuid": "2b3c4d5e-6f70-4182-93a4-b5c6d7e8f901" },
+        { "type": 2, "text": "Lab.Nested" },
+        { "type": 3, "text": "Ünïcødé — 日本語 🔐" },
+        { "type": 4, "text": "ユーザー" },
+        { "type": 6, "text": "пароль-ﬁ-Ǆ-🔑" },
+        { "type": 5, "text": "Mixed scripts, a combining mark (é), an astral emoji, and a right-to-left run: ‏عربى‏." }
+      ]
+    },
+    {
+      "_": "Carries an application-unique field type from the 0xc0-0xdf range (section 4.2.1) and a defined-but-not-implemented one (0x1b Two-Factor Key). Section 4.1 says a reader MUST NOT discard an unknown field — it must preserve it on save. This record is how that gets tested.",
+      "fields": [
+        { "type": 1, "uuid": "3c4d5e6f-7081-4293-a4b5-c6d7e8f90123" },
+        { "type": 2, "text": "Staging" },
+        { "type": 3, "text": "Unknown Fields" },
+        { "type": 4, "text": "mover" },
+        { "type": 6, "text": "moved-entry-pass" },
+        { "_": "0x1b Two-Factor Key, binary, listed as not implemented upstream",
+          "type": 27, "hex": "48656c6c6f21deadbeef" },
+        { "_": "0xc0 application-unique, must survive a round trip untouched",
+          "type": 192, "hex": "cafebabe00112233445566778899aabbccddeeff" }
+      ]
+    },
+    {
+      "_": "Zero-length fields are legal (section 2.9.2): absent or zero-length both mean 'use the default'.",
+      "fields": [
+        { "type": 1, "uuid": "4d5e6f70-8192-43a4-b5c6-d7e8f9012345" },
+        { "type": 3, "text": "Zero Length Fields" },
+        { "type": 4, "text": "" },
+        { "type": 6, "text": "" },
+        { "type": 5, "text": "" }
+      ]
+    }
+  ]
+}
