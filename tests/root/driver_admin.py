@@ -454,12 +454,13 @@ def body(rep):
     ses4.close()
 
     # The property is "the counter no longer bites", not "the file is gone".
-    # lockout_reset() unlinks and falls back to writing zeros if the unlink
-    # raises - and ENOENT raises, so a successful unlock with no counter
-    # present CREATES one holding {failures: 0, locked_until: 0}. That is
-    # harmless (it is 0600, it carries no value, and lockout_check returns
-    # immediately on it) but it is not what the docstring's "clears the
-    # counter" leads you to expect, so it is measured and reported rather than
+    # lockout_reset() ZEROES the counter in place and deliberately does not
+    # unlink it (I39): `flock` is held on an inode, and unlinking hands the
+    # next arrival an O_CREAT of a DIFFERENT inode, so two processes would hold
+    # two "exclusive" locks on two files with the same name. So a successful
+    # unlock leaves one 0600 JSON per (real uid, safe) holding
+    # {failures: 0, locked_until: 0}. Harmless - it carries no value and
+    # lockout_begin() returns immediately on it - and measured rather than
     # asserted away in either direction.
     doc = lock_doc()
     cleared = (doc is None
@@ -472,11 +473,12 @@ def body(rep):
         rep.check("the zeroed counter it wrote is still 0600 root-owned",
                   (st.st_mode & 0o777) == 0o600 and st.st_uid == 0,
                   mode_of(lock_path()))
-        rep.note("NOTE: lockout_reset() re-created this file. os.unlink raised "
-                 "ENOENT (nothing to clear) and the except branch writes a "
-                 "zero counter regardless, so every first successful unlock "
-                 "leaves one small 0600 JSON file per (uid, safe) in the "
-                 "state directory. Harmless; recorded in "
+        rep.note("NOTE: lockout_reset() zeroed this file rather than "
+                 "unlinking it - deliberate since the I39 fix, because "
+                 "unlinking a file other helpers hold an flock on breaks the "
+                 "exclusion. Every successful unlock therefore leaves one "
+                 "small 0600 JSON per (REAL uid, safe) in the state "
+                 "directory. Harmless; recorded in "
                  "docs/ROOT-VERIFICATION.md.")
         os.unlink(lock_path())
 

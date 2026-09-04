@@ -92,8 +92,8 @@ import uuid as _uuid
 from datetime import datetime, timezone
 
 from .base import (
-    AccessDenied, BadCredential, Conflict, Invalid, NotFound, Unsupported,
-    Backend, CsvWriter, LockFile, Limits, Secret,
+    AccessDenied, BadCredential, Conflict, Invalid, NotFound, SecretsError,
+    Unsupported, Backend, CsvWriter, LockFile, Limits, Secret,
     atomic_replace, constant_time_eq, open_safe_fd, redact, register_backend,
     validate_new_path, VERSION,
 )
@@ -724,6 +724,23 @@ def _emit_field(field, out, mac):
     n = len(data)
     if n > 0xFFFFFFFF:
         raise Invalid("PWS3 field is too large to encode")
+    # THE WRITE HALF OF THE READ LIMIT  (I23, I41).
+    #
+    # `_check_field_length` is the READER's bounds check, and until this line
+    # existed nothing on the write side consulted it: `_emit_field` would
+    # happily encode a 5 MiB text field that `_parse_field_stream` then refused
+    # at 4 MiB, so a save produced a file this program could not open. The same
+    # call, with the same constants and the same type-awareness (attachments
+    # get `MAX_ATTACHMENT_BYTES`, everything else `MAX_FIELD_BYTES`), is what
+    # makes I23's sentence true here — "the read and write limits are now the
+    # same number and this program cannot write a file its own reader refuses."
+    # `available=n` so only the CAP can fire; there is no file being consumed.
+    #
+    # This is a cause fix, not the guarantee. The guarantee is the round trip
+    # in `Psafe3Backend.verify_own_output`, which catches the whole class —
+    # record counts, field counts, and the next asymmetry nobody has thought of
+    # — rather than the one member of it that is already known.
+    _check_field_length(n, field.type, n)
     # Random fill first, then overwrite the header — the unused bytes of the
     # length block are random by design (§3), to deny a known-plaintext crib.
     head = bytearray(_sysrandom.token_bytes(BLOCK))
@@ -1125,17 +1142,44 @@ def _split_prefix(data):
 _BAD_CREDENTIAL = "the passphrase did not open this safe"
 
 
-def _decode(env, key):
+def _decode(env, key, *, own_output=False):
     """Decrypt, parse, **verify the MAC**, and only then return a database.
 
     Order matters and is the whole of I6 for this format: nothing below returns
     a `Pws3Db` until `compare_digest` has said yes. Everything between the
     decrypt and that comparison is treated as attacker-shaped input, which is
     why every length is bounds-checked and every count is capped.
+
+    `own_output=True` says the bytes were produced by `serialize()` in THIS
+    process, from a database this process has already authenticated, under a
+    credential it already holds — the pre-write round trip and nothing else.
+    It does one thing: a STRUCTURAL failure keeps its real detail instead of
+    being flattened into `BadCredential`.
+
+    WHY THAT DOES NOT REOPEN I6's ORACLE, and this is the reasoning the fix
+    turns on. The oracle I6 closes belongs to a caller who supplies BOTH a file
+    and a passphrase guess: flattening is what denies them the ability to tell
+    "your guess was wrong" from "your file is malformed", and so denies them a
+    per-guess signal. This path takes neither — the caller supplies no file (we
+    just built it) and no guess (the credential is the one that already opened
+    the live safe). There is nothing for a distinction to be a distinction
+    ABOUT. A hostile file and a wrong passphrase are still indistinguishable to
+    a client, because `unlock()`, `parse_bytes()` and `read_file()` never pass
+    this flag and cannot be made to from a request.
+
+    What it buys is I41's other half. With the flag off, a file WE broke came
+    back to the operator as "the passphrase did not open this safe" — the one
+    answer that sends them to re-type a passphrase that was never wrong, and on
+    into I39/I40's lockout, on a safe that is broken rather than locked. The
+    difference between that file and a hostile one is that this file is one we
+    wrote and can verify before we hand it over.
     """
     if not constant_time_eq(key.hash(), env["hpprime"]):
         # §2.5. Cheap, and the format's own design — but it is still only a
         # passphrase check, never an integrity check.
+        if own_output:
+            raise Invalid("the stretched-key check failed on a file we just "
+                          "built; the write credential does not match it")
         raise BadCredential(_BAD_CREDENTIAL)
 
     record_key, mac_key = key.unwrap(env["b1b2"], env["b3b4"])
@@ -1143,8 +1187,11 @@ def _decode(env, key):
     try:
         plain = _cbc_decrypt(record_key.bytes, env["iv"], env["body"])
         try:
-            return _decode_plaintext(plain, mac_key, env, key)
+            return _decode_plaintext(plain, mac_key, env, key,
+                                     own_output=own_output)
         except Invalid as exc:
+            if own_output:
+                raise
             # EVERY structural failure from here down is a failure on plaintext
             # that has NOT been authenticated yet, so telling the client which
             # one it was would distinguish "tampered file" from "wrong
@@ -1170,13 +1217,18 @@ def _decode(env, key):
             _wipe(plain)
 
 
-def _decode_plaintext(plain, mac_key, env, key):
+def _decode_plaintext(plain, mac_key, env, key, *, own_output=False):
     """Field walk and MAC verification over decrypted, still-UNTRUSTED bytes.
 
     Split out from `_decode` so that the one caller can convert every failure
     in here into the flat `BadCredential`, and so that "everything in this
     function is attacker-shaped" is a property of a whole function rather than
     a comment in the middle of one.
+
+    `own_output` is `_decode`'s; see the reasoning there. It reaches this
+    function for one line — the MAC gate — because on our own output a MAC
+    mismatch is a bug in this program's writer and calling it a bad passphrase
+    would be the same misattribution by a different route.
     """
     fields = _parse_field_stream(plain)
     mac = hmac.new(bytes(mac_key.bytes), digestmod=hashlib.sha256)
@@ -1223,6 +1275,8 @@ def _decode_plaintext(plain, mac_key, env, key):
     # it is returned until this passes, and a failure here carries the SAME
     # detail as a wrong passphrase (I6).
     if not constant_time_eq(mac.digest(), env["mac"]):
+        if own_output:
+            raise Invalid("the HMAC of a file we just built does not verify")
         raise BadCredential(_BAD_CREDENTIAL)
 
     db = Pws3Db(header, records, credential=key)
@@ -1270,6 +1324,80 @@ def parse_bytes(data, password):
 # Serialise
 # ===========================================================================
 
+def _describe_field(where, field):
+    """"header field last-save-time" / "entry field notes". A NAME, never a
+    value — this string goes to the operator and I15 is not negotiable."""
+    table = HEADER_FIELDS if where == "header" else RECORD_FIELDS
+    name = table.get(field.type, ("type 0x%02x" % field.type,))[0]
+    return "%s field %s" % (where, name)
+
+
+def _diff_db(expect, probe):
+    """What a read -> write -> read cycle LOST. A list of names; [] is clean.
+
+    This is I22's comparison, and it is now one function because it has two
+    callers that must not be allowed to disagree: `_ensure_lossless`, the early
+    warning that runs before the first save, and `Psafe3Backend.read_back`'s
+    partner `diff_read_back`, which runs on the ACTUAL bytes of EVERY save.
+    Two copies of "did we lose anything" is how one of them ends up weaker than
+    the other, which is the shape of I41 one level down.
+
+    A `Pws3Db` IS its ordered list of (type, bytes) fields, so the comparison is
+    exact: same header length, same fields in the same order, same record count,
+    same field count per record, same bytes. There is no tolerance and no
+    normalisation here — anything that legitimately changes on a save is
+    resolved by `_final_header` BEFORE serialisation, so that by the time these
+    two objects exist they are supposed to be identical.
+    """
+    lost = []
+    if len(probe.header) != len(expect.header):
+        lost.append("the header structure (%d fields written, %d read back)"
+                    % (len(expect.header), len(probe.header)))
+    for before, after in zip(expect.header, probe.header):
+        if before != after:
+            lost.append(_describe_field("header", before))
+    if len(probe.records) != len(expect.records):
+        lost.append("the record count (%d written, %d read back)"
+                    % (len(expect.records), len(probe.records)))
+    for rec_before, rec_after in zip(expect.records, probe.records):
+        if len(rec_before) != len(rec_after):
+            lost.append("a record's field count (%d written, %d read back)"
+                        % (len(rec_before), len(rec_after)))
+        for before, after in zip(rec_before, rec_after):
+            if before != after:
+                lost.append(_describe_field("entry", before))
+    return lost
+
+
+def _final_header(header, stamp):
+    """The header `serialize` will actually write, given the one it is handed.
+
+    Split out of `serialize` so a caller can know EXACTLY what it is about to
+    write without writing it. That matters for the pre-write round trip (I41):
+    the check compares the file it built against the database it meant to
+    build, and two of the three things that happen here — the "last saved"
+    stamp and the Version field's move to the front (§2.9.1) — are deliberate
+    changes that a naive comparison against `db.header` would report as data
+    loss. Calling this ONCE and serialising the result makes the expectation
+    and the file the same object's worth of decisions, so the diff has nothing
+    to be confused by. Calling it twice would not: `_stamped_header` reads the
+    clock, and two calls a second apart do not agree.
+
+    Everything else keeps its order exactly, because preserving order is how
+    unknown fields come back out where they went in (I22, §4.1).
+    """
+    header = list(header)
+    if stamp:
+        header = _stamped_header(header)
+    vidx = next((i for i, f in enumerate(header) if f.type == HDR_VERSION), -1)
+    if vidx < 0:
+        header.insert(0, Field(HDR_VERSION,
+                               DEFAULT_NEW_VERSION.to_bytes(2, "little")))
+    elif vidx > 0:
+        header.insert(0, header.pop(vidx))
+    return header
+
+
 def serialize(db, credential=None, *, stamp=True):
     """Build a complete `.psafe3` image. Returns bytes.
 
@@ -1296,19 +1424,7 @@ def serialize(db, credential=None, *, stamp=True):
     # The floor applies to what we WRITE, always (§2.4, I7).
     Limits.check_pws3_iter(credential.iterations, for_write=True)
 
-    header = list(db.header)
-    if stamp:
-        header = _stamped_header(header)
-
-    # §2.9.1: the header begins with the Version field. Order is otherwise
-    # preserved exactly, because preserving order is how unknown fields come
-    # back out in the same place they went in.
-    vidx = next((i for i, f in enumerate(header) if f.type == HDR_VERSION), -1)
-    if vidx < 0:
-        header.insert(0, Field(HDR_VERSION,
-                               DEFAULT_NEW_VERSION.to_bytes(2, "little")))
-    elif vidx > 0:
-        header.insert(0, header.pop(vidx))
+    header = _final_header(db.header, stamp)
 
     key = Secret(_sysrandom.token_bytes(32))
     mac_key = Secret(_sysrandom.token_bytes(32))
@@ -1447,7 +1563,26 @@ def write_file(path, passphrase, db, *, iterations=None, backup_dir=None,
             passphrase = owned
         credential = StretchedKey.derive(
             passphrase, _sysrandom.token_bytes(SALT_LEN), want, for_write=True)
-        data = serialize(db, credential)
+        header = _final_header(db.header, stamp=True)
+        expect = Pws3Db(header, db.records, credential=credential)
+        data = serialize(expect, stamp=False)
+        # The same pre-write reader check `Psafe3Backend.save` runs (I24, I41),
+        # here too because this function also puts bytes on a disk somebody
+        # will later have to open. It is `Backend.verify_own_output`'s body
+        # without the object: read the bytes back through the reader a later
+        # unlock uses, compare against what we meant to write, and refuse
+        # rather than write a file we cannot read. `own_output=True` for
+        # `_decode`'s documented reason — these bytes are ours, so a structural
+        # failure is ours and must not come back as a bad passphrase.
+        try:
+            echo = _decode(_split_prefix(data), credential, own_output=True)
+        except SecretsError as exc:
+            raise Conflict("the database we built cannot be read back, so it "
+                           "was not written: %s" % exc.detail)
+        lost = _diff_db(expect, echo)
+        if lost:
+            raise Conflict("this database cannot be written without losing "
+                           "data: %s" % "; ".join(lost[:5]))
     finally:
         if owned is not None:
             owned.zero()
@@ -2672,7 +2807,7 @@ class Psafe3Backend(Backend):
     # -- persistence -------------------------------------------------------
 
     def _ensure_lossless(self):
-        """I22, and it runs for real rather than being asserted.
+        """I22's EARLY warning: refuse the first save if a field would be lost.
 
         The claim this backend makes is that a field type it has never heard of
         survives a save byte-for-byte, because a database IS its ordered list of
@@ -2684,57 +2819,124 @@ class Psafe3Backend(Backend):
         `stamp=False` on both halves: the "last saved" fields are meant to
         change, and comparing them would make the guard fail on the one thing it
         is supposed to allow.
+
+        **THIS IS NOT THE PRE-WRITE CHECK, and believing it was is I41.** It
+        latches on `self._lossless_checked` and runs once per session, so the
+        second save of a session — the one carrying a mutation made after the
+        latch closed — went to disk with nothing having looked at it. The
+        per-save guarantee is `verify_own_output()` below, which runs on the
+        actual bytes of every save and cannot be latched. This stays because an
+        EARLY refusal, before the operator has done any work, is worth having;
+        it is no longer the thing standing between a mutation and the disk.
         """
         if self._lossless_checked:
             return
-        probe = serialize(self._db, stamp=False)
-        echo = _decode(_split_prefix(probe), self._db.credential)
-
-        def describe(where, field):
-            table = HEADER_FIELDS if where == "header" else RECORD_FIELDS
-            name = table.get(field.type, ("type 0x%02x" % field.type,))[0]
-            return "%s field %s" % (where, name)
-
-        if len(echo.header) != len(self._db.header):
-            raise Conflict("a save would change this database's header "
-                           "structure; refusing to write")
-        for before, after in zip(self._db.header, echo.header):
-            if before != after:
-                raise Conflict("a save would not preserve the %s; "
-                               "refusing to write" % describe("header", before))
-        if len(echo.records) != len(self._db.records):
-            raise Conflict("a save would change this database's record count; "
-                           "refusing to write")
-        for rec_before, rec_after in zip(self._db.records, echo.records):
-            if len(rec_before) != len(rec_after):
-                raise Conflict("a save would change a record's field count; "
-                               "refusing to write")
-            for before, after in zip(rec_before, rec_after):
-                if before != after:
-                    raise Conflict("a save would not preserve the %s; "
-                                   "refusing to write"
-                                   % describe("entry", before))
+        try:
+            probe = serialize(self._db, stamp=False)
+            echo = _decode(_split_prefix(probe), self._db.credential,
+                           own_output=True)
+        except Conflict:
+            raise
+        except SecretsError as exc:
+            # `own_output=True` is why there is a real reason to print here at
+            # all; see `_decode`. Without it this line said "the passphrase did
+            # not open this safe" about a database the operator had just
+            # successfully unlocked.
+            raise Conflict("this database cannot be written: %s" % exc.detail)
+        lost = _diff_db(self._db, echo)
+        if lost:
+            raise Conflict("a save would not preserve %s; refusing to write"
+                           % "; ".join(lost[:5]))
         self._lossless_checked = True
+
+    # -- the pre-write reader check  (I24, I41) ----------------------------
+
+    def read_back(self, data):
+        """`Backend.read_back` for PWS3: the reader `unlock()` uses, exactly.
+
+        `_split_prefix` -> `_decode`, which is the same pair `parse_bytes` runs
+        and therefore the same envelope checks, the same `_parse_field_stream`,
+        the same `_check_field_length` caps, the same `MAX_ENTRIES` and
+        `MAX_FIELDS_PER_RECORD` refusals and the same MAC gate. Not a re-run of
+        the MAC: I41 was a file whose MAC was perfect and whose FIELD LENGTH the
+        reader refused, so a check that stops at the MAC is exactly the check
+        that missed it.
+
+        The one difference from `unlock()` is `own_output=True`, and it is not a
+        weakening — `_decode`'s docstring carries the argument in full. In one
+        line: the flattening exists to deny a guesser a per-guess signal, and
+        there is no guesser here, only bytes we made ourselves half a
+        millisecond ago with a credential we already hold.
+
+        No KDF: the credential is the `StretchedKey` the database is already
+        open under, so the cost is one Twofish-CBC decrypt and one field walk.
+        """
+        self.require_unlocked()
+        return _decode(_split_prefix(data), self._db.credential,
+                       own_output=True)
+
+    def diff_read_back(self, probe, expect=None):
+        """`Backend.diff_read_back` for PWS3. Names, never values (I15).
+
+        `expect` is the database `_serialize_for_write` actually built — header
+        stamped, Version field already in front — so the comparison is exact and
+        needs no tolerances. Falling back to `self._db` would make every save
+        report the "last saved" stamp as data loss.
+        """
+        return _diff_db(expect if expect is not None else self._db, probe)
+
+    def _serialize_for_write(self):
+        """The bytes to write, and the database they are supposed to contain.
+
+        Returns `(data, expect)`. `_final_header` is called ONCE and the result
+        is what gets serialised, so `expect` is not an approximation of the file
+        — it is the same decisions, and any difference the round trip finds is a
+        real difference.
+
+        A serialisation refusal becomes a `Conflict`: `Invalid` is the code for
+        "the caller sent something malformed", and nobody sent anything here.
+        `Conflict` is already what I22 answers for "this database cannot be
+        written", it is the code the UI knows leaves the live file untouched,
+        and the detail still names what was wrong.
+        """
+        self.require_unlocked()
+        header = _final_header(self._db.header, stamp=True)
+        expect = Pws3Db(header, self._db.records,
+                        credential=self._db.credential)
+        try:
+            data = serialize(expect, stamp=False)
+        except Conflict:
+            raise
+        except SecretsError as exc:
+            raise Conflict("this database cannot be written: %s" % exc.detail)
+        return data, expect
 
     def save(self, *, override_stale=False):
         """Serialise and write durably. The only method that writes (I12, I13).
 
         Sequence, with no shortcuts: access class (the caller's job) ->
-        `require_writable` -> losslessness guard -> `.plk` lock -> serialise ->
-        `atomic_replace` with the fingerprint captured at unlock -> update the
-        fingerprint.
+        `require_writable` -> the I22 early warning -> `.plk` lock -> serialise
+        -> **verify what we are about to write** -> `atomic_replace` with the
+        fingerprint captured at unlock -> update the fingerprint.
+
+        The verify step is I41. It runs inside the lock, on the exact bytes, on
+        EVERY save, and a failure leaves the live file byte-for-byte as it was.
         """
         self.require_writable()
         self._ensure_lossless()
 
         backup = self.entry.get("backup") or {}
-        data = serialize(self._db)
         # The `.plk` name is Password Safe's own convention (`base.LockFile`
         # knows it); holding it for the write is what stops a save from
         # silently discarding what the desktop app wrote (I13).
         # override_stale is the operator's explicit answer to the Conflict
         # LockFile raises; it is never inferred from an age or a pid (I13).
         with LockFile(self.path, fmt="psafe3", override_stale=override_stale):
+            data, expect = self._serialize_for_write()
+            # Verify before the bytes replace a database that currently works.
+            # Cheap (no KDF) and it is the difference between "the save failed"
+            # and "the safe is gone, and we told you it was your passphrase".
+            self.verify_own_output(data, expect)
             report = atomic_replace(
                 self.path, data,
                 backup_dir=backup.get("dir"),
@@ -2765,13 +2967,18 @@ class Psafe3Backend(Backend):
         `require_writable()` is deliberately not called; see the KDBX backend's
         `save_as` for why the registry's `mode: "ro"` is a statement about that
         file rather than about the operator.
+
+        `verify_own_output` runs here for a sharper reason than in `save()`:
+        there is no live file to be spared, so the copy IS the artefact, and
+        nothing else will ever check it before the operator relies on it.
         """
         self.require_unlocked()
         self._ensure_lossless()
         validate_new_path(target_path)
-        data = serialize(self._db)
         with LockFile(target_path, fmt="psafe3",
                       override_stale=override_stale):
+            data, expect = self._serialize_for_write()
+            self.verify_own_output(data, expect)
             report = atomic_replace(target_path, data,
                                     expect_fingerprint=None)
         return {"path": target_path, "bytes": report["bytes"]}
@@ -3135,6 +3342,118 @@ def _selfcheck():                                       # noqa: C901
         big_iter[36:40] = (2 ** 31).to_bytes(4, "little")
         raises("ITER=2^31 -> Invalid", Invalid,
                lambda: parse_bytes(bytes(big_iter), pw))
+
+        print("== the pre-write reader check  (I24, I41) ==")
+        # The PWS3 twin of kdbx's
+        # `test_crypto01_save_refuses_output_it_cannot_read_back`. Its absence
+        # is why I24's written claim that this was already fixed here survived
+        # review for a whole remediation cycle.
+        live = os.path.join(tmp, "guarded.psafe3")
+        db2 = Pws3Db()
+        db2.header.append(Field(HDR_VERSION,
+                                DEFAULT_NEW_VERSION.to_bytes(2, "little")))
+        db2.records.append([
+            Field(REC_UUID, _uuid.uuid4().bytes),
+            Field(REC_TITLE, b"guarded"),
+            Field(REC_PASSWORD, b"s3cret-value"),
+        ])
+        write_file(live, pw, db2, iterations=Limits.PWS3_WRITE_MIN_ITER)
+        os.chmod(live, 0o600)
+        entry = {"id": "guarded", "label": "guarded", "format": "psafe3",
+                 "path": live, "access": "user", "mode": "rw",
+                 "backup": {"keep": 2, "dir": None}}
+        b = Psafe3Backend(entry)
+        b.unlock(Secret(pw))
+        uuid0 = b.entries(limit=1)["entries"][0]["uuid"]
+        b.edit(uuid0, {"notes": "first edit"})
+        ok("save 1 succeeds", b.save().get("ok") is True)
+        # I41 IN ONE ASSERTION: the I22 guard has now latched, and the
+        # per-save check must not have latched with it.
+        ok("the I22 early guard has latched after save 1",
+           b._lossless_checked is True)
+
+        before = open(live, "rb").read()
+        b.edit(uuid0, {"notes": "second edit, made AFTER the latch closed"})
+        # Make the READER stricter than the writer for the duration of ONE
+        # save. MAX_ENTRIES is a read-side cap that `serialize` does not
+        # consult, so this is a genuine writer/reader asymmetry rather than a
+        # patched-out guard — the same shape as the drift that produced I41,
+        # induced on purpose. With the check removed, this save SUCCEEDS and
+        # writes a file no later `unlock` can open.
+        keep_entries = Limits.MAX_ENTRIES
+        Limits.MAX_ENTRIES = 0
+        try:
+            b.save()
+            ok("a save whose output the reader refuses is REFUSED", False)
+            caught = None
+        except SecretsError as exc:
+            caught = exc
+            ok("a save whose output the reader refuses is REFUSED", True)
+        finally:
+            Limits.MAX_ENTRIES = keep_entries
+        if caught is not None:
+            ok("...as a Conflict (the live file is untouched)",
+               caught.code == "conflict")
+            ok("...naming what the reader objected to",
+               "record limit" in caught.detail)
+            # THE MISATTRIBUTION, which is the half of I41 that costs the
+            # operator their next move: a file WE broke must never come back as
+            # a statement about their passphrase.
+            ok("...and NOT as bad-credential",
+               caught.code != "bad-credential"
+               and _BAD_CREDENTIAL not in caught.detail)
+        ok("the live file is byte-for-byte unchanged",
+           open(live, "rb").read() == before)
+        # The positive control, so "refuses everything" cannot pass this.
+        ok("...and an ordinary save 2 still succeeds",
+           b.save().get("ok") is True)
+        after = read_file(live, pw)
+        ok("...and what it wrote still opens, with the second edit in it",
+           Pws3Db.field_get(after.records[0], REC_NOTES)
+           == b"second edit, made AFTER the latch closed")
+        after.zero()
+
+        # I6 IS NOT WEAKENED BY THE ABOVE. `own_output=True` reaches exactly
+        # one caller — the pre-write check — and the client-facing answers stay
+        # flat: a hostile file and a wrong passphrase are the same sentence.
+        raw2 = open(live, "rb").read()
+        hostile = bytearray(raw2)
+        hostile[PREFIX_LEN + 17] ^= 0x40
+        wrong = tampered = None
+        try:
+            parse_bytes(raw2, "not the passphrase")
+        except SecretsError as exc:
+            wrong = exc
+        try:
+            parse_bytes(bytes(hostile), pw)
+        except SecretsError as exc:
+            tampered = exc
+        ok("a wrong passphrase is still bad-credential",
+           wrong is not None and wrong.code == "bad-credential")
+        ok("a tampered file is still bad-credential",
+           tampered is not None and tampered.code == "bad-credential")
+        ok("...and the two are indistinguishable to a client",
+           wrong is not None and tampered is not None
+           and (wrong.code, wrong.detail) == (tampered.code, tampered.detail))
+        b.lock()
+
+        print("== the write half of the read limit  (I23, I41) ==")
+        # `_emit_field` must refuse exactly what `_parse_field_stream` refuses,
+        # by calling the same checker with the same constants.
+        raises("a field over MAX_FIELD_BYTES cannot be WRITTEN", Invalid,
+               lambda: _emit_field(Field(REC_NOTES,
+                                         b"x" * (Limits.MAX_FIELD_BYTES + 1)),
+                                   bytearray(),
+                                   hmac.new(b"k", digestmod=hashlib.sha256)))
+        raises("...and the reader refuses the same size", Invalid,
+               lambda: _check_field_length(Limits.MAX_FIELD_BYTES + 1,
+                                           REC_NOTES,
+                                           Limits.MAX_FIELD_BYTES + 1))
+        big_att = bytearray()
+        _emit_field(Field(REC_ATT_CONTENT, b"x" * (Limits.MAX_FIELD_BYTES + 1)),
+                    big_att, hmac.new(b"k", digestmod=hashlib.sha256))
+        ok("an ATTACHMENT of that size is still written (its cap is 32 MiB)",
+           len(big_att) > Limits.MAX_FIELD_BYTES)
 
         print("== hostile field length ==")
         started = time.monotonic()

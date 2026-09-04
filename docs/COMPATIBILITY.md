@@ -484,13 +484,13 @@ should be quoted as compatibility.
 | **KDBX 3.x + Twofish decrypts a real file** | the *primitive* is verified, and by a genuinely third party: `backends/kdbx._decrypt_prefix()` — Botan's `BlockCipher("Twofish")` with CBC composed by hand — was fed ciphertext produced by **Perl `Crypt::Twofish` 2.18** and returned the plaintext exactly, for both the full 48-byte buffer and the 32-byte prefix `_verify_kdbx3()` actually asks for | **No KDBX 3.x + Twofish file exists.** `keepassxc-cli` cannot create one (no cipher switch), so the header parse, the stream-start-bytes check and the block-digest walk *around* that primitive have never run on a real Twofish KDBX3 database |
 | **KDBX 4 + Twofish, beyond the one fixture** | `lab-kdbx40-twofish-argon2d.kdbx` opens here and in `keepassxc-cli`, which confirms `Cipher: Twofish 256-bit` | that fixture's container was **written by this project**, not by KeePassXC — `keepassxc-cli` cannot create a Twofish database at all. A foreign reader accepting our file is real evidence; a foreign *writer* producing one for us to read does not exist on this host, so the read path has never seen Twofish bytes laid out by someone else |
 | **KDBX 4 + AES-KDF** | nothing | **no such file exists on this host and none can be made here.** `keepassxc-cli db-create` always writes KDBX 3.1 + AES-KDF and `db-edit` has no KDF switch; `tests/fixtures/kdbx_reformat.py` deliberately refuses `--kdf aeskdf`, on the grounds that a 3.1 + AES-KDF fixture straight out of `db-create` has better provenance than anything it could synthesise. So AES-KDF is verified **only** in its KDBX 3.1 form (1 000 000 rounds, read-only), and the KDBX 4 combination — which `Limits.check_aeskdf_rounds` clamps and the writer would emit — has never been read or written |
-| **A `.psafe3` this program wrote is one this program can read back** | KDBX only. `_verify_own_output` re-opens every KDBX save through the reader before it is written, so a KDBX file this program writes is one it can open | **not true of PWS3.** `backends/psafe3.py` has no such check and its once-per-session losslessness guard latches after the first save, so a second save in one session can write a Password Safe file this program's own reader then refuses. Reproduced 2026-09-04; see KNOWN_ISSUES I41. A foreign reader's view of such a file is unknown, because none was produced for `keepassxc-cli` (which cannot read PWS3 anyway) or for the Password Safe GUI (which cannot be driven here) |
+| **A `.psafe3` this program wrote is one a FOREIGN reader can read back** | that **this** program can read it back: verified, both formats, on every save — see §8a. Every save re-opens the exact bytes through the reader a later unlock uses, before they replace a working file | **a foreign reader's view is still unknown.** No `.psafe3` this program wrote has ever been opened by anything but this program: `keepassxc-cli` cannot read PWS3 at all, and the Password Safe GUI cannot be driven on this host (§3.3). So "our reader accepts our writer" is the whole of the claim. The refusals at least now agree with themselves — a field this program refuses to read is one it refuses to write — but whether real Password Safe would have accepted it is unclaimed |
 | **A `.psafe3` written by the real Password Safe GUI** | nothing | see §3.3. `pwsafe` maps no window headlessly (proved against an `xmessage` control on the same Xvfb) and `--validate` never returns. This needs a human at a GUI |
 | **KeePass 2.x (the C# implementation) reading our files** | nothing | not installed here, and not installable offline. `keepassxc-cli` is a different implementation of the same format, not the reference one |
 
 ### 8a. What moved OUT of §8 on 2026-09-04, and the evidence that moved it
 
-Three rows in the table above were true when they were written and are not true any more. They
+Four rows in the table above were true when they were written and are not true any more. They
 are recorded here rather than silently deleted, because "this used to be unverified and here is
 what changed" is the only form of that claim a reader can check.
 
@@ -499,6 +499,7 @@ what changed" is the only form of that claim a reader can check.
 | *"`superuser: "require"` under a real Cockpit bridge — the browser suite stubs `cockpit.spawn`; **no test has ever run against a real bridge**"* | **VERIFIED.** `tests/browser/live-access.spec.js` item 9 drives live Cockpit 360 at `https://localhost:9090` signed in as a real account, with nothing stubbed. Both directions hold: with administrative access off, the bridge refuses immediately and **draws no prompt anywhere** (measured — the escalation dialog belongs to Cockpit's shell and nothing a package page can reach makes it appear); after Cockpit's own header control grants it, `cockpit.permission.allowed === true` and the admin-class safe opens. 22/22, run twice from a reset state on 2026-09-04 |
 | *"the `access: "admin"` class in general — only ever proved to *refuse*"* | **VERIFIED in both directions.** The refusing side: all 33 verbs driven as `cptest` (uid 1005, not in `sudo`) against a real root-owned admin safe, every one `access-denied`, plus the same refusal for autosave mutations carrying the correct passphrase. The allowing side: item 9 above renders 6 entry rows out of a root-owned KDBX the driving account cannot read unescalated |
 | *"the `export` verb's ALLOWED path — nothing in the standing suite runs as euid 0"* | **VERIFIED, and this row was already stale.** `tests/integration/newverbs.py` runs the export allow-path inside `unshare --map-root-user`, where `os.geteuid()` really is 0: the file lands 0600 in a 0700 directory under `export_dir`, named helper-side, content absent from the reply, audit line carrying the name and row count and no value. Re-run green in the re-gate (220 checks, 0 failures). What is still **not** covered is the SUDO_UID / group-membership branch of `gate()`, because inside that namespace the caller's real uid is 0 too — that half needs the `/srv/jobs` runner, and it is exercised there for the lockout path only (KNOWN_ISSUES I40) |
+| *"**A `.psafe3` this program wrote is one this program can read back** — KDBX only; not true of PWS3"* | **VERIFIED for both formats, 2026-09-04 (close-out).** The shared policy is `backends/base.Backend.verify_own_output`: re-open the exact bytes through the reader a later `unlock` uses, diff them against the database that was serialised, refuse as `conflict` with the live file untouched. `Psafe3Backend` implements its two hooks, which **refuse by default**, so a backend that has not written them cannot save at all. Measured independently of either fix report, by corrupting the serialisation in flight for **both** backends: psafe3 → `Conflict`, "the HMAC of a file we just built does not verify", live file UNCHANGED, fresh unlock opens 4 entries; kdbx → `Conflict`, live file UNCHANGED, fresh unlock opens 6 entries. With the psafe3 verify call deleted, the same probe wrote the file and the fresh unlock answered `bad-credential` — i.e. the guard is load-bearing. KNOWN_ISSUES I41 |
 
 ---
 
@@ -610,24 +611,35 @@ verified reference disagreement is the KDBX one.
 `unlock` both warn about it now. It is not mechanically fixed; the reasoning is in the residual
 register rather than hidden in a docstring.
 
-### 10.5 A Password Safe file this program writes may not be one it can read
+### 10.5 A Password Safe file this program writes is one it can read — CLOSED 2026-09-04
 
-Found by the 2026-09-04 re-gate; **this is an open defect, not a deliberate divergence**, and it
-is in this section because it is a statement about bytes another tool may be handed.
+Found by the 2026-09-04 re-gate as an **open defect**, and closed by the close-out pass the same
+day. The entry is kept, rewritten, because a compatibility document that deletes what it used to
+warn about is not one a reader can check.
 
 §10.1 and KNOWN_ISSUES I23 state the principle: *"the read and write limits are now the same
-number and this program cannot write a file its own reader refuses."* That is true for KDBX,
-where `_verify_own_output` re-opens every save through the reader before the bytes reach disk.
-It is **not** true for Password Safe v3, which has no such check and whose once-per-session
-losslessness guard latches after the first save.
+number and this program cannot write a file its own reader refuses."* It was true for KDBX and
+false for Password Safe v3, whose `save()` ran only the once-per-session losslessness guard.
+Measured then: a second save in one session wrote a `.psafe3` carrying a 5 MiB field, reported
+`{"ok": true, "bytes": 5244200}`, and the file answered `bad-credential` on reopen.
 
-Measured: a second save in one session wrote a `.psafe3` carrying a 5 MiB field — legal in the
-format, over this program's own 4 MiB per-field cap — reported `{"ok": true, "bytes": 5244200}`,
-and the resulting file answered `bad-credential` on reopen. Whether the real Password Safe GUI
-would open that file is **unknown**: formatV3.txt sets no per-field maximum, so a compliant
-reader plausibly would, which would make it a file this program wrote, cannot read, and would
-tell the operator was protected by the wrong passphrase. Nothing on this host can settle that —
-see §3.3 and RESIDUAL-RISK §3.5.
+**It is true for both formats now, and by construction rather than by round trip.** `_emit_field`
+calls `_check_field_length` — the READER's bounds check, the same function and the same
+type-aware constants, so an attachment keeps its 32 MiB cap and everything else gets 4 MiB — and
+on top of that every save re-opens its own bytes through the reader before they replace a working
+file. Driven through the real helper, the sequence that used to destroy the safe:
 
-Tracked as KNOWN_ISSUES I41 with the fix shape. Until it is closed, the honest form of the §10.1
-claim is *"for KDBX."*
+```
+save -> {"error": "conflict",
+         "detail": "this database cannot be written: PWS3 field length 4260599
+                    exceeds the 4194304 byte limit"}
+live safe sha256                  -> unchanged, byte for byte
+unlock, in a FRESH helper process -> opens, 4 entries
+```
+
+**What is still unknown, and it is the part this section exists for.** Whether the real Password
+Safe GUI would have accepted the 5 MiB field is still unsettled: `formatV3.txt` sets no per-field
+maximum, so a compliant reader plausibly would. This program's 4 MiB cap is therefore a
+*divergence from the format*, deliberately chosen as a parser-safety bound (I7, I25), and it is
+now applied symmetrically instead of only on read. Nothing on this host can settle what real
+Password Safe does with such a file — see §3.3 and RESIDUAL-RISK §3.5.

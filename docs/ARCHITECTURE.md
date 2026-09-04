@@ -52,7 +52,9 @@ Read [`CONTRACT.md`](CONTRACT.md) for the verb interface,
   │     path is ever produced                                    (I4)   │
   │  5. access class gate, from KERNEL identity, on THIS verb     (I2,  │
   │     geteuid/getuid/getgroups/SUDO_UID — never the request body) I3  │
-  │  6. lockout check for (uid, safe id)                        (I16)   │
+  │  6. RESERVE one attempt — check AND increment, under an       I16,  │
+  │     exclusive flock, before step 7: per (REAL uid, safe id)   I39,  │
+  │     and per safe id                                           I40   │
   │                                                                     │
   │        ┌────────────── backends/base.py ──────────────┐             │
   │        │ Secret(bytearray)  open_safe_fd()  Limits    │             │

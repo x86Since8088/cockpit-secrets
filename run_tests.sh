@@ -102,6 +102,13 @@ run "integration: the second-wave verbs"       900 \
     python3 tests/integration/newverbs.py
 run "integration: the unlock agent, end to end" 300 \
     python3 tests/integration/agent_cycle.py
+# I16's counter under concurrency (I39) and across principals (I40). It spawns
+# 50 helper processes at once and then waits out the real 2/4/8/16 s backoff
+# ladder to open the hard window, so it is a minute of wall clock and almost
+# all of that is sleeping on purpose: shortening the ladder would measure a
+# different program.
+run "integration: the lockout — concurrency, identity, reach" 600 \
+    python3 tests/integration/lockout.py
 # The confirmed adversarial findings, at the layer only the real helper can
 # reach: a request frame, a backup ring several processes have taken turns
 # with, an export artefact on disk. The per-cause guards for the same findings
@@ -144,8 +151,17 @@ else
     if command -v node >/dev/null 2>&1; then
         run "ui: headless browser driver"       600 \
             node tests/browser/ui.spec.js
+        # The ORACLE behind the live suite's I11 item, checked without a
+        # browser. The live suite itself cannot run here (it needs Cockpit, an
+        # account password and a registered safe), but the logic that decides
+        # what counts as "this page stored something" can, and it is the piece
+        # that was silently wrong once already (I42). It also asserts the
+        # tolerated-key list has not grown.
+        run "ui: item 4's storage oracle (I11, I42)"  60 \
+            node tests/browser/storage-check.selftest.js
     else
         skip "ui: headless browser driver" "node is not installed"
+        skip "ui: item 4's storage oracle (I11, I42)" "node is not installed"
     fi
 fi
 

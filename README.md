@@ -13,6 +13,41 @@ Plain HTML, vanilla JS and CSS on the front, one Python 3 verb helper on the
 back. **No build step, no bundler, no npm, no framework, no CDN, no WASM.** The
 only script the page loads besides its own is Cockpit's `../base1/cockpit.js`.
 
+### Where this actually stands — read this before you trust it
+
+**Version 0.3.0.** It runs, it is installed on one host, and it has been
+attacked. What that means, precisely:
+
+- Six adversarial lenses, and an independent re-gate of the result, found
+  **eighteen defects** in 0.2.0 and in this package's own test suite.
+  **Seventeen are fixed; one is argued and left standing with a runtime
+  warning** (the hardware-token challenge does not rotate — I35, and the
+  reasoning is in RESIDUAL-RISK §2.1). Three further low-severity items are
+  open and tracked rather than closed: I36 (a decrypted attachment stays
+  retrievable for ten seconds after Lock), I37 (a clipboard-clear failure the
+  page would announce as success — **nobody has managed to make it fail**), and
+  I38 (the optional agent's own notes are not redacted). The whole record,
+  including the attacks that bounced off, is in
+  [`docs/STRESS-REPORT.md`](docs/STRESS-REPORT.md); the hazard register with
+  every id the code cites is [`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md).
+- **What is still true of an attacker on a good day** is in
+  [`docs/RESIDUAL-RISK.md`](docs/RESIDUAL-RISK.md), which also has a part 3
+  listing every path that exists, is expected to work, and **has never been run
+  against the thing it names**. Read that part before promising anybody
+  anything.
+- **Compatibility is split into verified and believed**, deliberately, in
+  [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md) §8. Three things a reader
+  might assume are in the believed column: no YubiKey has ever answered a
+  challenge from this program, no Password Safe file written by the real
+  Password Safe has ever been read, and KDBX 4 + AES-KDF has never been read or
+  written.
+- It has been driven end to end in a real browser against real Cockpit —
+  ten items, 131 checks, [`docs/LIVE-WALKTHROUGH.md`](docs/LIVE-WALKTHROUGH.md)
+  — and at a real euid 0 through this host's root job runner.
+
+It has **not** been reviewed by anybody outside the system that wrote it, and
+it has run on exactly one machine.
+
 ---
 
 ## The one property everything else serves
@@ -29,7 +64,10 @@ rather than papered over.
 ## What it does
 
 - **Unlock** a registered safe with a passphrase typed into the page, optionally
-  with a registry-declared key file. KDBX3, KDBX4 and Password Safe v3.
+  with a registry-declared key file. KDBX 4.x and Password Safe v3 read/write;
+  **KDBX 3.1 read-only**, behind a permanent banner, because that format has no
+  integrity protection at all and a tampered file cannot be detected (I20). An
+  explicit upgrade to KDBX 4 is offered instead.
 - **Browse** groups and entries, search, page and sort. The entry table shows
   title, username, URL, tags, modified time and attachment count, and **never a
   password** — the helper does not send one.
@@ -57,15 +95,25 @@ rather than papered over.
 - **It does not export by default.** "Export as CSV" writes every secret in the
   safe to disk in the clear. It is admin-only, off unless the registry enables
   it per safe, and audited by name.
-- **It does not rotate a master passphrase.** Not in 0.1.0 — see
-  [`docs/OPERATIONS.md`](docs/OPERATIONS.md).
+- **It does not rotate a master passphrase, and it cannot create a safe.**
+  `save-as` copies an *open* database to a new name; it cannot make one from
+  nothing and cannot change the passphrase. Use the desktop client —
+  [`docs/OPERATIONS.md`](docs/OPERATIONS.md) has the procedure.
+- **It does not escrow or recover anything.** Lose the master passphrase and the
+  safe is gone. That is the point of it.
 
 ---
 
 ## Install
 
-`install.sh` must run as root, and refuses rather than half-installing. On this
-host root work goes through the `/srv/jobs` runner, not interactive `sudo`.
+`install.sh` must run as root, and refuses rather than half-installing.
+
+**On this host there is no interactive `sudo`** — root work goes through the
+`/srv/jobs` job runner, and `tests/root/submit.sh` is what this project uses:
+`./tests/root/submit.sh 10-install.sh` installs, `20-verify-install.sh` then
+audits the result from a *separate* root job, because an installer that checked
+its own work would report the mode it intended in both places. The `sudo` forms
+below are the portable spelling for a host that has it.
 
 ```bash
 ./check.sh                    # JavaScript syntax gate (no build step exists)
@@ -96,7 +144,7 @@ and a logout/login picks up the menu entry.
 | `/etc/cockpit-secrets/safes.d/` | `0755 root:root`, entries `0644 root:root` | **the registry** — the only source of safes |
 | `/etc/cockpit-secrets/safes/` | `0700 root:root` | admin-class safe files, `0600 root:root` |
 | `/var/log/cockpit-secrets/` | `0700 root:root` | `audit.log` — metadata only, never a value |
-| `/var/lib/cockpit-secrets/state/` | `0700 root:root` | per-(uid, safe) unlock-failure counters |
+| `/var/lib/cockpit-secrets/state/` | `0700 root:root` | `fail.<real uid>.<safe>.json` per-operator failure counters, and `safe.<safe>.json` per-safe rate windows. Both `0600`; the real uid, never the euid (I40) |
 | `/var/lib/cockpit-secrets/exports/` | `0700 root:root` | where `export` writes, `0600` — an entire safe in plaintext |
 | `/usr/local/lib/systemd/user/secrets-agent.*` | `0644` | `--with-agent` only, and never enabled by the installer |
 | `/usr/local/lib/systemd/system/secrets-agent@.*` | `0644` | the admin-class template — installed, never enabled |
@@ -193,6 +241,18 @@ and nothing in it that could reopen the safe — so even with it on, the
 passphrase is prompted on every unlock. What it buys is that the unlock is
 visible and revocable, not that you are asked less often.
 
+**Guessing is bounded by a counter, not only by the KDF.** Five failures for one
+operator against one safe trip an escalating backoff and then a five-minute
+lockout; twenty credential attempts against one safe in sixty seconds, counting
+every operator together, trip a fixed-window rate cap. The attempt is *reserved*
+under an exclusive file lock **before** the key is derived, so fifty guesses
+fired at once behave exactly like fifty guesses one at a time — that was not true
+before 2026-09-04 and the defect is written up as I39. The counter is named after
+the **real** caller behind an escalation, so one administrator's typo does not
+refuse the safe to every other administrator (I40). A wrong passphrase also
+cannot answer faster than a right one: there is a constant floor on the failure
+path, measured.
+
 **The passphrase never becomes an argument.** Not `argv`, not the environment,
 not a temp file — `/proc/<pid>/cmdline` and `/proc/<pid>/environ` are readable by
 the process owner and by root, and argv reaches shell history and audit trails.
@@ -273,13 +333,32 @@ Stated here rather than buried, and in full in
 | `docs/` | contract, architecture, threat model, hazard register, upstream review, operations |
 | `check.sh` | JavaScript syntax gate |
 | `validate.sh` | the fast standing gate: syntax, JSON, bad-practice bans, unit tests |
+| `run_tests.sh` | everything that can run unprivileged and without Cockpit — 19 steps, including the integration suite, the format oracles and a headless browser driver |
+| `tests/root/run-all.sh` | the eight-step root suite, submitted to `/srv/jobs`; the only place the admin class is tested against a genuinely root-owned registry |
+| `tests/browser/run-live.sh` | the ten-item live walkthrough against real Cockpit; needs the package installed and a credentials directory |
 | `install.sh` | root-only installer |
 
 **Read before changing anything:**
 [`docs/CONTRACT.md`](docs/CONTRACT.md) (the verb interface),
-[`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md) (hazards I1–I22 — code cites
-these ids),
+[`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md) (hazards **I1–I42** — the code
+cites these ids by number, so a comment saying `(I13)` is a pointer into that
+file),
 [`docs/THREAT-MODEL.md`](docs/THREAT-MODEL.md),
-[`docs/UPSTREAM-REVIEW.md`](docs/UPSTREAM-REVIEW.md) (what was adopted, what was
-rejected and why, plus the 20-item bad-practice table), and
-[`docs/OPERATIONS.md`](docs/OPERATIONS.md) for running it.
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) (what happens between a click and
+a decrypted field), and
+[`docs/UPSTREAM-REVIEW.md`](docs/UPSTREAM-REVIEW.md) (what was adopted from
+KeePassXC and Password Safe, what was rejected and why, plus the 20-item
+bad-practice table).
+
+**Read before trusting it:**
+[`docs/RESIDUAL-RISK.md`](docs/RESIDUAL-RISK.md) (what someone can still do, and
+what has never been tested),
+[`docs/STRESS-REPORT.md`](docs/STRESS-REPORT.md) (every attack, including the
+ones that found nothing),
+[`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md) (verified versus believed), and
+[`docs/LIVE-WALKTHROUGH.md`](docs/LIVE-WALKTHROUGH.md).
+
+**Read before operating it:**
+[`docs/OPERATIONS.md`](docs/OPERATIONS.md),
+[`docs/HOST-FACTS.md`](docs/HOST-FACTS.md) (what is true of edt1 specifically)
+and [`docs/ROOT-VERIFICATION.md`](docs/ROOT-VERIFICATION.md).

@@ -63,7 +63,10 @@ done
 
 cs_sect "lockout counters keyed on a throwaway safe"
 shopt -s nullglob
-counters=("$CS_STATE"/fail.*.zz-throwaway-*.json)
+# Two shapes since the I39/I40 fix: `fail.<real uid>.<safe>.json` is the
+# per-principal counter (one per operator who mistyped) and
+# `safe.<safe>.json` is the per-safe attempt window they share.
+counters=("$CS_STATE"/fail.*.zz-throwaway-*.json "$CS_STATE"/safe.zz-throwaway-*.json)
 shopt -u nullglob
 if ((${#counters[@]})); then
     for c in "${counters[@]}"; do rm -f -- "$c"; cs_ok "removed $c"; done

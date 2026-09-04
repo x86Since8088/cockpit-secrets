@@ -29,39 +29,88 @@ every machine. It is listed here anyway, because a threat model that puts root o
 risk register that never mentions root are two documents that together tell a reader something
 false.
 
-### 1.2 Passphrase guessing is not rate-limited if you guess in parallel
+### 1.2 Passphrase guessing against one safe is capped at 20 attempts a minute, not at 5
 
-The lockout counter that is supposed to stop repeated guesses is read, incremented and written
-back with no lock between the three steps. Fire fifty unlock attempts at once and forty-four of
-them are evaluated instead of five. Measured: fifty concurrent wrong guesses produced forty-four
-`bad-credential` answers and left the counter reading 43. Guessing still costs a full key
-derivation per attempt, so this is not an offline attack and not a fast one — but the specific
-promise that guessing is bounded by a threshold rather than only by CPU is not kept. Anyone who
-can run the helper repeatedly can do this: the owner of a user-class safe, or script running in
-the Cockpit page's origin. Tracked as **I39**.
+**This section used to say something worse and is kept, rewritten, rather than deleted.** It read
+"guessing is not rate-limited if you guess in parallel", and it was right: fifty unlock attempts
+fired at once were thirty-four evaluated against a threshold of five, and left the counter reading
+three. That was **I39**, and it is fixed — the attempt is now reserved under an exclusive lock
+*before* the key derivation rather than recorded after it, so fifty concurrent guesses now behave
+exactly like fifty sequential ones: one evaluated, forty-nine refused.
 
-### 1.3 One administrator can lock every other administrator out of a safe
+What is left is the deliberate ceiling. Guessing against one safe is bounded by two counters: five
+attempts per operator before a five-minute lockout, and — because an attacker who has already
+reached euid 0 can present a different `SUDO_UID` to each attempt and collect a fresh
+per-operator counter — **twenty attempts per safe per sixty seconds, from everybody together**.
+Twenty guesses a minute is a rate limit, not a wall. Against a passphrase worth having it is
+nothing; against a four-digit PIN reused as a passphrase it is ten thousand seconds. The people
+who can spend it are the administrators of this host and root, who as section 1.1 says can read
+the safe file directly and guess offline at whatever rate their hardware allows. So this ceiling
+buys nothing against the attacker of section 1.1 and everything against a script in the Cockpit
+page's origin, which is who it is for.
 
-The lockout counter for an admin-class safe is named after the *effective* user id, and every
-administrator is root when they open one. So there is one counter per admin safe, shared by
-everyone. Measured: one administrator mistyped a passphrase once; a second administrator, who had
-typed nothing, immediately offered the correct passphrase and was refused. Two consequences. An
-administrator who is merely clumsy denies the safe to their colleagues, and an administrator who
-is malicious can do it on purpose and cannot be identified from the lockout state, because the
-state records no identity. The audit log does record who tried. Tracked as **I40**.
+### 1.3 An administrator can deny one safe to their colleagues for up to a minute
 
-### 1.4 A Password Safe file can be destroyed by a second save, and the save says it worked
+**This section also used to say something worse.** It read "one administrator can lock every other
+administrator out of a safe", and it was right: the counter was named after the *effective* user
+id, every administrator is root when they open an admin-class safe, and one clumsy operator's typo
+refused everybody else with the correct passphrase. That was **I40**, and it is fixed — the
+counter is named after the *real* caller behind the escalation, so an operator's failures are
+their own, and the lockout state can now attribute where before only the audit log could.
 
-For Password Safe v3 files only, the check that a save will produce a readable file runs once per
-session instead of once per save. Save twice in one session and the second save is unchecked.
-Measured: the second save wrote a file the program's own reader then refused, and reported
-`{"ok": true}` while doing it. Worse, on reopening, the operator is told the passphrase did not
-match — so the natural next move is to try more passphrases and trip the lockout, on a safe that
-is not actually locked but broken. The previous version is in the backup ring, so the data is
-recoverable if the operator knows to look. KDBX files are not affected; they got this check and
-Password Safe files did not. Through the web page today this is hard to reach, because a single
-request is capped at 1 MiB and that cap happens to block the route — but that cap exists for an
-unrelated reason and is the only thing in the way. Tracked as **I41**.
+What is left is the shared half, and it is deliberate. The per-safe cap in section 1.2 counts
+every principal together, so an administrator who fires twenty wrong guesses at a safe inside one
+minute denies it to every other administrator until that window ends. Bounded at **sixty
+seconds**, whatever they do, because the window is fixed rather than escalating — and any
+successful unlock, by anybody, clears it immediately. That bound is the reason the cap is a rate
+limit and not a second lockout: giving it the per-operator escalation would have let one bad
+actor deny a safe for fifteen minutes, which is a worse thing to be able to do than the thing the
+cap prevents.
+
+An administrator who wants to deny their colleagues a safe has better options than this anyway:
+they are root, and section 1.1 applies.
+
+### 1.4 A save that a backend cannot read back is refused — and one backend still has its own copy of that rule
+
+**This section used to describe a live defect and is kept, rewritten, rather than deleted.** It
+read *"a Password Safe file can be destroyed by a second save, and the save says it worked"*, and
+it was right: the round-trip check ran once per session instead of once per save, the second save
+in a session wrote a file the program's own reader then refused, and it reported `{"ok": true}`
+while doing it — after which the operator was told their **passphrase** did not match a safe that
+was not locked but broken. That was **I41**, and it is fixed. Every save in both formats now
+re-opens the exact bytes through the reader a later unlock uses, before those bytes replace a
+working file, and a failure is a `conflict` that names what the reader objected to with the live
+file byte-for-byte untouched.
+
+The section also said the defect was hard to reach through the page because a request is capped at
+1 MiB. **That was wrong and is corrected here rather than quietly dropped**: the password-history
+field is written by the helper rather than carried by the caller and grows one ordinary edit at a
+time, so the largest frame needed to reach the defect was 65 680 bytes — six per cent of the cap
+that was supposed to be in the way. It was reachable through the shipping `edit` verb.
+
+What is left is a **drift risk, not a defect.** The shared policy lives in
+`backends/base.Backend.verify_own_output`, whose two format hooks refuse by default so a new
+backend cannot save at all rather than saving unchecked bytes, and a standing ban
+(`_unverified_writes`) fails any backend `save`/`save_as` that reaches `atomic_replace` without
+calling a verify. Three things are still true and are the honest remainder:
+
+* `backends/kdbx.py` satisfies the ban with its **own private** `_verify_own_output` and does not
+  route through the shared policy. The guarantee is identical today — measured, both backends, in
+  the same probe — but two implementations of one rule is the exact shape that produced I41 in the
+  first place. Making `KdbxBackend` implement `read_back`/`diff_read_back` and deleting the private
+  copy is the follow-up.
+* The ban is **static**. It reads the source and requires a verify call in the same function body
+  as the write. A backend that hid the write behind a helper method would pass it. A runtime stamp
+  — the verify records a digest and the write refuses bytes without one — would be stronger and
+  needs the kdbx unification first.
+* Nobody has **enumerated which other helper-written fields grow across calls** the way the
+  password history does. `0x0f` was enough to prove reachability, and the per-save check now covers
+  the whole class rather than that one field, so this is a gap in knowledge rather than in the
+  guard.
+
+And the limit that matters most for Password Safe is still §3.5: "our reader accepts our writer"
+is all that is proved. The refusals now agree with themselves; whether the real Password Safe
+would accept a field this program writes is unknown and unclaimed.
 
 ### 1.5 A hardware token's answer, seen once, opens the file for as long as the file exists
 
@@ -355,14 +404,19 @@ fire on this host's root filesystem. The defect was unconditional and the fix is
 what is filesystem-dependent is how often it would have bitten. tmpfs, NFS and CIFS are the
 realistic triggers.
 
-### 3.9 Password Safe was not put through the leakage or the browser lens
+### 3.9 Password Safe was not put through the leakage lens
 
-Every leakage test and every browser-rendering test ran against KDBX. Password Safe's export and
-error paths were never checked for leaks — its CSV writer was confirmed during this re-gate to be
-the same neutralising one, which closes part of it — and no `.psafe3` fixture was ever rendered in
-the page. That last gap matters more than it sounds: Password Safe fields are not constrained by
-XML the way KDBX fields are, so PWS3 is the right format for exactly the control-character and
-odd-encoding rendering tests that KDBX refused to store.
+Every leakage test ran against KDBX. Password Safe's export and error paths were never checked for
+leaks — its CSV writer was confirmed during the re-gate to be the same neutralising one, which
+closes part of it.
+
+**The "never rendered in the page" half of this section is now false and has been removed.** A
+`.psafe3` safe is driven through the live page in `tests/browser/live-ui.spec.js` item 6, both
+before and after the I41 fix: add, edit, custom-field refusal, attach, list, download, history,
+save and reopen, most recently on 2026-09-04. What remains untested is narrower and still worth
+saying: Password Safe fields are not constrained by XML the way KDBX fields are, so PWS3 is the
+right format for exactly the control-character and odd-encoding rendering tests that KDBX refused
+to store, and **those** have never been run in a browser against either format.
 
 ### 3.10 The hostile-filesystem matrix was not run against Password Safe
 

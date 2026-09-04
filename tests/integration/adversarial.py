@@ -21,6 +21,11 @@ are here, and each one is a full round trip through `secrets-admin`.
                which stops being true after `keep` of them.
   LEAKAGE-03   a CSV export wrote an attacker-supplied formula verbatim.
   LEAKAGE-04   an entry title containing a double quote answered `internal`.
+  CRYPTO-02    a PWS3 save wrote a file the program's own reader refuses,
+               reported `{ok: true}`, and the next unlock blamed the operator's
+               PASSPHRASE for it. Reached here the way it is really reachable —
+               through the shipping `edit` verb, in frames of 65 KB — which is
+               why it belongs against the real helper and not in a unit test.
   CRYPTO-01    the READ half: a database written entirely by keepassxc-cli, with
                an ordinary compressible attachment, was refused at every verb
                that touched the attachment. Needs the foreign oracle, so it
@@ -36,7 +41,7 @@ import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _env import Env, Report, PW, HELPER, SRC        # noqa: E402
+from _env import Env, Report, Session, PW, HELPER, SRC   # noqa: E402
 
 
 # ---------------------------------------------------------------- INPUT-2 ---
@@ -410,6 +415,137 @@ def crypto01_foreign(env, r):
         os.unlink(reg)
 
 
+def crypto02_pws3(env, r):
+    """I41 — a PWS3 save that produces a file our own reader refuses.
+
+    THE TRIGGER, and it is not the one the re-gate recorded. That entry said
+    the defect was held off the shipping helper by `MAX_REQUEST_BYTES`, since
+    `edit` carries the whole new value and a >4 MiB field will not fit in a
+    1 MiB frame. That is true of the field the re-gate used (a giant `notes`)
+    and false of the defect: field 0x0f, the password history, is written by
+    the helper rather than by the caller, and it GROWS. Note [12] gives it 255
+    slots and `PWH_MAX_PASSWORD` gives each slot 0xFFFF characters, so its
+    ceiling is about 16.7 MB — four times `MAX_FIELD_BYTES` — and it is reached
+    one ordinary `edit` at a time. Every frame below is about 65 KB, six per
+    cent of the cap that was supposed to be what stood in the way.
+
+    Before the fix, in exactly this sequence:
+
+        save 1 (ordinary edit)          -> {"ok": true}      latch closes
+        66 x edit, 65 KB per frame      -> accepted
+        save 2                          -> {"ok": true, "bytes": 4327480}
+        unlock, in a FRESH helper       -> bad-credential
+
+    The safe was destroyed, the save said it had worked, and the reader blamed
+    the operator's passphrase — which sends them to guess again and trip
+    I39/I40's lockout on a safe that is broken rather than locked.
+
+    What this asserts now: the save is refused as `conflict`, the live file is
+    byte-for-byte what it was, and a fresh helper still opens it.
+    """
+    r.section("CRYPTO-02 (I41) — a PWS3 save must not write a file our own "
+              "reader refuses")
+    env.reset_safes()
+    env.clear_lockout()
+    safe = os.path.join(env.safes, "lab-pws3.psafe3")
+
+    s = Session(env)
+    try:
+        out = s.call("unlock", safe="lab-pws3", password=PW)
+        if not r.check("the fixture unlocks", "handle" in out, out):
+            return
+        h = out["handle"]
+        listed = s.call("entries", handle=h, safe="lab-pws3", limit=1)
+        uuid = listed["entries"][0]["uuid"]
+
+        s.call("edit", handle=h, safe="lab-pws3", uuid=uuid,
+               changes={"notes": "an ordinary edit"})
+        first = s.call("save", handle=h, safe="lab-pws3")
+        r.check("save 1 (an ordinary edit) succeeds", first.get("ok") is True,
+                first)
+
+        # One small frame turns the history on with the format's maximum of
+        # 255 slots: flag 1, max_size 0xff, count 0x00.
+        s.call("edit", handle=h, safe="lab-pws3", uuid=uuid,
+               changes={"password-history": "1ff00"})
+
+        before = hashlib.sha256(open(safe, "rb").read()).hexdigest()
+        big = "P" * 0xFFFF
+        largest = 0
+        refused = None
+        for i in range(66):
+            largest = max(largest, len(json.dumps(
+                {"verb": "edit", "handle": h, "safe": "lab-pws3",
+                 "uuid": uuid, "changes": {"password": big}})))
+            got = s.call("edit", handle=h, safe="lab-pws3", uuid=uuid,
+                         changes={"password": big})
+            if got.get("error"):
+                refused = (i, got)
+                break
+        r.check("66 password edits are accepted, none of them oversized",
+                refused is None, refused)
+        r.check("every request frame is far inside MAX_REQUEST_BYTES "
+                "(%d of 1048576 bytes)" % largest, largest < 100 * 1024)
+
+        saved = s.call("save", handle=h, safe="lab-pws3")
+        r.check("save 2 is REFUSED", saved.get("ok") is not True, saved)
+        r.check("...as `conflict`, not `ok` and not `internal`",
+                saved.get("error") == "conflict", saved)
+        # The misattribution, which is the half that costs the operator their
+        # next move. A file we broke must not be reported as their passphrase.
+        r.check("...and never as `bad-credential`",
+                saved.get("error") != "bad-credential"
+                and "passphrase" not in (saved.get("detail") or ""), saved)
+        r.check("...naming what the reader objected to",
+                "limit" in (saved.get("detail") or ""), saved.get("detail"))
+        r.check("the live safe is byte-for-byte unchanged",
+                hashlib.sha256(open(safe, "rb").read()).hexdigest() == before)
+    finally:
+        s.close()
+
+    # A COMPLETELY FRESH helper process, which is how a later unlock really
+    # happens. This is the assertion that fails loudest with the fix reverted:
+    # before it, this line answered `bad-credential`.
+    out, _rc, _err = env.run("unlock", {"safe": "lab-pws3", "password": PW})
+    r.check("a fresh helper still opens the safe", "handle" in out, out)
+    r.check("...and it is not `bad-credential`",
+            out.get("error") != "bad-credential", out)
+
+    # The same defect one step earlier: the FIRST save of a session, where the
+    # I22 early guard does run. It caught the bytes and then reported them as
+    # `bad-credential` — the same misattribution by a different route.
+    env.reset_safes()
+    # The run above deliberately produced a `bad-credential`, which the I16
+    # counter counts. Clearing it is the same test seam `_env.clear_lockout`
+    # documents, not a policy change: without it a REVERTED run answers
+    # `locked-out` here and the failure reads as the wrong defect.
+    env.clear_lockout()
+    s = Session(env)
+    try:
+        opened = s.call("unlock", safe="lab-pws3", password=PW)
+        if not r.check("the fixture unlocks for the first-save case",
+                       "handle" in opened, opened):
+            s.close()
+            env.reset_safes()
+            return
+        h = opened["handle"]
+        listed = s.call("entries", handle=h, safe="lab-pws3", limit=1)
+        uuid = listed["entries"][0]["uuid"]
+        s.call("edit", handle=h, safe="lab-pws3", uuid=uuid,
+               changes={"password-history": "1ff00"})
+        for _ in range(66):
+            s.call("edit", handle=h, safe="lab-pws3", uuid=uuid,
+                   changes={"password": "P" * 0xFFFF})
+        first = s.call("save", handle=h, safe="lab-pws3")
+        r.check("the FIRST save of a session is refused as `conflict` too",
+                first.get("error") == "conflict", first)
+        r.check("...and not as `bad-credential` either",
+                first.get("error") != "bad-credential", first)
+    finally:
+        s.close()
+    env.reset_safes()
+
+
 def main():
     env = Env().build()
     r = Report("adversarial findings, against the real helper")
@@ -424,6 +560,7 @@ def main():
         durability3(env, r)
         leakage03(env, r)
         leakage04(env, r)
+        crypto02_pws3(env, r)
         crypto01_foreign(env, r)
     finally:
         env.destroy()

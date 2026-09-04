@@ -29,13 +29,14 @@ declare -A TIMEOUT=(
     [20-verify-install.sh]=300
     [30-throwaway-safes.sh]=300
     [40-admin-allow.sh]=900
+    [45-lockout-principals.sh]=300
     [50-user-class.sh]=300
     [60-uninstall-reinstall.sh]=600
     [90-cleanup.sh]=300
 )
 ORDER=(10-install.sh 20-verify-install.sh 30-throwaway-safes.sh
-       40-admin-allow.sh 50-user-class.sh 60-uninstall-reinstall.sh
-       90-cleanup.sh)
+       40-admin-allow.sh 45-lockout-principals.sh 50-user-class.sh
+       60-uninstall-reinstall.sh 90-cleanup.sh)
 
 steps=()
 if (($#)); then

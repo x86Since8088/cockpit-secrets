@@ -32,6 +32,7 @@ hands it over; nothing in this directory calls `sudo` and nothing needs to.
 | `20-verify-install.sh` | every installed path, mode and owner; nothing from `tests/`; nothing group-writable; the helper resolves its installed library root | 5 s |
 | `30-throwaway-safes.sh` | mints the passphrase; builds one admin-class and one user-class safe plus three registry entries under the REAL `/etc/cockpit-secrets` | 5 s |
 | `40-admin-allow.sh` | **the allowing side**: root unlocks, reads, mutates and saves; the state and audit directories; `SUDO_UID`/`PKEXEC_UID`; the lockout counter | 60 s |
+| `45-lockout-principals.sh` | **I40**: two escalated operators, two lockout counters — A's typo does not refuse B with the correct passphrase, A is still counted, and the class gate is what bounds identity variation | 15 s |
 | `50-user-class.sh` | the user class as `cptest`, unescalated: their own safe works, nothing of the admin class does | 10 s |
 | `60-uninstall-reinstall.sh` | `--uninstall` removes exactly the software and keeps the registry byte for byte; then reinstalls | 20 s |
 | `90-cleanup.sh` | removes every throwaway subject and the passphrase, and prints what is left on the host | 5 s |

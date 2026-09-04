@@ -6,7 +6,10 @@ task that owns it. Tasks cite these ids; a task is not done until its cited ids 
 MITIGATED or explicitly re-classified with a reason.
 
 Legend — Sev: **C**ritical / **H**igh / **M**edium / **L**ow.
-Status: OPEN / MITIGATED / BY-DESIGN / WONTFIX.
+Status: OPEN / MITIGATED / BY-DESIGN / WONTFIX. **FIXED** appears on entries added after the
+adversarial pass and means the same as MITIGATED — the hazard is closed and the evidence is in
+the entry. The two words are not a severity or a confidence distinction; the register simply
+grew a second author. Every closed entry names its regression test.
 
 ---
 
@@ -156,14 +159,20 @@ logs are group-readable. **Mitigation:** a single top-level exception barrier th
 records *verb, safe id, caller uid, outcome* and never a value; a redaction filter applied to
 everything the helper writes; and `set -x` explicitly banned in any shell wrapper. Owner: Task 2.
 
-### I16 · Unbounded unlock attempts · Sev M · PARTIAL (two halves proved, two defects found)
+### I16 · Unbounded unlock attempts · Sev M · MITIGATED (both halves proved)
 An unlock endpoint that never says no is an offline-strength guessing oracle with the KDF's
 cost as the only brake. **Mitigation:** per-(uid, safe id) failure counter in a root-owned
 state file with exponential backoff and a lockout threshold, plus a constant floor on the
 failure path so a wrong password does not answer faster than a right one. Owner: Task 2.
 
-**Status after the adversarial review and the 2026-09-04 re-gate.** The two halves of this
-hazard came out differently and the entry now says so rather than averaging them.
+**WHICH uid, stated once so it is not ambiguous anywhere else.** It is `Identity.real_uid` —
+the human behind the escalation, `getuid()` on the user path and `SUDO_UID`/`PKEXEC_UID` at
+euid 0. Not the euid. I40 is what happens when it is the euid, and this sentence is the one
+I40's fix note asked for.
+
+**Status after the adversarial review, the 2026-09-04 re-gate, and the I39/I40 fix.** The two
+halves of this hazard came out differently and the entry says so rather than averaging them.
+Both are now closed; the paragraph below records what each was measured at.
 
 * **The constant floor holds, and is measured.** 200 samples each way against one safe with the
   real 0.75 s floor: wrong `min 1.0249 / med 1.0525 / max 1.0946`, correct
@@ -172,13 +181,24 @@ hazard came out differently and the entry now says so rather than averaging them
   there is no per-guess signal. The floor is on every credential-bearing verb, not only
   `unlock`, because they all route through `need_backend → do_unlock`. It also cannot be
   starved: it is `time.monotonic()` plus one `sleep`, so load only lengthens it.
-* **The counter does not hold.** It is a lost-update race (**I39**) and, on the admin path, it
-  is keyed on euid so every administrator shares one counter per safe (**I40**). Both were
-  reproduced on 2026-09-04. Until those are fixed, the honest statement of this mitigation is
-  *"a constant-time floor, plus a counter that works when attempts arrive one at a time."*
+* **The counter now holds under concurrency, and across principals.** It did not: it was a
+  lost-update race (**I39**) and, on the admin path, keyed on euid so every administrator
+  shared one counter per safe (**I40**). Both were reproduced on 2026-09-04 and both are now
+  fixed and closed — see those entries for the reproduction, the fix and the regression tests.
+  Concurrent guessing is now indistinguishable from sequential guessing: 50 helpers fired at
+  once against a hermetic registry yield **1 evaluated, 49 locked-out, counter reading 1**,
+  which is what 8 sequential guesses yield.
 
-The sentence "per-**(uid, safe id)**" in the mitigation above is what the code was supposed to
-do and is not what it does; see I40.
+**THE COUNTER IS ON EVERY CREDENTIAL-CONSUMING VERB, and this is now measured rather than
+asserted.** The red team asked and the question went unanswered through two passes.
+`tests/integration/lockout.py` section E reads the list of credential-bearing verbs out of the
+`schema` verb — so a verb added later that accepts a passphrase is covered the day it is
+written — and drives all 20 of them with the window open. 19 answer `locked-out`; the 20th,
+`export`, is admin-class and is covered at a real euid 0 by `tests/root/driver_lockout.py`
+section 6. The verbs that consume no credential (`probe`, `backups`, `restore-backup`, `list`,
+`health`, `audit-tail`) are **not** refused, which is correct: a lockout is a brake on
+guessing and a header read is not a guess. The reach was already right before the fix; what
+was missing was anybody having shown it.
 
 ### I17 · Clipboard leakage · Sev M · OPEN→(design closes)
 A copied password stays in the clipboard indefinitely and any focused page can read it.
@@ -352,8 +372,15 @@ MITIGATED **for KDBX only**, which is what its guard actually tests.
 
 Guard: `test_crypto01_save_refuses_output_it_cannot_read_back`, which makes the reader stricter
 than the writer for the duration of one save and asserts both the refusal and that the live
-file is byte-for-byte unchanged. Note that it is a KDBX test; there is no PWS3 equivalent,
-which is why the false claim survived review.
+file is byte-for-byte unchanged.
+
+**UPDATE, 2026-09-04 (second pass).** The last sentence of the correction above — *"there is no
+PWS3 equivalent, which is why the false claim survived review"* — is now out of date, and this
+entry is MITIGATED for **both** formats. I41 is closed: PWS3 has the same per-save reader check,
+the shared policy for it lives in `backends/base.py` where a third backend cannot omit it, and
+the missing twin of this guard exists (`python3 -m backends.psafe3`, section *the pre-write
+reader check*, which makes the reader stricter than the writer for one save and asserts the
+refusal and the untouched file, exactly as this KDBX test does). See I41 for the evidence.
 
 ### I25 · No wall-clock bound on turning a payload into a database · Sev M · MITIGATED
 `Limits.MAX_ENTRIES` says it "stops a file that claims 10^9 records and makes the helper build
@@ -647,7 +674,20 @@ Two of them are defects the attack pass had already named and the remediation di
 **I41** is `CRYPTO-02`, which the remediation states in writing that it fixed and did not, and
 **I39** is `WEB-01`, which appears in no remediation entry at all. That is the same failure the
 whole exercise exists to catch, one level up: a remediation report is also written by the system
-that wrote the fix.
+that wrote the fix. (**I41 is now MITIGATED** — see its entry, which also corrects the re-gate's
+own too-narrow measurement of how far it reached. **I39 and I40 are now FIXED** — I39's entry
+also records that the re-gate's own measurement was too GENEROUS: re-reproducing it before
+fixing it found 34 attempts evaluated and 31 increments lost, not 44 and 7.)
+
+(**I42 is now FIXED** — by the close-out pass, which is the "somebody who is not also reporting
+on it" its own entry asked for, and which made the check strictly stronger rather than merely
+quieter: it removed a false positive *and* closed a false negative the old check had.)
+
+**ALL FOUR ARE CLOSED as of the close-out pass, 2026-09-04.** Each of the three product defects
+was re-reproduced before being fixed, and then re-verified by a third pass that took neither fix
+report on trust — including watching I41 reproduce end to end with one line of the fix reverted
+(`save() -> {'ok': True}`, the live file rewritten, and a fresh unlock answering
+`bad-credential`). `docs/STRESS-REPORT.md` §8 is that record.
 
 `docs/STRESS-REPORT.md` carries the full command and output for each.
 
@@ -703,8 +743,8 @@ been made. That is the same shape as I30, and the same reason it is worth closin
 blanket filter is that it covers the mistake nobody has made yet. `validate.sh` does not check
 this, which is why the asymmetry survived.
 
-### I39 · The unlock lockout does not survive concurrency · Sev M · OPEN
-This is the attack pass's `WEB-01`. It appears in no remediation entry.
+### I39 · The unlock lockout does not survive concurrency · Sev M · FIXED 2026-09-04
+This is the attack pass's `WEB-01`. It appeared in no remediation entry.
 
 `lockout_fail()` reads the counter, computes, and writes it back with `O_TRUNC`, with no lock
 between the three steps, and `lockout_check()` runs before the KDF while `lockout_fail()` runs
@@ -724,11 +764,88 @@ not an offline attack. What is defeated is the promise that guessing is bounded 
 rather than only by CPU. Reachable by anyone who can spawn the helper repeatedly: the owner of a
 user-class safe, or script in the Cockpit origin driving `cockpit.spawn` in a loop.
 
-**Fix shape:** hold the safe's lock file, or an `O_EXCL` sidecar, across the read-modify-write; or
-make the counter an append-only file whose length is the count.
+**RE-REPRODUCED BEFORE FIXING, and it is worse than the re-gate measured.** The skeptic REFUTED
+this during the red-team pass; the refutation was wrong. Same method, 2026-09-04, hermetic
+registry, counter cleared before each batch:
 
-### I40 · Every administrator shares one lockout counter per admin safe · Sev M · OPEN
-`_lockout_path()` (`secrets-admin:1203`) builds `"fail.%d.%s.json" % (os.geteuid(), safe_id)`. On
+```
+sequential control, 8 guesses one at a time  -> 1 evaluated, then 7 × locked-out
+10 concurrent -> {'bad-credential': 10}                  10 evaluated
+25 concurrent -> {'bad-credential': 22, 'locked-out': 3} 22 evaluated
+50 concurrent -> {'bad-credential': 34, 'locked-out': 16} 34 evaluated
+   counter after the 50: {"failures": 3, …}   -- 31 increments lost
+```
+
+Thirty-four attempts evaluated against a threshold of five, and a counter that ended up reading
+**three**. The lost-update count varies run to run because it is a race; the shape does not.
+
+**FIXED.** Three things were wrong and all three had to change, because any one of them alone
+would have left the property false:
+
+1. **Read-modify-write with no lock.** Every access to a counter file now goes through
+   `_StateTxn`, which opens it `O_RDWR|O_CREAT|O_NOFOLLOW` and holds `flock(LOCK_EX)` on that
+   same fd across the read AND the write.
+2. **The check ran before the KDF and the increment after it.** Even a perfectly atomic counter
+   would not have helped: the race window WAS the derivation, and every concurrent caller
+   legitimately saw a counter nobody had moved yet. The attempt is now RESERVED —
+   `lockout_begin()` checks and increments in one locked transaction — before any key is
+   derived, and `lockout_settle()` closes it out afterwards: a wrong passphrase keeps the
+   reservation, an error that never consumed a guess gives it back, a correct passphrase clears
+   the counter.
+3. **`lockout_reset()` unlinked the file.** `flock` is held on an inode; unlinking hands the
+   next arrival an `O_CREAT` of a *different* inode, and two processes then hold two "exclusive"
+   locks on two files with the same name. The counter is zeroed in place now. Nothing was
+   exploiting this — reaching that line needs the passphrase — but an exclusion primitive with
+   an exception in it is not one. The cost is the litter `docs/ROOT-VERIFICATION.md` F2 recorded
+   as a surprise: one 60-byte 0600 JSON per (real uid, safe), now deliberate rather than
+   accidental.
+
+**Why `flock` and not the other two options in the fix shape.** The counter lives in
+`/var/lib/cockpit-secrets/state` (root-owned, 0700) on the admin path and in the caller's own
+`~/.local/state/cockpit-secrets/state` on the user path. Both are local filesystems and both are
+single-owner directories, so the only contenders for a file are helper processes of the same
+principal class. The property that decides it is **release on death**: this helper is spawned
+once per verb by a browser channel that can vanish mid-derivation, and a killed process drops
+its `flock` in the kernel with no reaper, no timeout and no stale-lock heuristic. An `O_EXCL`
+sidecar has exactly the opposite property, and "the holder looks dead" is the guess `LockFile`
+refuses to make about the safe file itself for the same reason. Counting `O_EXCL` token files by
+listing adds a third problem: an unbounded directory that has to be swept, inside the one
+directory whose security property is that nothing but this program writes there.
+
+**The lock does not become the denial of service.** Three things keep it that way, and the third
+is the one that matters most for I40: nothing blocking happens while the lock is held (one
+`read` and one `write` of a document under 200 bytes — no KDF, no safe file, no network, there
+is none); the wait is bounded by `LOCKOUT_LOCK_SECONDS` (5 s) rather than indefinite, and
+expiring it **fails closed**, because letting an attempt through on a busy counter would make
+"hold this file open" the off switch for I16; and the per-principal counter is a *different file
+per principal*, so a wedged helper belonging to operator A cannot stall operator B at all. Only
+the per-safe cap is shared, and its critical section is the same few microseconds.
+
+That is measured rather than argued. A foreign process takes `flock(LOCK_EX)` on operator A's
+counter and holds it, at a real euid 0 through the root runner:
+
+```
+A, CORRECT passphrase -> locked-out in 5.31 s
+   detail: "the lockout counter for this safe is busy; the attempt was refused
+            rather than left uncounted"
+B, CORRECT passphrase -> handle minted, 0.86 s      <- unaffected, not even slowed
+lock released; A      -> handle minted, immediately
+```
+
+Fail closed, bounded, and isolated per principal — the three things that had to be true at once.
+`tests/integration/lockout.py` section F does the unprivileged half;
+`tests/root/driver_lockout.py` section 7 does the two-principal half, which is the one that needs
+two real uids behind euid 0.
+
+**Regression test:** `tests/integration/lockout.py`, sections A and B — a sequential control of
+8 guesses, then `CONCURRENCY = 50` real helper PROCESSES fired at once, asserting that the
+counter on disk equals the number of attempts actually evaluated *exactly* (a lost update makes
+those two numbers differ and nothing else does) and that the concurrent distribution matches the
+sequential one. Watched to fail against the committed pre-fix helper: 38 evaluated, counter 36,
+5 checks red.
+
+### I40 · Every administrator shares one lockout counter per admin safe · Sev M · FIXED 2026-09-04
+`_lockout_path()` (`secrets-admin:1203`) built `"fail.%d.%s.json" % (os.geteuid(), safe_id)`. On
 the admin path every operator is euid 0, so there is one counter per admin safe for everybody.
 `ident.real_uid` is available at that line and is not used. I16 and `docs/ARCHITECTURE.md` step 6
 both say the counter is per-**(uid, safe id)**.
@@ -748,18 +865,71 @@ Two consequences: one administrator's typo denies the safe to every other admini
 lockout state cannot attribute — it records no identity, so it cannot say whose failures they
 were. (The audit log does record that.)
 
-**Fix shape:** key the path on `ident.real_uid`, falling back to euid when there is no
-`SUDO_UID`/`PKEXEC_UID`, and say in I16 which identity is meant.
+**RE-REPRODUCED BEFORE FIXING**, this time without the root runner: inside `unshare -r` the euid
+really is 0, so the admin branch of `gate()` really runs and `SUDO_UID` is really believed —
+which is the whole mechanism, minus a root-owned registry.
 
-### I41 · PWS3 never got I24's per-save reader check · Sev M · OPEN
-This is the attack pass's `CRYPTO-02`, and I24 states that it was fixed. It was not — see the
-CORRECTION in I24.
+```
+identity as A: {"euid": 0, "real_uid": 1000, "escalated": true, "class_available": "admin"}
+operator A (SUDO_UID=1000) mistypes ONCE          -> bad-credential
+counter files on disk: ['fail.0.lab-admin.json']  <- ONE file, euid not uid
+operator B (SUDO_UID=1007), correct passphrase    -> locked-out
+```
 
-`backends/kdbx.py` `save()` calls `_assert_lossless()` **and then `_verify_own_output(data)`**, so
-the reader re-runs on every save. `backends/psafe3.py` `save()` calls `_ensure_lossless()` and
-nothing else, and `_ensure_lossless()` short-circuits on `self._lossless_checked`, which is set
-`True` on its first run and cleared only in `lock()`. So on PWS3 the I22 round-trip guard runs
-once per session, exactly as before the remediation.
+After the fix, same script, same registry: `['fail.1000.lab-admin.json', 'safe.lab-admin.json']`
+and B gets `ok, handle minted`.
+
+**FIXED, in two parts, because keying on the real uid alone would have been theatre.**
+
+*Part one — the accountability fix.* `_lockout_paths()` keys the per-principal counter on
+`ident.real_uid`. That is the field that exists to answer "who actually asked" behind an
+escalation, it is what the audit log has always been keyed on, and it is what I16 and
+`docs/ARCHITECTURE.md` step 6 both said the counter was. No fallback is needed: `real_uid` is
+already `getuid()` when there is no `SUDO_UID`/`PKEXEC_UID`, and those are read only at euid 0
+because an unprivileged caller can set them to anything.
+
+*Part two — the number an attacker could change.* Per-real-uid is right for accountability and
+for not locking innocent administrators out, and on its own it is a counter that resets when the
+attacker edits one environment variable. Two things now stop that, and only the second is new:
+
+* **The class gate gets there first, and this is measured** (`tests/root/driver_lockout.py`
+  section 5). A `SUDO_UID` naming somebody who is not in an administrative group is
+  `access-denied` *before* the counter is consulted, and mints no counter file at all — the same
+  for a uid with no account. So the fresh counters an attacker at euid 0 can mint number one per
+  **administrator of this host**, not one per integer. That bounds the attack; it does not close
+  it, and on a host with a large `sudo` group it barely bounds it.
+* **A second counter that no identity resets: a per-SAFE attempt cap.** `LOCKOUT_SAFE_THRESHOLD`
+  (20) credential attempts per `LOCKOUT_SAFE_WINDOW` (60 s), counting every principal together,
+  reserved in the same locked transaction as the per-principal one. A reservation the cap
+  refuses is given back to the principal, so nobody is charged for an attempt they never made.
+
+  It is a FIXED-WINDOW RATE CAP and not a second lockout, and that difference is what makes it
+  safe to have. Given the per-principal escalation, one bad actor could deny a safe to every
+  operator for fifteen minutes — a worse hazard than the one being closed. A fixed window bounds
+  the denial anyone can cause with it to **one window, 60 s**, whatever they do. A successful
+  unlock clears it as well, which is a deliberate trade recorded in `lockout_reset`'s docstring:
+  somebody just proved they hold the key, so the run of failures was not the campaign the cap
+  exists to stop, and an attacker cannot reach that line.
+
+**Regression tests.** `tests/root/45-lockout-principals.sh` + `driver_lockout.py` — the
+two-principal proof at a real euid 0 through `/srv/jobs`, because `unshare -r` gives a real euid
+0 with a real uid of 0 behind it and cptest cannot escalate at all, so this is the only place
+the defect can be measured properly. It asserts the counter's FILE NAME carries the real uid,
+that B opens the safe with the correct passphrase while A is locked out, **and in the same
+breath that A is still counted** — because "fix it by counting nobody" would pass the first two
+checks and destroy I16. `tests/integration/lockout.py` section D proves the per-safe cap against
+25 synthetic principals: exactly 20 admitted, 5 refused, 25 separate counter files with nobody
+sharing, and the cap lifting when the window expires.
+
+### I41 · PWS3 never got I24's per-save reader check · Sev M · MITIGATED (2026-09-04)
+This was the attack pass's `CRYPTO-02`, and I24 stated in writing that it was fixed. It was not
+— see the CORRECTION in I24, and the UPDATE under it now that it is.
+
+**What it was.** `backends/kdbx.py` `save()` called `_assert_lossless()` **and then
+`_verify_own_output(data)`**, so the reader re-ran on every save. `backends/psafe3.py` `save()`
+called `_ensure_lossless()` and nothing else, and `_ensure_lossless()` short-circuited on
+`self._lossless_checked`, set `True` on its first run and cleared only in `lock()`. So on PWS3
+the I22 round-trip guard ran once per session, exactly as before the remediation.
 
 Reproduced against the real backend on a copy of the committed fixture:
 
@@ -771,28 +941,111 @@ save 2, 5 MiB notes field in the SAME session
    (reader, on stderr: "PWS3 field length 5242880 exceeds the 4194304 byte limit")
 ```
 
-The safe is destroyed, the save reports success, and the reader then blames the operator's
-passphrase — the one answer that will send them to guess again and trip I39/I40 on a safe that is
-broken rather than locked. The previous generation is in the backup ring, so this is recoverable
-data loss.
+The safe was destroyed, the save reported success, and the reader then blamed the operator's
+passphrase — the one answer that sends them to guess again and trip I39/I40 on a safe that is
+broken rather than locked. The previous generation is in the backup ring, so this was
+recoverable data loss.
 
-I23 states the principle this breaks in its own words: *"the read and write limits are now the
+I23 states the principle this broke in its own words: *"the read and write limits are now the
 same number and this program cannot write a file its own reader refuses."* True for KDBX; false
 for PWS3.
 
-**How far it reaches today, measured.** Not through the shipping helper by this route:
-`MAX_REQUEST_BYTES` is 1 MiB and `edit` carries the whole new value, so the frame that would set a
->4 MiB field is refused and the session closes. `serialize()` does still check `MAX_SAFE_BYTES`,
-so the whole-file-too-big route is caught. What is unguarded is the per-field cap, and the only
-thing in the way is a transport limit that exists for an unrelated reason. Any caller that reaches
-the backend directly — a future verb, the agent, a script — has no such limit.
+#### CORRECTION: it was reachable through the shipping `edit` verb, and the 1 MiB cap was not in the way
 
-**Fix shape:** give `Psafe3Backend.save()` and `save_as()` the same `_verify_own_output` treatment
-`KdbxBackend` has, and add the PWS3 twin of
-`test_crypto01_save_refuses_output_it_cannot_read_back`. The absence of that twin is why the
-false claim in I24 survived review.
+This entry previously said, under *"How far it reaches today, measured"*, that the defect did
+not reach the shipping helper by this route because `MAX_REQUEST_BYTES` is 1 MiB and `edit`
+carries the whole new value, so a frame setting a >4 MiB field is refused. **That is true of the
+field the re-gate happened to use and false of the defect.** It was checked again before the fix
+and the conclusion is the opposite one.
 
-### I42 · The live suite's I11 storage check is a false statement · Sev L · OPEN (test defect)
+Field `0x0f`, the password history, is written by the HELPER rather than carried by the caller,
+and it **grows**. Note [12] gives it 255 slots (`PWH_MAX_ENTRIES`) and each slot holds up to
+`PWH_MAX_PASSWORD` = 0xFFFF characters, so the field's ceiling is about 16.7 MB — four times
+`Limits.MAX_FIELD_BYTES` — and it is reached one ordinary `edit` at a time. `password-history`
+is itself a published, editable field name, so one ~90-byte frame turns the history on with the
+format's maximum slot count. Driven through the real `secrets-admin` `open` session against the
+committed fixture:
+
+```
+save 1 (ordinary edit)                 -> {"ok": true}          the I22 latch closes
+edit password-history = "1ff00"        -> accepted              ~90 bytes
+66 x edit password = 65535 chars       -> accepted              65 680 bytes per frame
+save 2                                 -> {"ok": true, "bytes": 4327480}
+unlock, in a FRESH helper process      -> bad-credential
+```
+
+The largest frame in that run was 65 680 bytes — **six per cent** of the cap that was supposed
+to be what stood in the way. The cap prevented nothing. The re-gate's own instinct was the
+right one and its measurement was too narrow: *a defect that is only unreachable by accident
+should be treated as reachable*, and this one was not even that.
+
+**Mitigation, in three parts.**
+
+1. **The guarantee, and it is in `base.py` so a third backend cannot omit it.**
+   `Backend.verify_own_output()` is the shared policy: re-open the bytes about to be written
+   through the reader a later `unlock` uses, compare them against the database that was
+   serialised, and raise `Conflict` with the live file untouched if either step fails. It stands
+   on two format-specific hooks, `read_back()` and `diff_read_back()`, and **both refuse by
+   default** — `verify_structure`'s precedent — so a backend that has not written them cannot
+   save at all rather than saving bytes nothing has checked. `Psafe3Backend` implements both;
+   `save()`, `save_as()` and the module-level `write_file()` all run the check, inside the lock,
+   on the exact bytes, on **every** save. `_ensure_lossless()` stays as the I22 EARLY warning and
+   is no longer the thing standing between a mutation and the disk; its docstring now says so.
+2. **The omission that was left is calling it**, so that is banned too. `_unverified_writes()`
+   in `backends/base.py` parses every module in `backends/` and fails any `save`/`save_as` on a
+   `Backend` subclass that reaches `atomic_replace` without a `*verify_own_output` call in the
+   same function body. It ran red on `psafe3.py:2719` and `psafe3.py:2747` before the fix — the
+   two lines this entry is about — and the self-check plants a forgetful third backend in a
+   temp directory to prove the ban still fires.
+3. **The cause, at the layer the asymmetry lives on.** `_emit_field` now calls
+   `_check_field_length` — the READER's bounds check, the same function, the same constants, the
+   same type-awareness, so an attachment still gets its 32 MiB cap and everything else gets
+   4 MiB. I23's sentence is now true for PWS3 by construction and not only by round trip.
+
+**The misattribution is fixed separately, because it is the part that costs the operator their
+next move.** `_decode()` takes `own_output=True`, which is passed by exactly two callers — the
+pre-write check and the I22 early guard — and does exactly one thing: a structural failure keeps
+its real detail instead of being flattened into `BadCredential`. **I6's oracle is not reopened.**
+The flattening exists to deny a caller who supplies BOTH a file and a passphrase guess any
+per-guess signal; this path takes neither, since the bytes were built by this process from an
+already-authenticated database under a credential it already holds. `unlock()`, `parse_bytes()`
+and `read_file()` never pass the flag and cannot be made to from a request, and the self-check
+asserts that a wrong passphrase and a tampered file still come back as the identical
+`bad-credential` sentence. The difference is not that we relaxed a rule; it is that this file is
+one WE wrote and can verify before handing it over.
+
+**After the fix, the same run:**
+
+```
+save 2  -> {"error": "conflict",
+            "detail": "this database cannot be written: PWS3 field length 4260599
+                       exceeds the 4194304 byte limit"}
+live safe sha256                       -> unchanged, byte for byte
+unlock, in a FRESH helper process      -> opens, 4 entries
+```
+
+Guards, each watched failing with the fix reverted:
+
+* `tests/integration/adversarial.py::crypto02_pws3` — the whole sequence above through the real
+  helper, asserting the `conflict`, that the detail is **not** about a passphrase, that the live
+  file's sha256 is unchanged, and that a fresh helper still opens it. Reverted, six of its checks
+  fail, including *"a fresh helper still opens the safe -> bad-credential"*.
+* `python3 -m backends.psafe3`, *the pre-write reader check (I24, I41)* — the twin this entry
+  existed for. It makes the READER stricter than the writer for the duration of one save
+  (`Limits.MAX_ENTRIES = 0`, a read-side cap `serialize` does not consult, so the asymmetry is
+  genuine rather than a patched-out guard), then asserts the latch HAS closed, the save is
+  refused as `conflict`, the detail is not the bad-credential sentence, the live file is
+  byte-for-byte unchanged, an ordinary save still succeeds, and a wrong passphrase and a
+  tampered file are still indistinguishable.
+* `python3 -m backends.psafe3`, *the write half of the read limit (I23, I41)* — `_emit_field`
+  refuses exactly what `_parse_field_stream` refuses, and an attachment of the same size is
+  still written.
+* `python3 backends/base.py`, *verify_own_output (I24, I41)* — the default hooks refuse, every
+  refusal is a `Conflict` and never `bad-credential`, an unexpected exception contributes its
+  class name and not its value (I15), the ban reports zero offenders, and a planted forgetful
+  backend makes it report one.
+
+### I42 · The live suite's I11 storage check is a false statement · Sev L · FIXED 2026-09-04 (test defect)
 `live-ui.spec.js` item 4 asserts that an unlock added no key to either web-storage area, treating
 a key whose VALUE CHANGED LENGTH as added. The intent is right and the comment says so:
 *"overwriting Cockpit's own key with a passphrase would otherwise slip through a names-only
@@ -814,7 +1067,9 @@ That 235→223 transition is exactly what item 4 flagged. Both live runs of this
 it — in run 1 the key was absent from the baseline and appeared; in run 2 it was present and
 changed length. `secrets.js` contains no `page_status` and two standing gates assert it names no
 browser storage API at all; both PASS. The page is byte-identical (`secrets.js` sha256
-`7f03c81c…`) to the one that scored 140/140.
+`7f03c81c…`) to the one that scored 140/140 in the previous round — and to the one that scored
+131/131 after this entry was fixed, which is the point: no browser-side code changed at any stage
+of this.
 
 Every assertion in item 4 that would catch a real leak passed: no storage key belongs to this
 package, no IndexedDB database was opened, and the passphrase is in neither storage area, no
@@ -825,3 +1080,60 @@ the exact failure this exercise exists to catch, and this assertion should be re
 who is not also reporting on it. **Fix shape:** for a key that changed, ask *inside the page*
 whether the new value contains the passphrase or a marker from this package and return a boolean —
 strictly stronger than a length comparison, which a same-length overwrite already defeats.
+
+**FIXED, 2026-09-04, by the close-out pass — and made STRONGER, not more lenient.** The fix shape
+above is what was built, plus the one thing that keeps an exemption from being leniency in
+disguise.
+
+*What `readStorage` now returns.* Per key, a length **and** `hits`: the LABELS of the probes whose
+text was found in that key's value, computed inside the page. No value ever leaves the browser —
+a helper that returned the values would put every one of them into the suite's memory and into any
+artefact that printed it, which is the hazard rather than a check of it. The probes are the
+passphrase, the password the run revealed, the safe's registry id, and the string
+`cockpit-secrets`.
+
+*The three rules `storageAdded` now applies.* A key that is **new** is reported whatever its name.
+A key that **changed length** is reported unless it is a named host-shell key. And **any** key,
+new or old, exempt or not, whose value now contains a probe is reported — that rule has no
+exemption at all.
+
+*The exemption, named, with its reason in the source.* `HOST_SHELL_KEYS` is exactly
+`["cockpit:page_status"]`, and the comment above it carries the measurement in this entry so a
+later reader can see why it is there without having to find this file. Being on that list buys a
+key **only** the right to change length; it never buys it exemption from the content probes. The
+suite prints the waiver as a note on every run, so a growing exemption shows up in the log rather
+than in silence.
+
+*Why this is strictly stronger than what it replaced,* proved rather than asserted —
+`tests/browser/storage-check.selftest.js` lifts the shipping functions out of `live-ui.spec.js` by
+source extraction (so it cannot drift from them) and runs four scenarios plus two assertions about
+the exemption itself. Two of the four are the ones that matter, and the OLD check got **both**
+wrong:
+
+```
+I42's real scenario, page_status 235 -> 223   new: not flagged   old: FLAGGED   <- the false statement
+same-LENGTH overwrite of page_status
+   with the passphrase                        new: FLAGGED       old: not flagged  <- a real leak the old check MISSED
+a new key written by this package             new: FLAGGED       old: FLAGGED
+a non-tolerated key that changed length       new: FLAGGED       old: FLAGGED
+```
+
+So the repair did not trade correctness for a green number: it removed a false positive and closed
+a false negative in the same change. The self-check needs no browser and runs in `run_tests.sh`,
+which is the point — the live suite cannot run without Cockpit, an account password and a
+registered safe, but the oracle behind its one negative assertion now has a guard that runs
+everywhere.
+
+**Evidence it holds live.** `./tests/browser/run-live.sh`, 2026-09-04, against the installed
+package and this host's real Cockpit: item 4 PASS, **109/109** in `live-ui` and 22/22 in
+`live-access`, exit 0. The same `page_status` transition happened again during the run and appears
+in the log as the tolerated note it now is:
+
+```
+....  host-shell keys that changed and were tolerated by name:
+      ["session.cockpit:page_status 235 -> 223"]  (tolerated list: ["cockpit:page_status"])
+PASS  the unlock added NOTHING to either storage area and wrote nothing of ours into a key
+      that was already there ([] local, [] session, ...)
+PASS  no storage value in either area contains the passphrase, a revealed password, the safe's
+      id or this package's name — the tolerated keys included ([])
+```

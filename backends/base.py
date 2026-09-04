@@ -50,6 +50,7 @@ Run this file directly to execute its self-check:
 """
 
 import abc
+import ast
 import base64
 import binascii
 import ctypes
@@ -2623,6 +2624,129 @@ class Backend(abc.ABC):
 
     # -- persistence -------------------------------------------------------
 
+    # THE PRE-WRITE READER CHECK  (I24, I41).
+    #
+    # A backend's writer and its reader are two different pieces of code with
+    # two different sets of limits, and nothing but discipline keeps them in
+    # step. When they drift, the writer produces a file the reader refuses —
+    # and because the write path reports success and the READ path is the one
+    # that fails, the operator is told the wrong thing about the wrong file at
+    # the wrong time. I24 was that failure on KDBX (an ordinary attachment
+    # produced a database our own `unlock` refused for ever after) and I41 was
+    # the SAME failure on PWS3, still open after I24's fix, because the fix was
+    # written into `backends/kdbx.py` and the rule was never written down
+    # anywhere a second backend had to obey it.
+    #
+    # So it is written down here. `verify_own_output` is the policy — concrete,
+    # shared, and identical for every format. The two hooks it stands on
+    # (`read_back`, `diff_read_back`) are format-specific and BOTH REFUSE BY
+    # DEFAULT, following `verify_structure`'s precedent above: a backend that
+    # has not implemented them cannot save at all, rather than saving bytes
+    # nothing has checked. That is the property I41 asks for — a third backend
+    # must not be able to reproduce this by omission — and a default of "return
+    # None, it is probably fine" would hand the omission straight back.
+    #
+    # The omission that is left is calling it: `save()` and `save_as()` are the
+    # backend's own code and could still walk past this. `_ban_unverified_write`
+    # in the self-check below closes that by parsing every backend module and
+    # refusing any `save`/`save_as` that reaches `atomic_replace` without a
+    # `verify_own_output` call in the same function body.
+
+    def read_back(self, data):
+        """Re-open bytes we are ABOUT TO WRITE, through the SAME reader path a
+        later `unlock()` uses. Returns whatever the reader returns.
+
+        "The same reader" is the whole requirement, and it is why this is a
+        hook rather than a re-run of the MAC. A MAC check proves the bytes are
+        internally consistent; it proves nothing about the caps, the parser and
+        the structural refusals that live DOWNSTREAM of it, and those are where
+        both I24 and I41 actually happened. If `unlock()` would refuse these
+        bytes, this must refuse them too, for the same reason, in the same code.
+
+        Deliberately not abstract and deliberately not a stub that succeeds:
+        the default refuses (`Unsupported`), so a format that has not written
+        this cannot be silently treated as verified. It costs one symmetric
+        decrypt and one parse per save, with no KDF — a save is not a hot path,
+        and the alternative is a safe that is gone.
+
+        **It must not turn a structural failure into a credential failure.**
+        The bytes here were produced by this process from a database it has
+        already authenticated, under a credential it already holds; there is no
+        passphrase in question and no attacker-supplied ciphertext, so the
+        flattened `BadCredential` that I6 requires on the UNLOCK path would here
+        be a lie that sends the operator to doubt their passphrase for a file we
+        broke. I6's oracle is not weakened by that: it exists for a caller who
+        supplies both a file and a guess, and this path takes neither.
+        """
+        raise Unsupported("this format cannot re-read its own output before "
+                          "writing it")
+
+    def diff_read_back(self, probe, expect=None):
+        """What the round trip LOST. Returns a list of operator-safe strings —
+        empty when nothing was lost. Never a value (I15); a field's NAME only.
+
+        `probe` is what `read_back` returned; `expect` is the database the
+        backend serialised, when it has one to offer. This is I22's guarantee
+        stated over THESE bytes rather than over whatever state the database
+        happened to be in at the first mutation — which is exactly the latch
+        that made I41 possible on one backend and I24 possible on the other.
+
+        Refuses by default, for `read_back`'s reason.
+        """
+        raise Unsupported("this format cannot compare its own output against "
+                          "the database it serialised")
+
+    def verify_own_output(self, data, expect=None):
+        """Prove we can READ what we are about to write, BEFORE we write it.
+
+        This is not evidence of format compliance — a writer and a reader that
+        share a bug round-trip perfectly (I19), and the foreign-tool oracle is
+        what tests that. What it IS evidence of is that the bytes about to
+        replace a working database are ones THIS PROGRAM can open again.
+
+        Every refusal is a `Conflict`, never `Internal` and never
+        `BadCredential`:
+
+          * `Conflict` is already the code for "this database cannot be
+            written" (`I22`), the live file is untouched when it is raised, and
+            an operator can act on it by undoing the change that caused it.
+          * `Internal` would say "we do not know what went wrong" about
+            something we know exactly.
+          * `BadCredential` is the misattribution I41 is about. On this path a
+            structural failure means WE built a file we cannot read; answering
+            "the passphrase did not open this safe" sends the operator to
+            re-type a passphrase that was never wrong, and on to I39/I40's
+            lockout, on a safe that is broken rather than locked.
+
+        The detail names what the reader objected to. That is safe here for the
+        reason spelled out in `read_back`: this file is one we wrote and can
+        verify before we hand it over, so there is no guess for it to be an
+        oracle about.
+        """
+        try:
+            probe = self.read_back(data)
+        except Conflict:
+            raise
+        except Unsupported:
+            # The DEFAULT hook above, i.e. a backend that never implemented
+            # this. Left as `unsupported` rather than dressed up as a Conflict
+            # so the omission reads as what it is — "this format has not
+            # written its pre-write check" — instead of as a property of the
+            # operator's data. Either way the save is refused.
+            raise
+        except SecretsError as exc:
+            raise Conflict("the database we built cannot be read back, so it "
+                           "was not written: %s" % exc.detail)
+        except Exception as exc:                        # noqa: BLE001
+            # The class name, never the traceback and never the locals (I15).
+            raise Conflict("the database we built cannot be read back, so it "
+                           "was not written: %s" % type(exc).__name__)
+        lost = self.diff_read_back(probe, expect)
+        if lost:
+            raise Conflict("this database cannot be written without losing "
+                           "data: %s" % "; ".join(list(lost)[:5]))
+        return True
+
     @abc.abstractmethod
     def save(self, *, override_stale=False):
         """Serialize and write the safe durably. The only method that writes.
@@ -2642,10 +2766,15 @@ class Backend(abc.ABC):
           2. Take the `LockFile` for the format; a foreign lock is a `Conflict`
              naming the holder, unless `override_stale` was asked for.
           3. Serialize to bytes in memory.
-          4. `atomic_replace(self.path, data, expect_fingerprint=self.fingerprint,
+          4. `verify_own_output(data, expect)` — re-open those bytes through
+             the reader a later `unlock` uses, EVERY time, and `Conflict` with
+             the live file untouched if they do not come back (I24, I41). Not
+             optional, not cached, not skipped on the second save of a session:
+             the whole of I41 is a guard that ran once and then stopped.
+          5. `atomic_replace(self.path, data, expect_fingerprint=self.fingerprint,
              backup_dir=..., keep=...)` — which re-checks the fingerprint,
              backs up, writes the temp file, fsyncs, replaces, fsyncs the dir.
-          5. Update `self.fingerprint` from the result.
+          6. Update `self.fingerprint` from the result.
 
         Returns `{"ok": True, "backup": str|None, "bytes": int,
         "conflict": False}` — docs/CONTRACT.md's save object. A conflict is
@@ -2680,7 +2809,10 @@ class Backend(abc.ABC):
         The same refusals as `save()` apply for the same reasons: a format we do
         not write (KDBX3, I20) is not made writable by pointing it at a new
         name, and a database that would lose a field on serialisation loses it
-        just as thoroughly into a copy (I22).
+        just as thoroughly into a copy (I22). `verify_own_output` runs here for
+        a SHARPER reason than in `save()`: this file is about to be the only
+        copy of something the operator intends to rely on, and nothing else
+        will ever have checked it.
         """
 
     @abc.abstractmethod
@@ -2701,6 +2833,62 @@ class Backend(abc.ABC):
 # ===========================================================================
 # self-check — runnable proof, not an assertion
 # ===========================================================================
+
+def _unverified_writes(backend_dir=None):
+    """Every `save`/`save_as` in a Backend subclass that writes without verifying.
+
+    Returns a list of `"file:line function"` strings — empty when the invariant
+    holds. Parsed, not grepped, for `tests/ban_os_write.py`'s reason: this file
+    and both backends carry several comments that explain the rule, and a check
+    that fires on its own rationale is a check somebody switches off.
+
+    THE INVARIANT. A method named `save` or `save_as`, on a class that inherits
+    from `Backend`, may not call `atomic_replace` unless the SAME function body
+    also calls something named `verify_own_output`. Nothing else is asserted —
+    not the order, not the arguments — because the point is to catch the
+    omission I41 is made of, and I41 is an omission of the whole call.
+
+    The name is matched by SUFFIX (`*verify_own_output`) rather than exactly:
+    `backends/kdbx.py` implements the identical guarantee as its own private
+    `_verify_own_output`, which predates the shared hook in `Backend` and is
+    where I24's fix actually landed. One suffix, no per-file exemption list —
+    an exemption list is how the second backend gets forgotten again.
+    """
+    import pathlib
+    root = pathlib.Path(backend_dir or os.path.dirname(os.path.abspath(__file__)))
+    offenders = []
+    for src in sorted(root.glob("*.py")):
+        try:
+            tree = ast.parse(src.read_text(encoding="utf-8"), filename=str(src))
+        except SyntaxError as exc:                      # noqa: PERF203
+            offenders.append("%s:%s unparseable (%s)"
+                             % (src.name, exc.lineno, exc.msg))
+            continue
+        for cls in ast.walk(tree):
+            if not isinstance(cls, ast.ClassDef):
+                continue
+            bases = {ast.unparse(b).split(".")[-1] for b in cls.bases}
+            if "Backend" not in bases:
+                continue
+            for fn in cls.body:
+                if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                if fn.name not in ("save", "save_as"):
+                    continue
+                called = set()
+                for node in ast.walk(fn):
+                    if isinstance(node, ast.Call):
+                        f = node.func
+                        called.add(f.attr if isinstance(f, ast.Attribute)
+                                   else getattr(f, "id", ""))
+                if "atomic_replace" not in called:
+                    continue
+                if not any(n.endswith("verify_own_output") for n in called):
+                    offenders.append("%s:%d %s.%s writes without a "
+                                     "verify_own_output call"
+                                     % (src.name, fn.lineno, cls.name, fn.name))
+    return offenders
+
 
 def _selfcheck():                                       # noqa: C901
     """Exercise the load-bearing paths. `python3 backends/base.py` runs this.
@@ -3118,6 +3306,71 @@ def _selfcheck():                                       # noqa: C901
                lambda: backend_for("nope"))
         ok("register_backend registers", backend_for("stub") is _StubBackend)
         ok("known_formats lists it", "stub" in known_formats())
+
+        # ---- the pre-write reader check  (I24, I41) ----------------------
+        # Every assertion here is about the DEFAULT and the POLICY, which is
+        # the half that lives in this file. Each backend proves its own hooks
+        # in its own self-check.
+        print("\n== verify_own_output (I24, I41) ==")
+        raises("a backend that has not implemented read_back cannot save "
+               "unverified", Unsupported,
+               lambda: stub.verify_own_output(b"anything"))
+        raises("...and neither can one that has not implemented the diff",
+               Unsupported,
+               lambda: _ReadsBackFine(
+                   {"id": "s", "path": target}).verify_own_output(b"x"))
+
+        class _Broken(_ReadsBackFine):
+            def read_back(self, data):
+                raise Invalid("PWS3 field length 5242880 exceeds the "
+                              "4194304 byte limit")
+
+        class _Lossy(_ReadsBackFine):
+            def diff_read_back(self, probe, expect=None):
+                return ["entry field notes"]
+
+        class _Surprise(_ReadsBackFine):
+            def read_back(self, data):
+                raise ZeroDivisionError("a value that must not be printed")
+
+        for label, cls in (("a reader refusal", _Broken),
+                           ("a lost field", _Lossy),
+                           ("an unexpected exception", _Surprise)):
+            b = cls({"id": "s", "path": target})
+            try:
+                b.verify_own_output(b"bytes we built")
+            except SecretsError as exc:
+                ok("%s is a Conflict, never bad-credential" % label,
+                   exc.code == "conflict")
+                ok("...and the detail says the file was NOT written" % (),
+                   "not written" in exc.detail or "losing data" in exc.detail)
+                if cls is _Surprise:
+                    ok("...with the class name, not the value",
+                       "ZeroDivisionError" in exc.detail
+                       and "must not be printed" not in exc.detail)
+                if cls is _Broken:
+                    ok("...naming what the reader objected to",
+                       "4194304" in exc.detail)
+            else:
+                ok("%s raises" % label, False)
+        ok("a clean round trip returns True",
+           _ReadsBackFine.diffs_to([]) .verify_own_output(b"ok") is True)
+
+        offenders = _unverified_writes()
+        ok("no backend save/save_as writes without verify_own_output "
+           "(%d offender(s))" % len(offenders), not offenders)
+        for line in offenders:
+            print("        %s" % line)
+        # The negative control: the ban must actually FIRE on the shape it
+        # bans, or "0 offenders" is a statement about the parser, not the code.
+        planted = os.path.join(tmpdir, "backends_probe")
+        os.makedirs(planted, exist_ok=True)
+        with open(os.path.join(planted, "forgetful.py"), "w") as fh:
+            fh.write("class ThirdBackend(Backend):\n"
+                     "    def save(self, *, override_stale=False):\n"
+                     "        atomic_replace(self.path, self._serialize())\n")
+        ok("the ban fires on a backend that forgot",
+           len(_unverified_writes(planted)) == 1)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -3172,6 +3425,21 @@ class _StubBackend(Backend):
     def save_as(self, target_path, *, override_stale=False):
         raise Unsupported("stub")
     def lock(self): return {"ok": True}
+
+
+class _ReadsBackFine(_StubBackend):
+    """A backend whose reader works, to isolate the two halves of the check."""
+
+    _diffs = []
+
+    def read_back(self, data):
+        return {"probe": len(data)}
+
+    @classmethod
+    def diffs_to(cls, diffs):
+        obj = cls({"id": "s", "path": "/nonexistent"})
+        obj.diff_read_back = lambda probe, expect=None: list(diffs)
+        return obj
 
 
 if __name__ == "__main__":

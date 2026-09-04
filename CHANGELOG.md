@@ -5,12 +5,177 @@ carries the current one and `install.sh` prints it.
 
 Two conventions worth knowing before reading an entry:
 
-- Hazard ids (**I1**–**I35**) refer to [`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md).
+- Hazard ids (**I1**–**I42**) refer to [`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md).
   A line that cites one is claiming that hazard is mitigated in this release, not
   that it was thought about.
 - Some components are optional by design and can be absent from a build (the
   unlock agent above all). **`secrets-admin health` is the authority on what a
   given installation actually has** — not this file.
+
+## 0.3.0 — 2026-09-04
+
+**The three defects the re-gate found are closed, and so is the test defect it
+declined to touch.** 0.2.2 was a documentation release that ended with I39, I40
+and I41 recorded OPEN rather than rushed; this is the release that fixes them.
+Two agents did the work, a third integrated it and **re-verified all three
+without taking either report on trust** — which matters, because taking a
+remediation report on trust is exactly how I41 survived 0.2.1.
+
+### Fixed
+
+- **I41 · a PWS3 save could destroy the safe and blame the passphrase.**
+  `backends/psafe3.py`'s `save()` ran only the once-per-session losslessness
+  guard, which latches after the first save. A second save in one session wrote
+  a file the program's own reader then refused, reported `{"ok": true}`, and the
+  next unlock answered `bad-credential` — sending the operator to guess more
+  passphrases at a safe that was broken rather than locked.
+
+  Three changes, and the first is the one that generalises. `Backend.verify_own_output()`
+  in `backends/base.py` is now the **shared** policy — re-open the exact bytes
+  through the reader a later `unlock` uses, diff against the database that was
+  serialised, raise `Conflict` with the live file untouched — and it stands on
+  two hooks that **refuse by default**, so a third backend that has not written
+  them cannot save at all rather than saving unchecked bytes. `_emit_field` now
+  calls `_check_field_length`, the READER's own bounds check with the same
+  type-aware constants, so I23's *"this program cannot write a file its own
+  reader refuses"* is true for PWS3 by construction. And a standing ban
+  (`_unverified_writes`) fails any backend `save`/`save_as` that reaches
+  `atomic_replace` without a verify call in the same body — no per-file
+  exemption list, because an exemption list is how the second backend gets
+  forgotten again.
+
+  Separately, `_decode(own_output=True)` keeps a structural failure's real
+  detail instead of flattening it to `BadCredential`. **I6's oracle is not
+  reopened**: the flattening exists to deny a caller who supplies both a file
+  and a passphrase guess any per-guess signal, and this path takes neither. The
+  flag has exactly two callers, `unlock`/`parse_bytes`/`read_file` never pass it
+  and cannot be made to from a request, and a wrong passphrase and a tampered
+  file still return the identical `bad-credential` sentence.
+
+  **The re-gate's reachability claim was wrong and is corrected rather than
+  quietly dropped.** It recorded that only the 1 MiB request cap stood between
+  this and the shipping `edit` verb. Field `0x0f`, the password history, is
+  written by the helper rather than carried by the caller and grows one ordinary
+  edit at a time; `password-history` is itself a published editable field name.
+  Driven through the real helper, the largest frame needed was **65 680 bytes —
+  six per cent of the cap**. The cap prevented nothing.
+
+- **I39 · the unlock lockout did not survive concurrency.** Fifty guesses fired
+  at once were 34 evaluated against a threshold of 5, and left the counter
+  reading 3. **Three causes, all of which had to change.** Every counter access
+  now goes through `_StateTxn` — `O_RDWR|O_CREAT|O_NOFOLLOW|O_CLOEXEC`, `fstat`
+  on the fd, `flock(LOCK_EX)` held across the read *and* the write. The attempt
+  is **reserved before the KDF** rather than recorded after it, because the race
+  window *was* the derivation and no amount of locking closes that; a wrong
+  passphrase keeps the reservation, an error that never consumed a guess gives
+  it back, a correct one clears it. And `lockout_reset()` zeroes in place instead
+  of unlinking, because `flock` is held on an inode and unlinking hands the next
+  arrival a different one.
+
+  `flock` was chosen over an `O_EXCL` sidecar for **release on death**: this
+  helper is spawned per verb by a browser channel that can vanish mid-derivation,
+  and a killed process drops its `flock` with no reaper. The lock does not become
+  the denial of service: nothing blocking happens while it is held, the wait is
+  bounded by `LOCKOUT_LOCK_SECONDS` (5 s) and **fails closed**, and the counter is
+  a different file per principal. Measured at a real euid 0 with a foreign process
+  holding operator A's counter: A refused in 5.31 s naming the busy counter, B
+  unaffected at 0.87 s, A admitted the moment the lock dropped.
+
+- **I40 · every administrator shared one lockout counter per admin safe.** The
+  counter was named after the **effective** uid, which is 0 for every operator on
+  the admin path, so one clumsy operator's typo refused the safe to everybody else
+  holding the correct passphrase. It is now named after `ident.real_uid`, the human
+  behind the escalation — which is what I16 and `docs/ARCHITECTURE.md` step 6 both
+  already said it was.
+
+  **Keying on the real uid alone would have been theatre**, because an attacker at
+  euid 0 can present a different `SUDO_UID` per attempt. Two things stop that. The
+  class gate gets there first and mints no counter for a uid that is not in an
+  administrative group — measured, so the fresh counters obtainable are one per
+  *administrator of the host*, not one per integer. And a new per-SAFE cap that no
+  identity resets: `LOCKOUT_SAFE_THRESHOLD` (20) attempts per `LOCKOUT_SAFE_WINDOW`
+  (60 s) counting every principal together. It is deliberately a **fixed-window rate
+  cap and not a second lockout** — giving it the per-principal escalation would let
+  one bad actor deny a safe for fifteen minutes, which is worse than the hazard being
+  closed.
+
+- **I42 · the live suite's I11 storage check was a false statement** (a test
+  defect, and the re-gate deliberately left it for somebody who was not also
+  reporting on it). Item 4 treated *a key whose value changed length* as *a key
+  this page added*, and Cockpit's own shell rewrites
+  `sessionStorage["cockpit:page_status"]` while a run is in flight. The length
+  comparison is replaced by an **in-page content probe** returning booleans —
+  no storage value ever leaves the browser — and the exemption is bounded by
+  **name and by content**: `HOST_SHELL_KEYS` is exactly `["cockpit:page_status"]`,
+  documented in the source with the measurement, and being on it buys a key only
+  the right to change length, never exemption from the probe. Strictly stronger,
+  and proved so: of four scenarios the old check got **two wrong** — it fired on
+  the shell's own key and it would have missed a same-length overwrite with the
+  passphrase.
+
+### Added
+
+- `tests/integration/lockout.py` — 56 checks. A sequential control, 50 real
+  helper **processes** fired at once, the reservation give-back, the per-safe cap
+  against 25 synthetic principals, the wedge, and a reach sweep that reads the
+  credential-bearing verbs **out of the `schema` verb**, so a verb added later
+  that takes a passphrase is covered the day it is written. All 20 are covered.
+- `tests/root/45-lockout-principals.sh` + `driver_lockout.py` — 35 checks at a
+  real euid 0 through `/srv/jobs`, registered in `tests/root/run-all.sh`. It
+  asserts B opens the safe while A is locked out **and in the same breath that A
+  is still counted**, because "fix it by counting nobody" would pass the first
+  check and destroy I16.
+- `tests/browser/storage-check.selftest.js` — 6 checks, wired into
+  `run_tests.sh`. It lifts item 4's storage oracle out of `live-ui.spec.js` by
+  source extraction so it cannot drift, pins the four scenarios above, and fails
+  if the tolerated-key list grows.
+- New sections in `adversarial.py` (`crypto02_pws3`, the whole reachable sequence
+  through the real helper) and in both backend self-checks.
+
+### Verification
+
+Every gate green against the final tree, and **every new test was watched failing
+with its fix reverted.**
+
+    ./check.sh              secrets.js syntax OK
+    ./validate.sh           OK — 48 PASS / 0 FAIL, 38 unit tests
+    ./run_tests.sh          OK — 19/19 PASS
+    python3 backends/base.py            131 checks, 0 failure(s)
+    python3 -m backends.psafe3          psafe3 self-check: OK
+    python3 -m backends.kdbx            kdbx self-check: OK
+    agent --selfcheck                    61 checks, 0 failure(s)
+    gen_corpus.py --check                67 cases, 0 disagreed
+    tests/oracle/build.sh                OK  (go1.26.0)
+    integration: flow 86/0  conformance 83/0  properties 27/0  newverbs 220/0
+                 agent_cycle 45/0  adversarial 87/0  lockout 56/0
+                 corpus_vs_helper 67/0
+    tests/root/run-all.sh   all 8 steps exit 0, 0 failures in every step
+    run-live.sh             exit 0 — 131 checks held, 0 FAIL, all ten items
+
+The independent re-verification is in `docs/STRESS-REPORT.md` §8. Its sharpest
+result: with `verify_own_output` deleted from `Psafe3Backend.save` and nothing
+else changed, a probe written for that pass watched the defect reproduce end to
+end — `save() -> {'ok': True}`, the live file rewritten, and a fresh unlock
+answering `bad-credential`.
+
+**Nothing was weakened to get any of this green.** No test, ban, budget or
+threshold was edited.
+
+### Still open, deliberately
+
+- `backends/kdbx.py` satisfies the new ban with its own private
+  `_verify_own_output` rather than the shared policy. Both were measured and both
+  hold; two implementations of one rule is nonetheless the shape that produced
+  I41. Follow-up, `docs/RESIDUAL-RISK.md` §1.4.
+- The ban is **static** — a backend that hid the write behind a helper method
+  would pass it.
+- The per-safe cap has never bitten on a real host: only three uids are in `sudo`
+  here, so the per-principal backoff stops an identity-varying attacker at 3
+  attempts, far short of 20.
+- 20 / 60 s are a judgement, not a measurement. Nobody has attacked those numbers.
+- I35, I36, I37 and I38 are unchanged and still open. So is everything in
+  `docs/RESIDUAL-RISK.md` part 3 — no YubiKey, no foreign `.psafe3`, no
+  KDBX 4 + AES-KDF, the agent has never run as root, real power loss untested.
 
 ## 0.2.2 — 2026-09-04
 

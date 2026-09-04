@@ -43,14 +43,20 @@ one part finding, which is the true ratio.
 
 Sixteen defects were found. Fourteen were fixed and one was argued and left standing with a
 runtime warning; those fifteen were the remediation's scope and all fifteen hold up under
-re-examination. **Three further defects were found or confirmed during this re-gate and are
-open.** One of them — `REGATE-03` — is a defect the remediation states in writing that it
+re-examination. **Three further defects were found or confirmed during this re-gate**, plus one
+test defect. One of them — `REGATE-03` — is a defect the remediation states in writing that it
 fixed, and did not.
+
+**UPDATE, 2026-09-04, the close-out pass (§8).** All four are now closed. REGATE-01/02/03 were
+each re-reproduced before being fixed, and REGATE-04 was fixed by the pass that could report on
+it independently, which is what its entry asked for. The statuses in the table below are as of
+the close-out; §4 keeps each finding's original text, because a report that overwrites what it
+first said is not a record.
 
 | # | Finding | Severity | Status after the re-gate |
 |---|---|---|---|
 | CRYPTO-01 | `save()` wrote a database the plugin could never reopen | High | **FIXED** — I23, I24 |
-| CRYPTO-02 | PWS3's losslessness guard latches; a later save is unchecked | Medium | **OPEN — see REGATE-03** |
+| CRYPTO-02 | PWS3's losslessness guard latches; a later save is unchecked | Medium | **FIXED** — I41, I24 (close-out, §8) |
 | CRYPTO-03 | The hardware-token challenge never rotates | Low | **OPEN, argued** — I35, RESIDUAL-RISK §1 |
 | CRYPTO-04 | Duplicate field types resolved first-wins | Low | **FIXED** — I29 |
 | INPUT-1 | `MAX_ENTRIES` enforced after the parse | Medium | **FIXED** — I25 |
@@ -64,9 +70,9 @@ fixed, and did not.
 | DURABILITY-3 | "This restore is itself undoable" was false | Low | **FIXED** — I33 |
 | DURABILITY-4 | A truncated backup generation was restorable | Low | **FIXED** — I27 |
 | DURABILITY-5 | A directory at the lock path was unrecoverable | Low | **FIXED** — I28 |
-| WEB-01 | The unlock lockout does not survive concurrency | Medium | **OPEN — REGATE-01** |
-| — | The admin lockout counter is shared by all operators | Medium | **OPEN — REGATE-02** |
-| — | The live suite's I11 storage check is a false statement | Low | **OPEN — REGATE-04** |
+| WEB-01 | The unlock lockout does not survive concurrency | Medium | **FIXED** — I39 (close-out, §8) |
+| — | The admin lockout counter is shared by all operators | Medium | **FIXED** — I40 (close-out, §8) |
+| — | The live suite's I11 storage check is a false statement | Low | **FIXED** — I42 (close-out, §8) |
 
 ### Two gaps in the finding numbering, and what happened to each
 
@@ -127,6 +133,11 @@ re-gate; `git status --porcelain` over `tests/` and `validate.sh` is unchanged f
 remediation left.
 
 ### The one gate that is not green
+
+> **CLOSED in the close-out pass (§8.2). The section below is kept as it was written.** The
+> failing assertion was the test defect it says it was; it has since been rewritten to be
+> *correct* rather than lenient, and the live suite now scores **131/131, exit 0, all ten
+> items**. See §8.2 and KNOWN_ISSUES I42.
 
 The live browser walkthrough is **129/130**, not 140/140, and it was 129/130 twice.
 
@@ -194,7 +205,7 @@ sha256 for **every** installed artefact, not only the four that changed. **[re-g
 
 ## 4. The three defects this re-gate found
 
-### REGATE-01 · The unlock lockout does not survive concurrency (was WEB-01) · Sev M · OPEN
+### REGATE-01 · The unlock lockout does not survive concurrency (was WEB-01) · Sev M · FIXED in the close-out (§8)
 
 I16 promises *"a per-(uid, safe id) failure counter … with exponential backoff and a lockout
 threshold"*. The counter is a read-modify-write with no lock: `lockout_fail()` calls
@@ -233,7 +244,7 @@ read-modify-write; or make the counter an append-only file whose length is the c
 
 ---
 
-### REGATE-02 · Every administrator shares one lockout counter per admin safe · Sev M · OPEN
+### REGATE-02 · Every administrator shares one lockout counter per admin safe · Sev M · FIXED in the close-out (§8)
 
 `_lockout_path()` (`secrets-admin:1203`) builds `"fail.%d.%s.json" % (os.geteuid(), safe_id)`.
 On the admin path every operator is euid 0. `ident.real_uid` is available at that point and is
@@ -264,7 +275,7 @@ there is no `SUDO_UID`/`PKEXEC_UID`), and say in I16 which identity is meant.
 
 ---
 
-### REGATE-03 · PWS3 never got CRYPTO-01's per-save reader check (was CRYPTO-02) · Sev M · OPEN
+### REGATE-03 · PWS3 never got CRYPTO-01's per-save reader check (was CRYPTO-02) · Sev M · FIXED in the close-out (§8)
 
 The KDBX save path gained the fix the remediation describes: `backends/kdbx.py` `save()` calls
 `_assert_lossless()` **and then `_verify_own_output(data)`**, and `_verify_own_output` re-opens
@@ -315,7 +326,7 @@ script, the test suite — has no such limit.
 
 ---
 
-### REGATE-04 · The live suite's I11 storage check is a false statement · Sev L · OPEN (test defect)
+### REGATE-04 · The live suite's I11 storage check is a false statement · Sev L · FIXED in the close-out (§8)
 
 `item4`'s difference check flags any key that appeared **or whose value changed length** between
 a baseline snapshot and the post-unlock snapshot. The comment explains why length is included,
@@ -702,3 +713,236 @@ Nothing in this section was tested. It is here so that no reader mistakes an abs
 * Working files from this re-gate (probe scripts, raw logs, timing captures) are under this
   session's scratchpad only. Nothing was written to `/etc`, `/usr` or `/var` except the install
   itself and the throwaway registry entries that were then removed.
+
+**§8.6 below supersedes this section for the state of the host as it stands now.**
+
+---
+
+## 8. The close-out pass, 2026-09-04
+
+The re-gate ended with three defects open (`REGATE-01/02/03`) and one test defect
+(`REGATE-04`), each recorded rather than rushed. This section is the record of closing them.
+Two agents fixed the three product defects; this pass integrated their work, **re-verified all
+three without taking either report on trust**, fixed REGATE-04, reinstalled, re-ran the live
+walkthrough and swept the documents. **[close-out]** marks what was measured here.
+
+### 8.1 The independent verification, and what it found
+
+Taking a fix report on trust is how REGATE-03 survived a remediation in the first place — the
+remediation *said* the PWS3 half was fixed. So each of the three was re-checked with a probe
+written for this pass, not with the fixing agent's own test.
+
+**REGATE-03 / I41 — corrupt the serialisation in flight, and see which layer catches it.**
+The probe replaces the bytes a save is about to write with the same bytes with one byte
+bit-flipped, for **both** backends, and asks whether the save catches it or the next unlock
+does. A corrupt MAC is the cleanest injection because it is what a writer bug looks like from
+the reader's side and it cannot be confused with a bounds check the writer happens to share
+with the reader. **[close-out]**
+
+```
+psafe3   save verdict : Conflict
+         detail       : the database we built cannot be read back, so it was not written:
+                        the HMAC of a file we just built does not verify
+         live file    : UNCHANGED
+         fresh unlock : opens, 4 entries
+kdbx     save verdict : Conflict
+         detail       : this database cannot be written without losing data: the database
+                        could not be re-read after a trial serialisation
+         live file    : UNCHANGED
+         fresh unlock : opens, 6 entries
+```
+
+Then the negative control, which is the half that makes the above mean something. With
+`self.verify_own_output(data, expect)` deleted from `Psafe3Backend.save` — and nothing else
+changed — **the defect reproduced end to end and was watched failing**:
+
+```
+psafe3   save verdict : save() returned {'ok': True, 'bytes': 1544, 'conflict': False}
+         live file    : *** REWRITTEN ***
+         fresh unlock : BadCredential: the passphrase did not open this safe
+```
+
+That is I41's exact shape: a save that reports success, a rewritten file, and a reader that
+blames the operator's passphrase. The line was restored and the probe went green again.
+
+**A methodological note, because the first attempt at that control was invalid.** The probe
+originally worked in `/tmp`, and `atomic_replace` refuses a backup ring under `/tmp` — so the
+reverted run stopped at a *different* guard and printed a `conflict` that had nothing to do with
+the fix. It looked like a pass. The probe was moved to `$XDG_RUNTIME_DIR` and only then did the
+control fail the way it had to. A negative control that stops early is worse than none, because
+it certifies the wrong thing.
+
+**REGATE-01 / I39 — N concurrent guesses must leave the counter reading exactly N.** The
+shipped regression test asserts `counter == attempts evaluated`, which is the right invariant
+but is satisfied at N=1 because the backoff refuses attempts 2..N. To measure the literal
+lost-update property the probe drives a throwaway copy of the helper with
+`LOCKOUT_THRESHOLD`/`LOCKOUT_SAFE_THRESHOLD` raised and `LOCKOUT_BASE_SECONDS` zeroed, so all
+30 attempts are **admitted** and a lost increment is the only thing that can make the counter
+read less than 30. Nothing shipped was modified; the copies live in the scratchpad. Both
+helpers, same hermetic registry, same 30 concurrent processes: **[close-out]**
+
+```
+pre-fix helper (committed HEAD ef44542)
+   outcomes    : {'bad-credential': 30}
+   counters    : {'fail.1000.lab-kdbx41.json': 3}
+   counter sum : 3    <- 27 increments lost
+fixed helper (working tree)
+   outcomes    : {'bad-credential': 30}
+   counters    : {'fail.1000.lab-kdbx41.json': 30}
+   counter sum : 30   <- exact
+```
+
+**REGATE-02 / I40 — two administrators, two counters, at a real euid 0.** `unshare -r` gives a
+real euid 0 with a real uid of 0 behind it, so this one can only be measured through the root
+runner. `tests/root/45-lockout-principals.sh`, submitted to `/srv/jobs`, **35 checks, 0
+failures**, including the three that are the defect itself: **[close-out]**
+
+```
+ok  the counter file names A's REAL uid (1006), not euid 0
+      -> /var/lib/cockpit-secrets/state/fail.1006.zz-throwaway-admin.json
+ok  there is NO euid-keyed counter (the I40 file name)
+ok  operator B, who has typed nothing, opens the safe with the correct passphrase
+ok  A is still inside their own backoff window, correct passphrase and all
+ok  A's counter records exactly the one failure A made
+```
+
+The third and fourth of those have to hold *together*: "fix it by counting nobody" would pass
+the B check and destroy I16.
+
+### 8.2 REGATE-04, fixed by somebody who could report on it
+
+Its own entry asked for that, and this pass is it. The repair is in I42 in full; the short form
+is that a length comparison was replaced by an in-page content probe, and the exemption it
+needed was bounded by name **and** by content rather than by name alone. The proof that it is
+strictly stronger rather than merely quieter is that the old check got two of four scenarios
+wrong and the new one gets none wrong — including a same-length overwrite with the passphrase,
+a real leak the old check could not see. `tests/browser/storage-check.selftest.js` pins that,
+needs no browser, and runs in `run_tests.sh`.
+
+### 8.3 The gates, from a clean state **[close-out]**
+
+Every gate below was run against the final state of the tree, VERSION 0.3.0.
+
+```
+./check.sh                        secrets.js syntax OK
+./validate.sh                     OK — 48 standing bans PASS, 0 FAIL, 38 unit tests OK
+python3 backends/base.py          131 checks, 0 failure(s)
+python3 -m backends.psafe3        psafe3 self-check: OK
+python3 -m backends.kdbx          kdbx self-check: OK
+python3 agent/secrets_agent.py --selfcheck   61 checks, 0 failure(s)
+tests/corpus/gen_corpus.py --check           67 cases, 0 disagreed with their sidecar
+tests/oracle/build.sh             OK  pws3_oracle (3581529 bytes), go1.26.0
+./run_tests.sh                    OK — 19/19 PASS
+
+integration, each run directly:
+   flow 86/0   conformance 83/0   properties 27/0   newverbs 220/0
+   agent_cycle 45/0   adversarial 87/0   lockout 56/0   corpus_vs_helper 67/0
+
+tests/root/run-all.sh (full 10 -> 90, through /srv/jobs, real euid 0):
+   10-install 7/0    20-verify-install 34/0   30-throwaway 11/0   40-admin-allow 98/0
+   45-lockout-principals 35/0   50-user-class 34/0   60-uninstall-reinstall 35/0
+   90-cleanup 14/0                                  all eight steps exit 0
+
+./tests/browser/run-live.sh (installed package, this host's live Cockpit, exit 0):
+   live-ui      109/109 checks held   items 1, 2, 3, 4, 5, 6, 7, 10
+   live-access   22/22  checks held   items 8, 9
+   131 checks held, 0 FAIL, 0 NOT-ATTEMPTED — all ten items
+```
+
+**Nothing was weakened to get any of that green.** The one place a constant is touched anywhere
+in the suite is the psafe3 self-check's `Limits.MAX_ENTRIES = 0` for the duration of one save,
+restored in a `finally` — which *induces* a genuine reader/writer asymmetry rather than removing
+a guard, and is the honest twin of the KDBX test it was modelled on. The probe helpers in §8.1
+are throwaway copies in a scratchpad and are not the shipped gate.
+
+### 8.4 What the host serves, after the close-out **[close-out]**
+
+`tests/root/run-all.sh` reinstalled from the 0.3.0 tree (step 10, then again at step 60), and
+served-versus-source was checked by sha256 for **all eleven** installed artefacts — the four
+package files, the helper, the five backend modules and the registry schema. All eleven match.
+
+```
+/usr/share/cockpit/secrets/secrets.js                 7f03c81c8919baf3260229a17c13e452707c0ec866fa9ecc2e4c397d1082db08
+/usr/local/sbin/secrets-admin                         54d767c0d528ce0281ae1b8944973c01702aabfd6a82a7e8b12b78b80572b469
+/usr/local/lib/cockpit-secrets/backends/base.py       58fd58c9ce8722c77011df9113a24d38bd43dbfe8fa00b04d3c5efd95b44736b
+/usr/local/lib/cockpit-secrets/backends/psafe3.py     1d5e41d5124f805e0751294f632f8a02e05a1c7763d80440b2df4d6375b5645c
+   … and 7 more, all MATCH
+```
+
+`secrets.js` is byte-identical to the page that scored 140/140 before the re-gate, 129/130 in
+the re-gate (the one failure being REGATE-04, a defect in the test) and 131/131 here;
+no browser-side code changed in this round. `cockpit.socket` was never stopped, started or
+reloaded.
+
+### 8.5 What is still open after the close-out
+
+Nothing that was found is left unfixed, and these are the things the close-out could not settle
+rather than chose not to. All are in `docs/RESIDUAL-RISK.md` in full.
+
+* **Two implementations of one save-time rule.** `backends/kdbx.py` satisfies the standing ban
+  with its own private `_verify_own_output` instead of the shared `Backend.verify_own_output`.
+  Both were measured and both hold; two copies of a rule is nonetheless the shape that produced
+  REGATE-03. Follow-up, not a defect. RESIDUAL-RISK §1.4.
+* **The ban is static.** It requires a verify call in the same function body as the write; a
+  backend that hid the write behind a helper method would pass it.
+* **Nobody enumerated the other helper-written fields** that grow across calls the way the PWS3
+  password history does. The per-save check covers the class, so this is a gap in knowledge.
+* **The per-safe rate cap has never bitten on a real host.** Only three uids are in `sudo` here,
+  so the per-principal backoff stops an identity-varying attacker at 3 attempts, far short of
+  the cap of 20 — measured: 60 attempts cycling three uids gave 3 `bad-credential` and 57
+  `locked-out`. The cap is proved at the module boundary against 25 synthetic principals. On a
+  host with a large admin group it is the control that matters and it is untried there.
+* **20 / 60 s are a judgement, not a measurement.** Nobody has attacked those numbers.
+* **Fail-closed on a busy counter** lets somebody who can hold one counter file open deny one
+  principal one safe while they hold it. Deliberate, measured (5.31 s bounded, other principals
+  unaffected), and re-examinable by somebody else.
+* Everything in `docs/RESIDUAL-RISK.md` Part 3 is unchanged: no YubiKey, no foreign PWS3 file,
+  no KDBX 4 + AES-KDF, the agent has never run as root, and real power loss was never tested.
+
+### 8.6 Host state after the close-out **[close-out]**
+
+This supersedes §7.
+
+* **The package installed is the 0.3.0 source**, sha256-verified served-versus-source across all
+  eleven installed artefacts (§8.4). Installed twice during the run — `tests/root/10-install.sh`
+  and again at `60-uninstall-reinstall.sh` — and audited from a **separate** root job each time.
+* **The registry is empty.** `secrets-admin health` → `registry_entries=0, registry_errors=[]`;
+  `secrets-admin list` → *none registered*. `/etc/cockpit-secrets/safes.d` holds only the two
+  shipped `.example` files, which the registry's `*.json` glob does not match.
+* **`/etc/cockpit-secrets/safes/` is empty**, and so are
+  **`/var/lib/cockpit-secrets/state/`** (no lockout counter and no per-safe window left behind)
+  and **`/var/lib/cockpit-secrets/exports/`** — the last of which matters, because a file there
+  is an entire safe in plaintext.
+* **The three live-walkthrough subjects were re-created and destroyed again.** They had to be:
+  `90-cleanup.sh` removed them at the end of the re-gate, and the live suite cannot run without
+  registered safes. Seeded from the **committed fixtures** through `/srv/jobs` (`cs-live-seed`),
+  removed by exact path afterwards (`cs-live-cleanup`), together with their backup rings,
+  `/home/cptestadm/.local/share/cockpit-secrets`, `/home/cptestadm/.local/state/cockpit-secrets`,
+  and a leftover `.plk`.
+* **`cockpit.socket` was never stopped, started or reloaded** — `ActiveEnterTimestamp` is still
+  `Tue 2026-09-01 01:59:08 CDT`, unchanged across every job in this pass.
+* **No `git` write command was run.** `git status --short` shows 19 modified and 4 new files, all
+  of them this round's work.
+* `/var/log/cockpit-secrets/audit.log` is **680 lines, 0600 root:root**, 407 of them naming a
+  throwaway safe that no longer exists. Deliberate: an audit log is not a throwaway safe, and it
+  carries no value, no entry title and no path from a request.
+
+**What remains on the host that this pass did NOT create, and did not remove:**
+
+* `${XDG_RUNTIME_DIR}/cockpit-secrets-live` — 0700, five 0600 files, **used but not created by
+  this pass**; it predates it. It holds two Cockpit test-account passwords and the fixture
+  passphrase that is published in `tests/fixtures/manifest.json` on purpose. It is on tmpfs, so a
+  reboot removes it. Removing it is the operator's call, and doing so means the live suite cannot
+  run again without re-creating it.
+* `tests/browser/artifacts/` — 49 files, **all 0600**, rewritten by this round's live run and
+  git-ignored. Two contain plaintext secret material by design: a screenshot taken deliberately
+  between "Reveal" and the countdown ending, and a decrypted attachment body. Both are the
+  published fixture passphrase, in throwaway safes that no longer exist.
+* Two Cockpit test accounts, `cptestadm` (uid 1007, in `sudo`) and `cptest` (uid 1005, not in
+  `sudo`), plus `cpadmin` (uid 1006). Created by earlier rounds; the root suite needs them.
+* Working files for this pass — the two independent probes and the raw logs — are under this
+  session's scratchpad only. **The throwaway helper copies used for the I39 probe, which had
+  `LOCKOUT_THRESHOLD` and `LOCKOUT_BASE_SECONDS` altered, were deleted**; nothing with a weakened
+  constant in it was left anywhere on this host.
+
+---

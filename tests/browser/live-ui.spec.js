@@ -337,7 +337,10 @@ async function main() {
          * the only honest form of "this page stored nothing" is a difference
          * against what was already there. Everything item 4 and item 5 assert
          * about storage is measured against this snapshot. */
-        const storage0 = await readStorage(frame);
+        /* No probes here: `state.pass` does not exist until item 3. The
+         * baseline only needs the key names and lengths; every probe runs on
+         * the AFTER snapshots, which is where a leak would be. */
+        const storage0 = await readStorage(frame, []);
         console.log("   storage before any unlock: local " +
                     JSON.stringify(Object.keys(storage0.local)) + ", session " +
                     JSON.stringify(Object.keys(storage0.session)));
@@ -688,19 +691,61 @@ async function item3(page, frame, list) {
     return { safe, pass, pwHandle, revealed: shown };
 }
 
-/* Both web-storage areas as {key: valueLENGTH}, plus the cookie NAMES.
+/* Keys the HOST SHELL owns and may write or REWRITE while this suite runs.
  *
- * Lengths and names only. A helper written for an I11 test that returned the
- * values would put every one of them into this suite's own memory and into any
- * artefact that printed it, which is the hazard rather than a check of it. */
-async function readStorage(target) {
-    return target.evaluate(() => {
+ * NAMED, one line of reason each, because an exemption list that grows without
+ * anybody noticing is how an oracle stops being one (docs/KNOWN_ISSUES.md I42).
+ * A changed key that is NOT on this list still fails the check outright, and
+ * every key on it is still content-checked below — being here buys a key
+ * nothing except the right to change LENGTH.
+ *
+ *   cockpit:page_status
+ *       sessionStorage. A Cockpit package page is an iframe on the SHELL's own
+ *       origin, and the shell writes this key on behalf of STOCK pages to
+ *       carry their status line. Measured on this host with this package never
+ *       opened in the browser context: absent after login, present after
+ *       visiting /system naming "updates" and "system/services", and it then
+ *       changes length where it sits — len 235 "Checking for package
+ *       updates..." at t+2 s, len 223 "Security updates available" at t+20 s.
+ *       That 235 -> 223 transition is what the old length comparison flagged,
+ *       on a page that had written nothing. `secrets.js` contains no
+ *       `page_status` and two standing gates in validate.sh assert it names no
+ *       browser storage API at all.
+ *
+ * Nothing else is tolerated. In particular no localStorage key is: every one
+ * measured here (`cockpit:v2-machines.json` and friends) is written once by
+ * the shell before this package loads and does not move afterwards, so a
+ * localStorage key that changes during an unlock is a finding. */
+const HOST_SHELL_KEYS = ["cockpit:page_status"];
+
+/* Both web-storage areas as {key: {len, hits}}, plus the cookie NAMES.
+ *
+ * NO VALUE EVER LEAVES THE PAGE. A helper written for an I11 test that
+ * returned the values would put every one of them into this suite's own memory
+ * and into any artefact that printed it, which is the hazard rather than a
+ * check of it. So the question is asked INSIDE the page and only a boolean
+ * comes back: `hits` is the list of PROBE LABELS whose text was found in that
+ * key's value. `probes` is [{label, text}, ...]; the text is never echoed.
+ *
+ * This is what makes the check correct rather than lenient. A length is a
+ * proxy for "the value changed", and it is wrong in both directions: it fires
+ * on the shell rewriting its own key (I42), and a same-length overwrite of a
+ * shell key with a passphrase defeats it entirely. A content probe fires on
+ * exactly the thing I11 forbids and on nothing else. */
+async function readStorage(target, probes) {
+    return target.evaluate((probeList) => {
         const dump = (s) => {
             const o = {};
             try {
                 for (let i = 0; i < s.length; i++) {
                     const k = s.key(i);
-                    o[k] = String(s.getItem(k) || "").length;
+                    const v = String(s.getItem(k) || "");
+                    o[k] = {
+                        len: v.length,
+                        hits: (probeList || [])
+                                .filter((p) => p.text && v.indexOf(p.text) >= 0)
+                                .map((p) => p.label)
+                    };
                 }
             } catch (e) { /* a storage area the browser refuses is not a leak */ }
             return o;
@@ -711,17 +756,74 @@ async function readStorage(target) {
             cookies: String(document.cookie || "").split(";")
                         .map((c) => c.split("=")[0].trim()).filter(Boolean)
         };
-    });
+    }, probes || []);
 }
 
-/* Which keys appeared between two readStorage() snapshots. A key whose VALUE
- * changed counts too: overwriting Cockpit's own key with a passphrase would
- * otherwise slip through a names-only comparison. */
+/* The probe set: the strings that, found in a storage value, mean THIS package
+ * put them there. The passphrase is the one I11 is actually about; the others
+ * catch a page that cached a safe's contents or its identity instead. Labels
+ * only are ever reported. */
+function storageProbes(state) {
+    const p = [];
+    if (state && state.pass) p.push({ label: "the passphrase", text: state.pass });
+    if (state && state.revealed) p.push({ label: "a revealed password", text: state.revealed });
+    if (state && state.safe && state.safe.id)
+        p.push({ label: "the safe's registry id", text: state.safe.id });
+    p.push({ label: "this package's name", text: "cockpit-secrets" });
+    return p;
+}
+
+/* Which keys this page ADDED or WROTE between two readStorage() snapshots.
+ *
+ * Three rules, and the second is the one I42 was about:
+ *   1. a key that is NEW is reported, whatever its name;
+ *   2. a key that CHANGED is reported unless it is a named host-shell key —
+ *      the shell rewriting its own status line is not this package storing
+ *      something, and pretending otherwise was a false statement;
+ *   3. ANY key, new or old, tolerated or not, whose value now contains one of
+ *      the probes is reported — this rule has no exemption at all, so
+ *      overwriting `cockpit:page_status` with the passphrase is caught even
+ *      though the key is on the list and even if the length is unchanged.
+ * Rule 3 is strictly stronger than what rule 2 gave up. */
 function storageAdded(before, after) {
-    const diff = (b, a) => Object.keys(a).filter(
-        (k) => !Object.prototype.hasOwnProperty.call(b, k) || b[k] !== a[k]);
+    const has = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
+    const diff = (b, a) => Object.keys(a).filter((k) => {
+        const hits = (a[k].hits || []);
+        if (hits.length) return true;                       // rule 3, no exemption
+        if (!has(b, k)) return true;                        // rule 1
+        if (b[k].len === a[k].len) return false;
+        return HOST_SHELL_KEYS.indexOf(k) < 0;              // rule 2
+    });
     return { local: diff(before.local, after.local),
              session: diff(before.session, after.session) };
+}
+
+/* Every probe hit anywhere in either area, as "key: label" strings. Reported
+ * separately from storageAdded() so a failure says WHAT was found and not just
+ * that a key moved. */
+function storageProbeHits(snap) {
+    const out = [];
+    ["local", "session"].forEach((area) => {
+        Object.keys(snap[area]).forEach((k) => {
+            (snap[area][k].hits || []).forEach((h) => out.push(area + "." + k + ": " + h));
+        });
+    });
+    return out;
+}
+
+/* Keys the host shell moved under us, reported as a NOTE so the exemption is
+ * visible in every run's log rather than silent. */
+function storageTolerated(before, after) {
+    const has = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
+    const out = [];
+    ["local", "session"].forEach((area) => {
+        Object.keys(after[area]).forEach((k) => {
+            if (HOST_SHELL_KEYS.indexOf(k) < 0) return;
+            if (!has(before[area], k) || before[area][k].len === after[area][k].len) return;
+            out.push(area + "." + k + " " + before[area][k].len + " -> " + after[area][k].len);
+        });
+    });
+    return out;
 }
 
 function sameKeys(a, b) {
@@ -757,8 +859,9 @@ async function item4(page, frame, state) {
      * fail the first of those, which is the one the old assertion was reaching
      * for and missing. The key names are printed so a reader can see whose
      * they are rather than taking "Cockpit's, not ours" on trust. */
-    const inFrame = await readStorage(frame);
-    const inShell = await readStorage(page);
+    const probes = storageProbes(state);
+    const inFrame = await readStorage(frame, probes);
+    const inShell = await readStorage(page, probes);
     const added = state.storage0 ? storageAdded(state.storage0, inFrame) : null;
     it.note("storage in the plugin frame: local " + JSON.stringify(Object.keys(inFrame.local)) +
             ", session " + JSON.stringify(Object.keys(inFrame.session)));
@@ -768,10 +871,26 @@ async function item4(page, frame, state) {
           "the plugin frame's storage IS Cockpit's — same origin, same keys — so the " +
           "count can never be zero and the question is what THIS page added");
     if (added) {
+        /* The tolerated set is printed on EVERY run, so a reader sees what was
+         * waived and the exemption cannot grow without showing up in the log. */
+        const waived = storageTolerated(state.storage0, inFrame);
+        it.note("host-shell keys that changed and were tolerated by name: " +
+                (waived.length ? JSON.stringify(waived) : "none") +
+                "  (tolerated list: " + JSON.stringify(HOST_SHELL_KEYS) + ")");
         it.ok(!added.local.length && !added.session.length,
-              "the unlock added NOTHING to either storage area (" +
+              "the unlock added NOTHING to either storage area and wrote nothing of " +
+              "ours into a key that was already there (" +
               JSON.stringify(added.local) + " local, " + JSON.stringify(added.session) +
               " session, against the baseline taken before any safe was opened)");
+        /* Stated separately from the diff above, because this is the assertion
+         * I11 is actually made of and it holds against EVERY key including the
+         * tolerated ones — a same-length overwrite of a shell key is caught
+         * here and was not caught by the length comparison this replaced. */
+        const hits = storageProbeHits(inFrame);
+        it.ok(!hits.length,
+              "no storage value in either area contains the passphrase, a revealed " +
+              "password, the safe's id or this package's name — the tolerated keys " +
+              "included (" + JSON.stringify(hits) + ")");
     } else {
         it.note("no pre-unlock storage baseline was captured, so 'added nothing' could not " +
                 "be checked as a difference; the ownership and passphrase checks below stand.");
@@ -925,9 +1044,10 @@ async function item5(ctx, page, frame, state) {
           "…and its box is EMPTY: a reload cannot restore what was never kept");
     /* And the storage areas, at the one moment a "we remembered it" bug would
      * have had to leave something behind to be able to skip this prompt. */
-    const afterReload = await readStorage(frame);
+    const afterReload = await readStorage(frame, storageProbes(state));
     const addedR = state.storage0 ? storageAdded(state.storage0, afterReload)
                                   : { local: [], session: [] };
+    const hitsR = storageProbeHits(afterReload);
     const hitR = await frame.evaluate((needle) => {
         const dump = (s) => {
             let o = "";
@@ -940,11 +1060,12 @@ async function item5(ctx, page, frame, state) {
     }, state.pass);
     /* Against the pre-unlock baseline, not against zero: the areas are
      * Cockpit's own and were never empty (see item 4). */
-    it.ok(!addedR.local.length && !addedR.session.length && !hitR,
-          "nothing was carried across the reload — no storage key appeared or changed " +
-          "since before the first unlock (" + JSON.stringify(addedR.local) + " local, " +
-          JSON.stringify(addedR.session) + " session) and the passphrase is not in either " +
-          "area or in any cookie");
+    it.ok(!addedR.local.length && !addedR.session.length && !hitR && !hitsR.length,
+          "nothing was carried across the reload — no storage key appeared, and none " +
+          "changed except a named host-shell key carrying nothing of ours (" +
+          JSON.stringify(addedR.local) + " local, " + JSON.stringify(addedR.session) +
+          " session, probe hits " + JSON.stringify(hitsR) + ") and the passphrase is not " +
+          "in either area or in any cookie");
     it.shot(await H.shot(page, "05-prompted-after-reload"));
     await frame.locator('.sec-modal button:text-is("Cancel")').last().click();
 
@@ -967,9 +1088,10 @@ async function item5(ctx, page, frame, state) {
               "the fresh tab demands the passphrase for the same safe");
         it.ok((await box2.inputValue()) === "",
               "…and its box is EMPTY too — the first tab's unlock bought it nothing");
-        const s2 = await readStorage(f2);
+        const s2 = await readStorage(f2, storageProbes(state));
         const added2 = state.storage0 ? storageAdded(state.storage0, s2)
                                       : { local: [], session: [] };
+        const hits2 = storageProbeHits(s2);
         const hit2 = await f2.evaluate((needle) => {
             const dump = (s) => {
                 let o = "";
@@ -984,10 +1106,11 @@ async function item5(ctx, page, frame, state) {
         /* sessionStorage is per-TAB, localStorage is per-origin — so this tab
          * genuinely could have read anything the first one left in the shared
          * area, and it found nothing to read. */
-        it.ok(!added2.local.length && !added2.session.length && !hit2,
+        it.ok(!added2.local.length && !added2.session.length && !hit2 && !hits2.length,
               "the fresh tab sees no key this session added (" + JSON.stringify(added2.local) +
-              " local, " + JSON.stringify(added2.session) + " session) and neither its " +
-              "storage nor its DOM holds the passphrase");
+              " local, " + JSON.stringify(added2.session) + " session, probe hits " +
+              JSON.stringify(hits2) + ") and neither its storage nor its DOM holds the " +
+              "passphrase");
         it.shot(await H.shot(tab2, "05-prompted-fresh-tab"));
         await f2.locator('.sec-modal button:text-is("Cancel")').last().click();
     } finally {

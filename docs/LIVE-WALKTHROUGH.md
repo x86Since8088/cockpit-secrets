@@ -52,6 +52,39 @@ reloads `cockpit.socket`.** Cockpit is a live system service on this host.
     live-access   22/22  checks held   items 8, 9
     140 PASS, 0 FAIL, 0 NOT-ATTEMPTED
 
+> **RE-RUN, 2026-09-04, after the close-out pass.** Same host, same installed package
+> (`secrets.js` sha256 `7f03c81c…`, byte-identical — no browser-side code changed), rebuilt
+> subjects, exit 0:
+>
+>     live-ui      109/109 checks held   items 1, 2, 3, 4, 5, 6, 7, 10
+>     live-access   22/22  checks held   items 8, 9
+>     131 checks held, 0 FAIL, 0 NOT-ATTEMPTED
+>
+> The check count moved because **item 4's I11 assertion was rewritten**, not because the page
+> did. The version of item 4 that produced the 108 above treated *a key whose value changed
+> length* as *a key this page added* — and Cockpit's own shell rewrites
+> `sessionStorage["cockpit:page_status"]` while a run is in flight, so the assertion was a false
+> statement that happened to be passing (KNOWN_ISSUES **I42**). It now asks, inside the page,
+> whether a key's value contains the passphrase, a revealed password, the safe's id or this
+> package's name, and returns a boolean; a named list of exactly one host-shell key
+> (`cockpit:page_status`) may change LENGTH and nothing is ever exempt from the content probe.
+> That is strictly stronger: the old check both fired on the shell's own key **and** would have
+> missed a same-length overwrite with the passphrase.
+>
+> The same transition happened again during the re-run and now appears as the note it is:
+>
+>     ....  host-shell keys that changed and were tolerated by name:
+>           ["session.cockpit:page_status 235 -> 223"]  (tolerated list: ["cockpit:page_status"])
+>     PASS  the unlock added NOTHING to either storage area and wrote nothing of ours into
+>           a key that was already there
+>     PASS  no storage value in either area contains the passphrase, a revealed password,
+>           the safe's id or this package's name — the tolerated keys included ([])
+>
+> `tests/browser/storage-check.selftest.js` pins that logic without needing a browser and runs in
+> `run_tests.sh`, so the one negative assertion in this suite now has a guard that runs
+> everywhere. The subjects were rebuilt from the committed fixtures for the re-run and destroyed
+> again afterwards.
+
 **All ten items pass.** Six of them had never run at all before this round —
 items 3, 4, 5, 6, 7 and the keyboard half of 10 — and item 9 had run once and
 failed. Getting there took one fix in `secrets.js` (the page promised an
