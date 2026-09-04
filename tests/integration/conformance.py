@@ -6,11 +6,22 @@ other, and to what the `schema` verb declares. The two backends were written by
 authors who never saw each other's code, against the same prose contract, so
 this is where a key that quietly means two different things shows up.
 
-Two divergences are legitimate and are asserted as such rather than ignored:
-`reveal.resolved_field` appears only when the backend's own name for a field
-differs from the requested one, and `group-add` returns a `uuid` on KDBX because
-KeePass groups have one and PWS3 groups do not. Both are supersets of the
-contract shape. Anything else that differs is drift.
+Three divergences are legitimate and are named in `ALLOWED_EXTRA` with their
+reasons rather than ignored: `reveal.resolved_field` appears only when the
+backend's own name for a field differs from the requested one; `group-add`
+returns a `uuid` on KDBX because KeePass groups have one and PWS3 groups do not;
+and `probe.yubikey` appears only on KDBX because only KDBX4 can carry a hardware
+key. All three are supersets of the contract shape. Anything else that differs
+is drift.
+
+Two things are compared besides the shapes, and both were added after they
+caught something:
+
+  * **the error CODE for an identical bad request.** A duplicate attachment name
+    answered `conflict` on KDBX and `unsupported` on PWS3 — one operator mistake,
+    two codes, and only one of them named the fix.
+  * **the declaration against a real call.** `breach-check` declared three keys
+    it correctly does not return when no corpus is configured.
 """
 import json
 import os
@@ -27,9 +38,25 @@ ALLOWED_EXTRA = {
     ("group-add", "uuid"):
         "KeePass groups have a uuid; a PWS3 group IS its '.'-delimited path, so "
         "there is no second identifier to return.",
+    ("probe", "yubikey"):
+        "KdbxBackend.probe() publishes a `yubikey` object (slot, algorithm and "
+        "the 64-byte challenge from the KDF seed) because KDBX4 can carry a "
+        "hardware key; PWS3 cannot, so it has nothing to put there. This is "
+        "allowed ONLY because the helper flattens it: `needs_challenge` and a "
+        "top-level `challenge_b64` are present on BOTH, which is what the page "
+        "actually reads. That normalisation is asserted below rather than "
+        "assumed, because without it this exemption would be hiding a real "
+        "difference instead of naming a superset.",
 }
 
 SHAPES = {}
+
+#: label -> {fmt: error code}. The SAME bad request on both backends must draw
+#: the same code out of docs/CONTRACT.md's taxonomy. The detail sentence may
+#: and should differ — it names the format's own reason — but a UI branches on
+#: the code, and a code that means "impossible here" on one backend and
+#: "already done" on the other sends the operator two different ways.
+ERRORS = {}
 
 
 def record(fmt, verb, out):
@@ -39,6 +66,15 @@ def record(fmt, verb, out):
 def exercise(env, r, safe, fmt):
     r.section("%s (%s)" % (safe, fmt))
     env.reset_safes()
+    # `probe` is the no-credential verb the page reads before it draws the
+    # unlock dialog, and the two backends do NOT return the same thing:
+    # `KdbxBackend.probe()` carries a `yubikey` object and `Psafe3Backend`'s
+    # does not. The helper normalises that into `needs_challenge` and a
+    # top-level `challenge_b64`, and the page reads the normalised keys — so
+    # the normalisation is load-bearing and belongs in the drift detector
+    # rather than in a comment saying it was handled.
+    record(fmt, "probe", env.run("probe", {"safe": safe})[0])
+
     s = Session(env)
     u = s.call("unlock", safe=safe, password=PW)
     record(fmt, "unlock", u)
@@ -87,10 +123,48 @@ def exercise(env, r, safe, fmt):
            s.call("group-mv", handle=h, uuid=(newg or {}).get("uuid"),
                   parent=root or None))
     record(fmt, "rm", s.call("rm", handle=h, uuid=a["uuid"], permanent=True))
+
+    # --- the verbs added after the first build --------------------------
+    # Shapes only; behaviour lives in newverbs.py. The point here is that the
+    # two backends answer the same KEYS and, for an identical bad request, the
+    # same ERROR CODE — which is where the second wave drifted: a duplicate
+    # attachment name was `conflict` on KDBX and `unsupported` on PWS3, so the
+    # same operator mistake produced two different sentences and only one of
+    # them named the fix.
+    target = router or e["entries"][0]
+    tu = target["uuid"]
+    record(fmt, "history", s.call("history", handle=h, uuid=tu))
+    record(fmt, "attach-add",
+           s.call("attach-add", handle=h, uuid=tu, name="conform.bin",
+                  data_b64="Y29uZm9ybQ=="))
+    record(fmt, "attach-get",
+           s.call("attach-get", handle=h, uuid=tu, name="conform.bin"))
+    ERRORS.setdefault("attach-add duplicate name", {})[fmt] = \
+        s.call("attach-add", handle=h, uuid=tu, name="conform.bin",
+               data_b64="Y29uZm9ybQ==").get("error")
+    ERRORS.setdefault("attach-get unknown name", {})[fmt] = \
+        s.call("attach-get", handle=h, uuid=tu, name="nope.bin").get("error")
+    ERRORS.setdefault("attach-rm unknown name", {})[fmt] = \
+        s.call("attach-rm", handle=h, uuid=tu, name="nope.bin").get("error")
+    ERRORS.setdefault("history-restore past the end", {})[fmt] = \
+        s.call("history-restore", handle=h, uuid=tu, index=9999).get("error")
+    ERRORS.setdefault("save-as with a path for a name", {})[fmt] = \
+        s.call("save-as", handle=h, name="../escape.db").get("error")
+    ERRORS.setdefault("restore-backup unlisted name", {})[fmt] = \
+        env.run("restore-backup",
+                {"safe": safe, "name": "../../etc/passwd"})[0].get("error")
+    record(fmt, "attach-rm",
+           s.call("attach-rm", handle=h, uuid=tu, name="conform.bin"))
+    record(fmt, "save-as", s.call("save-as", handle=h, name="conform-%s.out"
+                                  % fmt))
     record(fmt, "save", s.call("save", handle=h))
     record(fmt, "lock", s.call("lock", handle=h))
     _rest, _err, rc = s.close()
     r.check("the session exits 0", rc == 0, "rc=%d" % rc)
+
+    record(fmt, "backups", env.run("backups", {"safe": safe})[0])
+    record(fmt, "breach-check",
+           env.run("breach-check", {"safe": safe, "value": "x"})[0])
 
 
 def main():
@@ -118,6 +192,20 @@ def main():
                                   % sorted(k for (_v, k) in extra)),
                     not unexplained,
                     "unexplained: %s" % unexplained if unexplained else "")
+
+        r.section("probe is normalised across the backend asymmetry")
+        for fmt in ("kdbx", "psafe3"):
+            keys = set(SHAPES["probe"][fmt])
+            r.check("%-6s probe answers the normalised hardware-key keys" % fmt,
+                    {"needs_challenge", "yubikey_slot"} <= keys,
+                    sorted(keys))
+
+        r.section("the same bad request draws the same error code")
+        for label in sorted(ERRORS):
+            got = ERRORS[label]
+            r.check("%-34s %s" % (label, got.get("kdbx")),
+                    len(got) == 2 and got.get("kdbx") == got.get("psafe3"),
+                    got if got.get("kdbx") != got.get("psafe3") else "")
 
         r.section("every key the schema declares is actually returned")
         for verb in sorted(SHAPES):

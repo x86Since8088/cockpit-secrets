@@ -97,7 +97,9 @@ and a logout/login picks up the menu entry.
 | `/etc/cockpit-secrets/safes/` | `0700 root:root` | admin-class safe files, `0600 root:root` |
 | `/var/log/cockpit-secrets/` | `0700 root:root` | `audit.log` — metadata only, never a value |
 | `/var/lib/cockpit-secrets/state/` | `0700 root:root` | per-(uid, safe) unlock-failure counters |
+| `/var/lib/cockpit-secrets/exports/` | `0700 root:root` | where `export` writes, `0600` — an entire safe in plaintext |
 | `/usr/local/lib/systemd/user/secrets-agent.*` | `0644` | `--with-agent` only, and never enabled by the installer |
+| `/usr/local/lib/systemd/system/secrets-agent@.*` | `0644` | the admin-class template — installed, never enabled |
 
 `secrets-admin` finds its Python packages in the directory holding the script
 (the repo layout, where `backends/` and `schema/` sit beside it) and otherwise
@@ -131,6 +133,8 @@ or they do not exist at all. That outside is
   "yubikey_slot": null,
   "agent": { "enabled": false, "idle_seconds": 300, "max_seconds": 3600 },
   "export_allowed": false,
+  "export_dir": null,
+  "breach_corpus": null,
   "backup": { "keep": 10, "dir": null }
 }
 ```
@@ -182,6 +186,12 @@ setting. Two opt-in exceptions exist and both are visible: a single long-lived
 helper for one multi-step editing session, and the per-safe agent (off by
 default, hard idle and absolute timeouts, a persistent banner while it holds
 anything).
+
+The agent is a narrower exception than it sounds. It holds a **ticket, not a
+key** — a uid-bound note that a safe was unlocked, with both deadlines running
+and nothing in it that could reopen the safe — so even with it on, the
+passphrase is prompted on every unlock. What it buys is that the unlock is
+visible and revocable, not that you are asked less often.
 
 **The passphrase never becomes an argument.** Not `argv`, not the environment,
 not a temp file — `/proc/<pid>/cmdline` and `/proc/<pid>/environ` are readable by

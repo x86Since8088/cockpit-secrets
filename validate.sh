@@ -134,6 +134,73 @@ if compgen -G "backends/*.py" >/dev/null && grep -rqs 'def save' backends/; then
     else fail "I12 a save path exists with no os.replace (non-atomic write)"; fi
 else skip "I12 no save path yet"; fi
 
+# ---- bans added with the second wave of verbs -----------------------------
+
+# I21 — AN EXPORT MAY NEVER LAND ON A PATH FROM THE REQUEST. `_write_export`
+# is the one function that creates an export file; its destination must come
+# from `export_dir_for(entry)`, which reads the REGISTRY. A call with any other
+# first argument is the whole exfiltration hazard back in one line, so the call
+# site is pinned rather than the intent described. `urllib.parse` is NOT in the
+# network ban below for the same reason this is a call-site check and not a
+# name check: it is what builds `otpauth://` URIs and opens nothing.
+if [[ -f secrets-admin ]]; then
+    if grep -n '_write_export(' secrets-admin \
+        | grep -v '^[0-9]*:def _write_export(' \
+        | grep -qv '_write_export(export_dir_for('; then
+        fail "I21 an export is written to a directory that is not export_dir_for(entry)"
+        grep -n '_write_export(' secrets-admin | sed 's/^/        /' | head -5
+    else pass "I21 exports are written only to the registry's export_dir"; fi
+else skip "I21 secrets-admin not written yet"; fi
+
+# I21's sibling — THE HELPER HAS NO NETWORK CLIENT. `breach-check` answers from
+# an operator-supplied local corpus or says it cannot; a Cockpit page that
+# phones a third party about the passwords it is holding is precisely what this
+# project must not become. The agent's AF_UNIX socket is not covered by these
+# names, which is why they are the network-capable ones specifically rather
+# than `socket` wholesale.
+ban '\b(urllib\.request|urllib\.error|http\.client|httplib|requests\.(get|post|put)|socket\.create_connection|AF_INET|getaddrinfo|smtplib|ftplib|xmlrpc)\b' \
+    secrets-admin backends backends/*.py agent/*.py \
+    -- "I21 no network client anywhere in the helper, backends or agent"
+
+# I4 — NO VERB TAKES A FILESYSTEM PATH. `save-as` and `restore-backup` take a
+# bare NAME; a field named `path`/`dir`/`dest` in a verb's request would be the
+# I4 hazard re-entering through the schema, where it would look like a feature.
+# Asked of the live schema rather than the source, because the schema is what
+# the browser builds its forms from.
+if [[ -x secrets-admin ]]; then
+    if COCKPIT_SECRETS_ETC=/nonexistent ./secrets-admin schema 2>/dev/null \
+       | python3 -c "
+import json, sys
+BAD = {'path', 'dir', 'dest', 'destination', 'target_path', 'filename', 'file'}
+d = json.load(sys.stdin)
+bad = [(v['id'], f) for v in d['verbs'] for f in v.get('request') or []
+       if f in BAD]
+if bad:
+    print(bad, file=sys.stderr)
+    sys.exit(1)
+"; then pass "I4 no verb declares a filesystem path as a request field"
+    else fail "I4 a verb declares a path-shaped request field"; fi
+else skip "I4 secrets-admin not executable yet"; fi
+
+# Not a KNOWN_ISSUES hazard, just a trap that cost real time: a stray NUL byte
+# in a source file parses fine, passes both gates, and makes grep treat the
+# file as binary — so every ban above it silently stops matching. A ban that
+# can be switched off by a typo is not a ban.
+#
+# `-a` IS LOAD-BEARING. Without it grep detects the NUL, decides the file is
+# binary, and skips it — so the check for the byte is disabled by the byte,
+# which is the same failure one level down. Written out because it looks like
+# a redundant flag and deleting it would leave a check that always passes.
+if compgen -G "*.js" >/dev/null; then
+    nul=$(grep -rlaP '\x00' --include='*.js' --include='*.py' --include='*.sh' \
+              --include='*.json' --include='*.html' --include='*.css' \
+              . 2>/dev/null | grep -v '^\./\.git' | head -5)
+    if [[ -n $nul ]]; then
+        fail "a source file contains a NUL byte (grep will treat it as binary)"
+        printf '%s\n' "$nul" | sed 's/^/        /'
+    else pass "no source file contains a NUL byte"; fi
+else skip "no sources to scan for NUL bytes"; fi
+
 # ------------------------------------------------------------ unit tests ----
 head_ "Unit tests"
 if compgen -G "tests/test_*.py" >/dev/null; then

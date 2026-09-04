@@ -13,10 +13,14 @@
 #   * anything needing root. The admin access class is only ever exercised from
 #     the refusing side; euid 0 needs the /srv/jobs runner. Stated in the
 #     summary rather than skipped silently.
-#   * the Playwright browser drivers. They need a chromium and a node_modules
-#     that are not part of this package; the summary says so.
 #   * `tests/fixtures/gen_fixtures.sh --build --force`, which REWRITES the
 #     committed fixtures. The verify-only form runs.
+#
+# The Playwright browser driver IS here now (`tests/browser/ui.spec.js`). It
+# needs a chromium and a node_modules that are not part of this package, so it
+# resolves them from the host and reports a SKIP with the reason when it cannot
+# find them — the one stage that is allowed to decide for itself whether it can
+# run.
 #
 # No `set -x` anywhere: /srv/jobs logs are group-readable and a traced shell
 # prints every argument (I15).
@@ -28,8 +32,8 @@ QUICK=0
 for arg in "$@"; do
     case "$arg" in
         --quick) QUICK=1 ;;
-        --list)  sed -n 's/^run  *"\([^"]*\)".*/  \1/p' "$0"; exit 0 ;;
-        -h|--help) sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --list)  sed -n 's/^[[:space:]]*run  *"\([^"]*\)".*/  \1/p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) printf 'run_tests.sh: unknown option %s\n' "$arg" >&2; exit 2 ;;
     esac
 done
@@ -62,6 +66,8 @@ run "javascript syntax (check.sh)"             60 ./check.sh
 # ------------------------------------------------- the unit self-checks ----
 run "backends/base.py self-check"             180 python3 backends/base.py
 run "backends/psafe3 self-check"              180 python3 -m backends.psafe3
+run "backends/kdbx self-check"                180 python3 -m backends.kdbx
+run "agent self-check"                        180 python3 agent/secrets_agent.py --selfcheck
 run "twofish ECB vectors, both providers"     180 python3 - <<'PY'
 import binascii, json, sys
 sys.path.insert(0, ".")
@@ -92,6 +98,10 @@ run "integration: cross-backend conformance"   300 \
     python3 tests/integration/conformance.py
 run "integration: load-bearing properties"     600 \
     python3 tests/integration/properties.py
+run "integration: the second-wave verbs"       900 \
+    python3 tests/integration/newverbs.py
+run "integration: the unlock agent, end to end" 300 \
+    python3 tests/integration/agent_cycle.py
 
 if ((QUICK)); then
     skip "integration: corpus vs the helper" "--quick"
@@ -119,6 +129,18 @@ else
              "keepassxc-cli is not installed (it is the TEST-ONLY oracle; it "\
 "must never appear in a runtime path)"
     fi
+    # The page's own driver. It resolves Playwright from $PLAYWRIGHT_PATH, the
+    # normal module path, or this host's shared copy, and SKIPS with a stated
+    # reason if it finds none — so on a machine without one it reports that it
+    # did not run rather than passing. That is why it is a `run` and not
+    # guarded by a `command -v` here: the script itself is the better judge of
+    # whether it can run, and it says so.
+    if command -v node >/dev/null 2>&1; then
+        run "ui: headless browser driver"       600 \
+            node tests/browser/ui.spec.js
+    else
+        skip "ui: headless browser driver" "node is not installed"
+    fi
 fi
 
 # ------------------------------------------------------------- summary -----
@@ -134,11 +156,16 @@ done
 cat <<'EOF'
 
 Not covered by this script, and not claimed to be:
-  * euid 0 / the admin access class from the ALLOWED side. Everything here runs
-    unescalated, so `access: "admin"` is only ever proved to REFUSE. Use the
-    /srv/jobs runner for the other half.
-  * the page under a real Cockpit bridge. The browser drivers stub
+  * the admin access class against a ROOT-OWNED registry. newverbs.py does run
+    the export allow-path at a real euid 0, inside `unshare --map-root-user`,
+    which exercises the euid-0 branch of gate() for real — but inside that
+    namespace the caller's REAL uid is 0 too, so the SUDO_UID/group-membership
+    branch is correctly skipped rather than tested. That half, and a registry
+    genuinely owned by root, need the /srv/jobs runner.
+  * the page under a real Cockpit bridge. The browser driver stubs
     cockpit.spawn, so `superuser: "require"` has never been exercised for real.
+  * a real YubiKey. The challenge/response arithmetic has unit vectors; no
+    token has ever answered one.
   * a .psafe3 written by the actual Password Safe GUI. There is no Password
     Safe CLI packaged on this host, so I19 stays partially open for PWS3 —
     tests/fixtures/README.md has the table of what does and does not

@@ -234,16 +234,29 @@ Everyone holding an unlocked handle for that safe will get `conflict` or
 
 ## 5 · The agent, and why you probably should not
 
-`secrets-agent` (I18) holds an unlocked safe behind an `AF_UNIX` socket so
-several operations share one passphrase prompt. It is **off by default, opt-in
-per safe**, and it should stay off on almost every safe.
+`secrets-agent` (I18) keeps a record of an unlocked safe behind an `AF_UNIX`
+socket. It is **off by default, opt-in per safe**, and it should stay off on
+almost every safe.
 
-Enabling it recreates precisely the property this project exists not to have: a
-safe that is open when nobody is looking at it. The default configuration
-prompts every time not because a setting says so but because one browser call
-runs one short-lived helper for one operation and there is nowhere for a key to
-survive. Turning the agent on replaces a structural guarantee with a promise
-enforced by timers.
+**READ THIS BEFORE YOU DECIDE: the agent does NOT stop the passphrase being
+asked for.** As shipped it holds a *ticket* — a uid-bound note that safe X was
+unlocked at time T, with both deadlines running — and no key material at all.
+It cannot hand a later helper process an unlocked database, because it does not
+have one. So enabling it does not buy fewer prompts.
+
+What it buys is the thing that is genuinely hard without it: an unlock you can
+**see** and **revoke**. Without the agent, a safe unlocked in one browser call
+is already locked by the time the next one starts, and there is nothing to show
+or to cancel — which is fine, and is why the default is off. With it, the page
+can show "unlocked — N s remaining" from a number the helper did not invent,
+that number survives a page reload, and a Lock button can revoke the hold for
+every process at once. If your reason for wanting the agent was "stop asking
+me", it will not do that and you should leave it off.
+
+The cost is still real and still worth stating: an unlock now leaves a trace
+outside the process that made it, bounded by timers rather than by the process
+model, and every future "convenience" patch to that daemon is a patch to the
+one component that could turn a ticket into a key.
 
 If you enable it anyway, know exactly what you are buying:
 
@@ -257,7 +270,13 @@ If you enable it anyway, know exactly what you are buying:
   as a service.
 - `max_seconds` is absolute and no amount of activity extends it.
 - The handle is bound by `SO_PEERCRED` to the uid that created it; another uid
-  gets `access-denied`.
+  gets `access-denied` — the same answer an unknown handle gets, so the socket
+  cannot be used to enumerate which handles exist.
+- For an `access: "admin"` safe the helper runs as root, so `SO_PEERCRED` sees
+  uid 0 for every operator and cannot tell two administrators apart. The
+  separation there is **one agent instance per operator** behind a 0700 run
+  directory (`secrets-agent@<uid>`), which `install.sh --with-agent` installs
+  into the system unit directory and deliberately does not enable.
 - While the agent holds anything the page shows a persistent "unlocked — N s
   remaining" banner with a Lock button. **An unlocked safe must never be
   invisible.** If you ever see the agent holding a safe with no banner, that is a
@@ -405,7 +424,18 @@ is the one operation that undoes everything else in this document. So:
 - It is **admin-only**. A non-admin caller is refused even on a safe that allows
   it, and even on a `user`-class safe.
 - The destination is an **operator-configured directory**, never a path from the
-  request (I4), and the file is written `0600`.
+  request (I4), and the file is written `0600` into a `0700` directory. It is
+  `export_dir` from the registry entry, or `/var/lib/cockpit-secrets/exports`
+  which `install.sh` creates. `export_dir` must be absolute, free of `..`, and
+  is refused under `/tmp`, `/var/tmp` or `/dev/shm`; setting it while
+  `export_allowed` is false is refused outright rather than ignored, because the
+  two are one decision.
+- The **file name is minted by the helper** — `<safe id>-<UTC stamp>.<ext>` —
+  and the request has no say in it.
+- The request must carry the exact token **`export-plaintext:<safe id>`**,
+  compared in constant time. The token names the safe, so a confirmation an
+  operator gave for a throwaway safe cannot be replayed against the
+  domain-administrator one.
 - Every export is **audited by file name** — the audit line names what was
   written and where, never what was in it.
 - The page asks for an explicit confirmation that says, in plain words, what is

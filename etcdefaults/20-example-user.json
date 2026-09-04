@@ -16,6 +16,8 @@
     "max_seconds": 3600
   },
   "export_allowed": false,
+  "export_dir": null,
+  "breach_corpus": null,
   "backup": {
     "keep": 10,
     "dir": null

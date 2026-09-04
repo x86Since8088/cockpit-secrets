@@ -169,10 +169,21 @@ property visible:
    socket in a `0700` per-user run dir, peer identity from `SO_PEERCRED`, handle
    bound to the creating uid, a hard idle timeout *and* an absolute lifetime
    neither of which any client can extend, and a persistent "unlocked — N s
-   remaining" banner in the UI. An unlocked safe must never be invisible. This is
-   the one place the project rebuilds the thing it exists to avoid, which is why
-   it is per-safe, defaults off, and Task 7 is allowed to drop it entirely rather
-   than ship it half-defended.
+   remaining" banner in the UI. An unlocked safe must never be invisible.
+
+   **What it holds is a TICKET, not a key.** `secrets-admin` sends the agent a
+   handle and never any key material, so the agent cannot hand a later helper
+   process an unlocked database — which means the passphrase is still prompted
+   on every unlock, and point 1 above is undisturbed. What the ticket buys is
+   the *other* half of I18: an unlock that can be SEEN (`health.agent` answers
+   with no handle and no passphrase, so a hold survives a page reload) and
+   REVOKED (`lock` with a bare safe id reaches it after the helper that minted
+   it has exited). The daemon's `put` still accepts optional key material,
+   because I18 sanctions a real reattach as a per-safe opt-in and a future one
+   will need it — but nothing in this tree produces any, and the helper strips
+   a `material` key out of any reply at the door. docs/CONTRACT.md, "What the
+   agent holds", is the authority; deleting that strip is the deliberate act
+   that would start implementing a reattach.
 
 ---
 

@@ -145,11 +145,85 @@ def main():
                 "handle" in out, json.dumps(out)[:120])
 
         r.section("access class, enforced in the helper (I1, I2, I3)")
-        for verb in ("probe", "unlock", "entries"):
-            out, rc, _e = env.run(verb, {"safe": "lab-admin", "password": PW})
+        # EVERY class-gated verb, taken from the schema rather than a list
+        # written here — so a verb added later is covered the day it appears
+        # instead of the day somebody remembers this file. I3's whole point is
+        # that the check is server-side and applies to the WHOLE surface; a
+        # gate proved on three verbs out of twenty is a gate with seventeen
+        # holes in it.
+        schema, _rc, _e = env.run("schema")
+        # `save` is excluded and it is the only exclusion: it has no
+        # single-shot form at all — it takes a handle from an open session and
+        # nothing else — so there is no request that reaches its gate from
+        # here. Its gate is `unlock`'s: an admin safe hands a non-root helper
+        # no handle, so there is no path to `save` to defend. That is checked
+        # one line below rather than assumed.
+        gated = [v["id"] for v in schema["verbs"]
+                 if v.get("access") == "class"
+                 and v.get("needs") in ("safe", "handle")
+                 and v["id"] != "save"]
+        r.check("the schema declares a class-gated verb surface to check",
+                len(gated) >= 10, gated)
+        for verb in sorted(gated):
+            # `autosave` is what makes a single-shot MUTATION a well-formed
+            # request: without it the helper answers `invalid` before it looks
+            # at the safe at all, and the gate is never reached. A refusal that
+            # comes from argument validation is not evidence about access
+            # control, so every request here is built to be well-formed and to
+            # fail for exactly one reason.
+            req = {"safe": "lab-admin", "password": PW, "autosave": True}
+            # A few verbs need one more field for the same reason.
+            req.update({"reveal": {"uuid": "x", "field": "password"},
+                        "totp": {"uuid": "x"},
+                        "attach-get": {"uuid": "x", "name": "n"},
+                        "attach-add": {"uuid": "x", "name": "n",
+                                       "data_b64": "eA=="},
+                        "attach-rm": {"uuid": "x", "name": "n"},
+                        "history": {"uuid": "x"},
+                        "history-restore": {"uuid": "x", "index": 0},
+                        "add": {"entry": {"title": "t"}},
+                        "edit": {"uuid": "x", "changes": {"username": "u"}},
+                        "move": {"uuid": "x", "group": None},
+                        "rm": {"uuid": "x"},
+                        "group-add": {"name": "g"},
+                        "group-rm": {"uuid": "x"},
+                        "group-mv": {"uuid": "x", "parent": None},
+                        "save-as": {"name": "copy.out"},
+                        "restore-backup": {"name": "nope"},
+                        "export": {"fmt": "csv",
+                                   "confirm": "export-plaintext:lab-admin"},
+                        "breach-check": {"value": "x"},
+                        }.get(verb, {}))
+            out, rc, _e = env.run(verb, req)
             r.check("an admin safe is access-denied to a non-root helper (%s)"
                     % verb,
                     out.get("error") == "access-denied" and rc != 0, out)
+
+        # `save`'s gate, the only way it can be reached: no handle, no save.
+        sess = Session(env)
+        try:
+            u = sess.call("unlock", safe="lab-admin", password=PW)
+            r.check("a session cannot unlock an admin safe either",
+                    u.get("error") == "access-denied", u)
+            r.check("...so `save` has no handle to be reached with",
+                    sess.call("save", handle=u.get("handle") or "x"
+                              ).get("error") == "access-denied")
+        finally:
+            sess.close()
+
+        # ...and the request-shape refusal that runs BEFORE the gate must not
+        # be an oracle. `save` without a handle answers the same `invalid` for
+        # a safe you own, a safe you may not touch, and a safe that does not
+        # exist — so a caller who provokes it learns nothing about the
+        # registry. If these three ever diverge, the cheapest verb in the
+        # program becomes a way to enumerate safe ids.
+        shapes = [env.run("save", {"safe": sid, "password": PW})[0]
+                  for sid in ("lab-kdbx41", "lab-admin", "no-such-safe")]
+        r.check("a pre-gate argument refusal is identical for a safe you own, "
+                "one you may not, and one that does not exist",
+                len({json.dumps(x, sort_keys=True) for x in shapes}) == 1,
+                shapes)
+
         out, _rc, _e = env.run("probe", {"safe": "no-such-safe"})
         r.check("an unregistered id is not-found",
                 out.get("error") == "not-found", out)

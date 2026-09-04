@@ -38,10 +38,22 @@ audited path and it works.
 
 ## `/usr/bin/pwsafe` — the GUI accepts some arguments
 
-`pwsafe --help` exits 0 and lists: `-r/--read-only`, `-v/--validate=<str>` ("validate (and
-repair) database"), `-e/--encrypt=<str>`, `-d/--decrypt=<str>`, `-c/--close`, `-s/--silent`,
+**`pwsafe --help` exits 255, not 0, and writes its usage to STDERR, not stdout.** This file
+recorded exit 0; two independent runs during the second build measured 255, with and without a
+display, so the record was wrong and is corrected here. It matters because "did pwsafe accept
+this?" is the shape of every attempt to use it as an oracle, and a harness that reads the exit
+code gets "failed" for a successful help request — which is one of the ways the PWS3 oracle was
+believed to be closer than it is (I19).
+
+The usage it prints lists: `-r/--read-only`, `-v/--validate=<str>` ("validate (and repair)
+database"), `-e/--encrypt=<str>`, `-d/--decrypt=<str>`, `-c/--close`, `-s/--silent`,
 `-m/--minimized`, `-u/--username`, `-h/--hostname`, `-g/--config_file`,
 `--yubi-polling-interval`.
+
+Under `Xvfb`, `pwsafe --validate` maps **no** X window and never returns, while `xmessage` on
+the same Xvfb maps one — so the display is real and pwsafe is the thing that will not be
+driven. That control is what turns "we could not automate it" into "it cannot be automated
+here".
 
 It is still a wxWidgets GUI and will want a display and an interactive passphrase dialog, so it
 is **not** a scriptable CLI. `--validate` is worth an attempt under `Xvfb` as a genuine foreign
@@ -67,6 +79,32 @@ Password Safe's file-encryption feature — they are NOT a `.psafe3` database du
 Also present: Python 3.14.4, `gjs`, node v22.22.1, a cached Playwright chromium, Go 1.26 with
 `golang.org/x/crypto@v0.48.0` already in `$(go env GOMODCACHE)` (has `x/crypto/twofish`), and
 outbound network.
+
+## systemd 259 ignores `RuntimeDirectoryMode=` in a `.socket` unit
+
+Measured twice, both directions, on `systemd 259 (259.5-0ubuntu3.4)`:
+
+```
+# a SOCKET unit with RuntimeDirectory=sdprobe-x, RuntimeDirectoryMode=0700
+drwxr-xr-x /run/user/1000/sdprobe-x          # ← 0755. The mode was ignored.
+
+# a SERVICE unit with the same two settings, via systemd-run --user
+drwx------ /run/user/1000/sdprobe-y          # ← 0700. Honoured.
+```
+
+The agent's whole uid separation rests on that directory being 0700, so both socket units carry
+`ExecStartPost=/usr/bin/chmod 0700 …` with **no** leading `-`: a run directory that cannot be
+made 0700 must fail the unit rather than start an agent behind a world-listable path.
+
+Related, and also measured: with `ProtectHome=yes` on a **user** unit, `/run/user` is not
+visible inside the service's mount namespace, so the agent cannot stat its own socket path. That
+is the sandbox working — it only needs the inherited fd — and the 0700 guarantee comes from the
+socket unit's unsandboxed `ExecStartPost`, not from the agent's own check.
+
+`/run/systemd/sessions/<id>` is readable but its first line says it is private and must not be
+parsed, and it carries no lock hint: `loginctl` is the only supported source. `loginctl -p A -p B
+--value` prints properties in systemd's own order, **not** the order asked, so a multi-property
+read must use the `KEY=value` form.
 
 ## Cockpit
 

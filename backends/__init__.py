@@ -34,7 +34,7 @@ from .base import (                                          # noqa: F401
     Secret, constant_time_eq, redact, REDACT_MIN_LEN, REDACTED,
     # process and file primitives
     harden_process, open_safe_fd, SafeFile, Fingerprint,
-    atomic_replace, LockFile,
+    atomic_replace, validate_new_path, LockFile, backup_dir_for,
     # policy clamps
     Limits,
     # the adapter interface
@@ -48,7 +48,7 @@ __all__ = [
     "ERROR_CODES", "ERROR_CLASSES",
     "Secret", "constant_time_eq", "redact", "REDACT_MIN_LEN", "REDACTED",
     "harden_process", "open_safe_fd", "SafeFile", "Fingerprint",
-    "atomic_replace", "LockFile",
+    "atomic_replace", "validate_new_path", "LockFile", "backup_dir_for",
     "Limits",
     "Backend", "register_backend", "backend_for", "known_formats",
     "VERSION",

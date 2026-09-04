@@ -17,6 +17,24 @@
 
     <div class="sec-page">
 
+        <!-- The agent banner (I18). An unlock held by `secrets-agent` outlives
+             the page's own view, so its banner lives ABOVE the view switch and
+             outside every pane the browse/safes views clear: an agent-held safe
+             is visible from wherever the operator happens to be standing.
+
+             It is empty, and therefore invisible, whenever nothing is held —
+             which is the default configuration, because the agent is off unless
+             a registry entry opts in. There is deliberately no disabled
+             placeholder: a permanent "no safes unlocked" chrome would imply the
+             page is watching something when the agent is not even running.
+
+             role="region" rather than role="alert": the countdown updates once a
+             second and an assertive region would interrupt a screen reader on
+             every tick. The sentence that matters is announced once, into
+             #sec-live, when the set of held safes changes. -->
+        <div id="sec-agent-banner" class="sec-agent-host" role="region"
+             aria-label="Safes held unlocked by the agent"></div>
+
         <header class="sec-topbar">
             <div class="sec-topbar-title">
                 <h1>Secrets</h1>
@@ -78,6 +96,18 @@
             operating-system resource: this page clears it when the countdown ends and when the
             page is hidden, but another application may already have read it, and a clipboard
             manager may keep its own copy that this page cannot reach.</p>
+            <p><strong>An export is plaintext on disk, and it stays there.</strong> Exporting
+            writes every password in a safe, unencrypted, into a file the helper chooses; the
+            countdown that re-hides a revealed value has no equivalent for a file. This page
+            never shows an export&#8217;s contents &#8212; it reports only where the file landed and
+            how big it is &#8212; and deleting it afterwards is the operator&#8217;s job, not this
+            page&#8217;s. An attachment downloaded from an entry, by contrast, is streamed through
+            the Cockpit channel straight to this browser and never lands on the server&#8217;s disk.</p>
+            <p><strong>A safe held open by the agent is announced, always.</strong> When a safe is
+            unlocked through <code>secrets-agent</code>, the banner at the top of this page names
+            it and counts down to its automatic lock, from every view. If that banner is not
+            there, nothing is being held &#8212; the agent is off unless a registry entry opts in,
+            and there is nothing for it to hide.</p>
             <p><strong>What is greyed out here is decoration.</strong> The helper re-derives the
             caller&#8217;s identity from the kernel and re-checks the access class on every verb;
             that is what refuses a safe you may not open, not this page.</p>

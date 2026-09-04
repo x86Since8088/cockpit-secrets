@@ -141,6 +141,39 @@
       "default": false
     },
 
+    "export_dir": {
+      "$comment": "Where this safe's exports land, overriding the host default under COCKPIT_SECRETS_VAR/exports. Absolute and free of '..' for the same reasons as 'path', and refused under /tmp or /var/tmp -- an export is the whole safe in the clear and a world-writable directory is not a place to put one. The helper creates it 0700 and every file inside it 0600. Setting it while export_allowed is false is refused rather than ignored: the two together are one decision, and a directory configured for a safe that cannot be exported is somebody's half-finished intent. null means the host default.",
+      "anyOf": [
+        { "type": "null" },
+        {
+          "type": "string",
+          "minLength": 2,
+          "allOf": [
+            { "pattern": "^/" },
+            { "not": { "pattern": "(^|/)\\.\\.(/|$)" } },
+            { "not": { "pattern": "^/(tmp|var/tmp|dev/shm)(/|$)" } }
+          ]
+        }
+      ],
+      "default": null
+    },
+
+    "breach_corpus": {
+      "$comment": "An OFFLINE corpus of leaked password hashes (HIBP 'SHA1:count' lines) for the breach-check verb, overriding breach-corpus.txt under the registry root. Absolute and free of '..'. breach-check has no network client at all -- there is no online fallback and never will be one, because a page that phones a third party about the passwords it is holding is the exfiltration channel I21 exists to close. Absent means the feature answers available:false and stops; it never means 'ask the internet'.",
+      "anyOf": [
+        { "type": "null" },
+        {
+          "type": "string",
+          "minLength": 2,
+          "allOf": [
+            { "pattern": "^/" },
+            { "not": { "pattern": "(^|/)\\.\\.(/|$)" } }
+          ]
+        }
+      ],
+      "default": null
+    },
+
     "backup": {
       "$comment": "The retention ring written before the first byte of every save (I12). It is the ONLY undo this program has: a save that succeeds is not reversible any other way. Setting keep too low means a corruption you notice on the third save has already aged out of the ring.",
       "type": "object",

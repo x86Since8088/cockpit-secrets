@@ -76,7 +76,7 @@ __all__ = [
     "Secret", "constant_time_eq", "redact", "REDACT_MIN_LEN", "REDACTED",
     # process and file primitives
     "harden_process", "open_safe_fd", "SafeFile", "Fingerprint",
-    "atomic_replace", "LockFile",
+    "atomic_replace", "validate_new_path", "LockFile", "backup_dir_for",
     # policy
     "Limits",
     # the adapter interface
@@ -655,6 +655,15 @@ class Limits:
     MAX_GROUP_DEPTH = 64
     #: One attachment. Stops "declared length 2 GiB" turning into an allocation.
     MAX_ATTACHMENT_BYTES = 32 * 1024 * 1024
+    #: Archived versions of ONE entry that `history` will enumerate. Every
+    #: other collection in this class had an explicit clamp and this one did
+    #: not: it was bounded only transitively, by the parse having already been
+    #: bounded, which is an argument about a file we have already read rather
+    #: than a limit on what we will build from it. KeePass's own
+    #: `HistoryMaxItems` defaults to 10 and a human-maintained entry does not
+    #: reach three figures, so a file with more than this is telling you
+    #: something about its author, not about its content.
+    MAX_HISTORY_VERSIONS = 1_000
     #: One field's data. A hostile PWS3 field length of 0xFFFFFFFF must fail in
     #: O(1) against this and against the remaining file size — never by trying.
     MAX_FIELD_BYTES = 4 * 1024 * 1024
@@ -1232,8 +1241,20 @@ def open_safe_fd(path, *, expect_uid=None, want_write=False):
 # atomic_replace — the durable write primitive  (I12, I13)
 # ===========================================================================
 
-def _backup_dir_for(path, backup_dir):
-    """Default `<path>.bak.d/`, per docs/CONTRACT.md `backup.dir`."""
+def backup_dir_for(path, backup_dir):
+    """Where a safe's backup ring lives. Default `<path>.bak.d/`, per
+    docs/CONTRACT.md `backup.dir`.
+
+    PUBLIC, and it has to be. This is the one function that decides where a
+    backup goes, `atomic_replace` routes every write through it, and the
+    `backups` and `restore-backup` verbs must enumerate exactly the directory
+    `save` writes to. `secrets-admin` used to import it under its underscored
+    name — reaching past the package boundary for the single most important
+    piece of agreement in the program. Re-deriving the rule on the reading side
+    would make the listing and the writer disagree the first time either
+    changed, and a restore verb that reads a different directory than the one
+    being written is worse than no restore verb at all.
+    """
     if backup_dir:
         if not backup_dir.startswith("/"):
             raise Invalid("backup directory is not absolute")
@@ -1411,7 +1432,7 @@ def atomic_replace(path, data, *, backup_dir=None, keep=None,
                         "the safe file changed on disk since it was unlocked")
             # ---- 2. backup ring, before the first new byte ----------------
             backup_path = _ring_backup(existing.fd, path,
-                                       _backup_dir_for(path, backup_dir), keep)
+                                       backup_dir_for(path, backup_dir), keep)
     finally:
         if existing is not None:
             existing.close()
@@ -1484,6 +1505,44 @@ def atomic_replace(path, data, *, backup_dir=None, keep=None,
     with open_safe_fd(path, expect_uid=expect_uid) as sf:
         final = sf.fingerprint()
     return {"backup": backup_path, "bytes": len(data), "fingerprint": final}
+
+
+def validate_new_path(path, what="destination"):
+    """Vet a path this program is about to CREATE a safe at. Returns it.
+
+    Every operation that writes a database somewhere the registry does not list
+    — `save_as`, `upgrade_to_kdbx4` — funnels through here, because each of them
+    is one refusal away from being the file-overwrite primitive an attacker
+    wanted. The helper has already decided the operator may name a path at all
+    (I4 is about the BROWSER naming one); this is the part that is the same
+    every time and therefore must not be re-typed per call site.
+
+    The refusals, and what each one stops:
+
+      * not absolute, or not equal to `os.path.normpath` of itself — `..`, a
+        doubled slash and a trailing slash all walk straight past the textual
+        checks below, so a path that is not already in normal form is refused
+        rather than normalised (normalising would accept the attacker's input
+        and act on a different path than the one the operator was shown);
+      * under `/tmp` or `/var/tmp` — world-writable, a different filesystem
+        from anything the registry names, and the classic place for a
+        plaintext-adjacent file to be read by someone else (bad practice #3);
+      * already exists, INCLUDING as a dangling symlink (`os.path.lexists`, not
+        `os.path.exists`) — never overwrite, and never follow a link somebody
+        else planted at the name we were about to create (I5).
+
+    Raises `Invalid` for a malformed path and `Conflict` for one that is taken;
+    two codes because an operator fixes them differently.
+    """
+    if not isinstance(path, str) or not path.startswith("/"):
+        raise Invalid("the %s must be an absolute path" % what)
+    if path != os.path.normpath(path):
+        raise Invalid("the %s path must be in normal form" % what)
+    if path.startswith("/tmp/") or path.startswith("/var/tmp/"):
+        raise Invalid("refusing to write a database under /tmp")
+    if os.path.lexists(path):
+        raise Conflict("the %s already exists; this never overwrites" % what)
+    return path
 
 
 # ===========================================================================
@@ -1855,7 +1914,8 @@ class Backend(abc.ABC):
         """
 
     @abc.abstractmethod
-    def unlock(self, password, keyfile=None, session=None):
+    def unlock(self, password, keyfile=None, session=None, *,
+               yubikey_response=None):
         """Derive the key, verify the MAC, and open the database in memory.
 
         Args:
@@ -1869,6 +1929,16 @@ class Backend(abc.ABC):
                       path). Never a caller-supplied path (I4).
             session:  opaque session id for the multi-verb `open` flow, or None
                       for the default one-process-one-operation shape.
+            yubikey_response:
+                      RAW BYTES of a hardware token's challenge-response answer
+                      — the 20-byte HMAC-SHA1 a YubiKey returns for the
+                      challenge `challenge_for()` published — or None. It is a
+                      key component, not a passphrase: the helper obtains it
+                      from the token and hands it over on stdin like everything
+                      else (I10), and a backend whose FORMAT has no
+                      challenge-response concept raises `Unsupported` rather
+                      than ignoring it. Ignoring it would let an operator
+                      believe a second factor was in play when it was not.
 
         Returns docs/CONTRACT.md's unlock object::
 
@@ -1963,6 +2033,93 @@ class Backend(abc.ABC):
         is the exfiltration channel I21 is about.
         """
 
+    @abc.abstractmethod
+    def history(self, uuid):
+        """Previous versions of one entry, METADATA ONLY. **Never a password.**
+
+        Returns a list, oldest first::
+
+            [{"index": int, "when": "<ISO-8601 UTC>", "title": str,
+              "username": str, "url": str, "has_password": bool,
+              "notes_len": int}, ...]
+
+        `index` is the position in that list and is what `history_restore`
+        takes. It is positional and therefore only valid until the next
+        mutation of this entry — a stable id would have to be invented, and
+        inventing one means writing a field the file never had (I22).
+
+        `has_password` is a boolean for the same reason `entries()` reports
+        `has_totp` as one: a history view has to show that a version HAD a
+        password without shipping it. `reveal()` is still the only door, and it
+        opens the CURRENT version — reading an archived password means
+        restoring the version first, which is a mutation and therefore audited.
+
+        `notes_len` is a length and not the notes. Note the difference from
+        `fields()`, which deliberately reports neither: this list exists so an
+        operator can tell two versions apart before restoring one, and the
+        caller already holds the safe unlocked. A length is the least that
+        answers "did the notes change here"; anything less makes the view
+        useless and anything more is the value.
+
+        A format with no per-entry history models whatever it does have (PWS3's
+        password-history field) rather than returning an empty list, and says so
+        in its docstring. `Unsupported` only where there is genuinely nothing.
+        """
+
+    @abc.abstractmethod
+    def export_plain(self, *, fmt):
+        """**The single most dangerous method in this codebase.** Read this.
+
+        It returns EVERY secret in the safe, decrypted, in the clear, in one
+        object: every password, every note, every TOTP seed, every protected
+        custom field, every archived password in every history version. There
+        is no other method here that does that. `reveal()` — the door this
+        project spent its whole design budget narrowing to one field of one
+        entry, once, audited — is bypassed entirely. One call is the whole
+        database.
+
+        That is why:
+
+          * it is an `admin`-only verb, off unless the registry entry sets
+            `export_allowed: true`, and preceded by an explicit confirmation
+            naming what is about to be written in the clear (I21);
+          * it returns BYTES and never writes a file. The helper owns the
+            destination, writes `0600` into an operator-configured directory,
+            and audits it by name. A backend that took a path would be taking a
+            client-supplied path (I4) into the one operation that empties the
+            safe;
+          * the bytes must not be logged, echoed into an error `detail`, or
+            kept anywhere after the helper has handed them over (I15).
+
+        Args:
+            fmt: "csv" | "xml" | "json". Keyword-only so no caller can pass it
+                 positionally and get a format it did not mean.
+
+        Returns:
+            bytes — the complete export, UTF-8 where the format is textual.
+
+        **`bytes` is immutable, so the return value cannot be zeroed** (I14,
+        bad practice #13). That is not an oversight and there is no version of
+        this method that avoids it: building a plaintext export means every
+        password in the safe exists as an unwipeable object on the GC heap, and
+        every intermediate `str` the formatter made is another copy. The
+        mitigation is the one the whole program rests on — the helper lives for
+        one operation and its address space returns to the kernel in
+        milliseconds — plus `harden_process()` having already turned off core
+        dumps and `ptrace`. A caller must hand these bytes on and drop them; it
+        must not stash them, and it must never let them reach a log line.
+
+        Attachment CONTENT is excluded and attachment NAMES are listed: an
+        export is for migrating credentials, and inlining megabytes of base64
+        turns one dangerous file into an unwieldy dangerous file. `attach_get`
+        remains the way to move an attachment, one at a time, audited.
+
+        Raises `Unsupported`, with a detail naming the reason, for a `fmt` the
+        FORMAT cannot honestly express — never a silent approximation. A file
+        that claims to be another project's export format and is not is the
+        I19 mistake wearing a different hat.
+        """
+
     # -- mutation: in memory only, nothing reaches disk until save() -------
 
     @abc.abstractmethod
@@ -2014,6 +2171,57 @@ class Backend(abc.ABC):
         cycle the tree walker will not survive.
         """
 
+    @abc.abstractmethod
+    def history_restore(self, uuid, index):
+        """Roll one entry back to the version `history()` listed at `index`.
+
+        Returns `{"uuid": str, "restored_from": int}`. In memory only — like
+        every other mutation, nothing reaches disk until `save()`.
+
+        **The current version must be archived first**, so that a restore is
+        itself undoable. A restore that discards what you had is a data-loss
+        bug wearing a feature's clothes, and the operator who reached for it
+        was already unsure which version they wanted.
+
+        Archiving obeys the format's own history policy where it has one (PWS3
+        records carry an on/off flag and a maximum size; KDBX keeps the limits
+        in `Meta`). Overriding that policy would write a database describing a
+        state the file's own settings say is impossible.
+
+        Raises `NotFound` for an index that is not in `history()`.
+        """
+
+    @abc.abstractmethod
+    def attach_add(self, uuid, name, data, *, replace=False):
+        """Attach `data` (BYTES) to an entry under `name`. In memory only.
+
+        Bytes, not base64 and not a path: base64 is the request encoding and
+        belongs to the helper, and a path would be I4 pointed at a file the
+        browser named. `Limits.MAX_ATTACHMENT_BYTES` is checked before anything
+        is stored.
+
+        `replace=False` makes an existing `name` a `Conflict` rather than a
+        silent overwrite — losing an attachment to a name collision is the same
+        class of harm as I22.
+
+        Returns `{"ok": True, "name": str, "size": int}`. Raises `Unsupported`
+        where the FORMAT has no attachment concept, naming that as the reason.
+        """
+
+    @abc.abstractmethod
+    def attach_rm(self, uuid, name):
+        """Detach `name` from one entry. In memory only. `{"ok": True}`.
+
+        Detaching is not the same act as deleting the bytes where the format
+        shares an attachment pool across entries and history versions (KDBX4).
+        An implementation must free pool storage only when NOTHING still
+        references it, and must never leave a dangling reference behind — both
+        directions of that mistake corrupt a database that other readers then
+        refuse.
+
+        Raises `NotFound` when the entry has no such attachment.
+        """
+
     # -- persistence -------------------------------------------------------
 
     @abc.abstractmethod
@@ -2044,6 +2252,36 @@ class Backend(abc.ABC):
         "conflict": False}` — docs/CONTRACT.md's save object. A conflict is
         raised, not returned as `conflict: true`; the field exists so the UI has
         a stable shape.
+        """
+
+    @abc.abstractmethod
+    def save_as(self, target_path, *, override_stale=False):
+        """Write the in-memory database to a NEW path. Returns
+        `{"path": str, "bytes": int}`.
+
+        **The original is not touched, and that is the whole contract.** Not
+        its bytes, not its `Fingerprint` (which still describes the original, so
+        a later `save()` still re-checks against what it read at unlock), not
+        its `.lock`/`.plk`, and not its backup ring — `target_path` does not
+        exist yet, so `atomic_replace` has nothing to back up and never opens
+        the original at all. A test asserts the original's sha256 is unchanged
+        across this call, because "I didn't mean to touch it" is not a property.
+
+        `target_path` is absolute and **already validated by the helper**, which
+        is where I4 is enforced: the registry names the safes, and this is the
+        one operation that legitimately writes somewhere the registry does not
+        list. A backend still refuses a path that is not in normal form and one
+        that already exists (`Conflict`) — never overwrite, because for the
+        instant before `os.replace` the operator's only copy would be the one we
+        are half-way through re-encrypting.
+
+        `override_stale` applies to the TARGET's lock file, not the original's:
+        two concurrent copies to the same destination are the race this closes.
+
+        The same refusals as `save()` apply for the same reasons: a format we do
+        not write (KDBX3, I20) is not made writable by pointing it at a new
+        name, and a database that would lose a field on serialisation loses it
+        just as thoroughly into a copy (I22).
         """
 
     @abc.abstractmethod
@@ -2354,6 +2592,36 @@ def _selfcheck():                                       # noqa: C901
         ok("a new file can be created", open(fresh, "rb").read() == b"brand-new")
         ok("creating takes no backup", cres["backup"] is None)
 
+        # -------------------------------------------------- validate_new_path --
+        # NOTE the paths below are deliberately NOT under `tmpdir`: this
+        # self-check's scratch directory lives in /tmp, which is precisely what
+        # validate_new_path refuses, so a destination built from it would be
+        # rejected for the wrong reason and prove nothing. Nothing here touches
+        # the filesystem — the function only ever calls lexists.
+        print("\n== validate_new_path (save_as / upgrade destinations) ==")
+        want = "/var/lib/cockpit-secrets/selfcheck-%s.kdbx" % _sysrandom.token_hex(6)
+        ok("an absolute, normal, unused path is accepted",
+           validate_new_path(want) == want)
+        raises("a relative destination -> Invalid", Invalid,
+               lambda: validate_new_path("copy.kdbx"))
+        raises("a destination containing .. -> Invalid", Invalid,
+               lambda: validate_new_path("/var/lib/../lib/copy.kdbx"))
+        raises("a doubled slash -> Invalid", Invalid,
+               lambda: validate_new_path("/var//lib/copy.kdbx"))
+        raises("a trailing slash -> Invalid", Invalid,
+               lambda: validate_new_path("/var/lib/copy.kdbx/"))
+        raises("a destination under /tmp -> Invalid", Invalid,
+               lambda: validate_new_path("/tmp/copy.kdbx"))
+        raises("a destination under /var/tmp -> Invalid", Invalid,
+               lambda: validate_new_path("/var/tmp/copy.kdbx"))
+        # /dev/null rather than a file we made: it exists on every host this
+        # runs on and it is not under /tmp, so the Conflict it raises is the
+        # "already taken" refusal and not the directory policy. The check is
+        # `lexists`, so a dangling symlink planted at the name is refused too —
+        # `exists` would follow it and answer False.
+        raises("an existing destination -> Conflict", Conflict,
+               lambda: validate_new_path("/dev/null"))
+
         # ---------------------------------------------------------- LockFile --
         print("\n== LockFile (I13) ==")
         ok("kdbx lock name appends .lock",
@@ -2407,11 +2675,33 @@ def _selfcheck():                                       # noqa: C901
            _cannot_instantiate(Backend, {"id": "x", "path": "/x"}))
         needed = {"probe", "unlock", "tree", "entries", "reveal", "totp",
                   "attach_get", "add", "edit", "move", "rm", "group_add",
-                  "group_rm", "group_mv", "save", "lock"}
+                  "group_rm", "group_mv", "save", "lock",
+                  # the second-phase interface: history, attachments, an
+                  # operator-named copy, and the one method that empties the
+                  # safe in one call.
+                  "history", "history_restore", "attach_add", "attach_rm",
+                  "save_as", "export_plain"}
         ok("every CONTRACT.md verb is abstract",
            needed <= set(Backend.__abstractmethods__))
         ok("no extra abstract methods",
            set(Backend.__abstractmethods__) == needed)
+        # A keyword-only `yubikey_response` on unlock is what lets a hardware
+        # token be a key COMPONENT rather than a second passphrase prompt. It
+        # is checked here because two backends and the helper all build to it,
+        # and a positional drift would be silently accepted by every one of
+        # them until a token was actually present.
+        import inspect
+        sig = inspect.signature(Backend.unlock)
+        ok("unlock takes yubikey_response, keyword-only",
+           sig.parameters.get("yubikey_response") is not None
+           and sig.parameters["yubikey_response"].kind
+           is inspect.Parameter.KEYWORD_ONLY
+           and sig.parameters["yubikey_response"].default is None)
+        for name, want in (("export_plain", "fmt"), ("save_as", "override_stale"),
+                           ("attach_add", "replace")):
+            p = inspect.signature(getattr(Backend, name)).parameters.get(want)
+            ok("%s's %s is keyword-only" % (name, want),
+               p is not None and p.kind is inspect.Parameter.KEYWORD_ONLY)
 
         stub = _StubBackend({"id": "s", "path": target, "mode": "ro"})
         raises("require_unlocked before unlock", AccessDenied,
@@ -2451,13 +2741,16 @@ class _StubBackend(Backend):
     is complete and that the guards refuse before they permit."""
 
     def probe(self): return {}
-    def unlock(self, password, keyfile=None, session=None): return {}
+    def unlock(self, password, keyfile=None, session=None, *,
+               yubikey_response=None): return {}
     def tree(self): return {"groups": []}
     def entries(self, group=None, query=None, offset=0, limit=100):
         return {"total": 0, "entries": []}
     def reveal(self, uuid, field): raise NotFound("stub")
     def totp(self, uuid): raise Unsupported("stub")
     def attach_get(self, uuid, name): raise NotFound("stub")
+    def history(self, uuid): return []
+    def export_plain(self, *, fmt): raise Unsupported("stub")
     def add(self, group, entry): raise Unsupported("stub")
     def edit(self, uuid, changes): raise Unsupported("stub")
     def move(self, uuid, group): raise Unsupported("stub")
@@ -2465,7 +2758,13 @@ class _StubBackend(Backend):
     def group_add(self, parent, name): raise Unsupported("stub")
     def group_rm(self, uuid, permanent=False): raise Unsupported("stub")
     def group_mv(self, uuid, parent): raise Unsupported("stub")
+    def history_restore(self, uuid, index): raise Unsupported("stub")
+    def attach_add(self, uuid, name, data, *, replace=False):
+        raise Unsupported("stub")
+    def attach_rm(self, uuid, name): raise Unsupported("stub")
     def save(self, *, override_stale=False): raise Unsupported("stub")
+    def save_as(self, target_path, *, override_stale=False):
+        raise Unsupported("stub")
     def lock(self): return {"ok": True}
 
 

@@ -89,15 +89,18 @@ Licence: GPL-3.0 — forced by linking pykeepass. See ../LICENSE.
 
 import base64
 import binascii
+import csv
 import datetime as _dt
 import hashlib
 import hmac
 import io
+import json
 import os
 import re
 import secrets as _sysrandom
 import struct
 import time
+import urllib.parse
 import zlib
 from copy import deepcopy
 
@@ -117,6 +120,7 @@ from .base import (
     constant_time_eq,
     open_safe_fd,
     register_backend,
+    validate_new_path,
     LockFile,
 )
 
@@ -198,7 +202,20 @@ _BUILTIN_FIELDS = {
     "notes": "Notes",
     "otp": "otp",
     "totp-seed": "otp",
+    # The helper's published vocabulary (docs/CONTRACT.md, `_FIELD_RE`, and the
+    # schema's `field` select whose label is "TOTP secret") spells the seed
+    # `totp`. Without this row that option resolved to a string field literally
+    # named "totp", which no KeePass writer produces, so the UI's own menu item
+    # answered not-found on every database.
+    "totp": "otp",
 }
+
+#: The prefix the helper's `field` vocabulary uses to address a non-reserved
+#: string field: `custom:<name>`. It is stripped here rather than in the helper
+#: because the mapping from a contract field name to a storage key is exactly
+#: what a backend is for — psafe3 answers the same spelling from a typed field
+#: table that has no named custom fields at all.
+_CUSTOM_PREFIX = "custom:"
 
 #: KeePass 2.x (not KeePassXC) stores OTP configuration in these custom fields.
 _TIMEOTP_SECRET_FIELDS = ("TimeOtp-Secret-Base32", "TimeOtp-Secret-Hex",
@@ -800,13 +817,22 @@ def _keyfile_composite(keyfile):
     return hashlib.sha256(raw).digest()
 
 
-def _composite_key(password, keyfile):
-    """SHA-256(SHA-256(passphrase) || keyfile_composite) — KeePass's rule.
+def _composite_key(password, keyfile, challenge_result=None):
+    """SHA-256(SHA-256(passphrase) || keyfile_composite || CR) — KeePass's rule.
 
     `password` is a `Secret`, so this reads the wipeable `bytearray` directly.
     `Secret.str_view()` is deliberately never called anywhere in this module:
     KDBX needs the passphrase only as UTF-8 bytes to hash, so there is no
     reason to mint an unwipeable `str` from it (I14).
+
+    `challenge_result` is the challenge-response component and is appended LAST,
+    which is the order KeePassXC's `CompositeKey::rawKey(transformSeed)` hashes
+    in: every static key first, then the challenge-response hash. Order is not a
+    detail here — a different order produces a different composite key, which
+    produces a different transformed key, which fails the header HMAC with the
+    same `bad-credential` a wrong passphrase gives, and no amount of staring at
+    the error tells you which of the two it was. `_yubikey_component()` is what
+    builds this value; nothing else may pass it.
     """
     parts = b""
     if password is not None:
@@ -817,9 +843,115 @@ def _composite_key(password, keyfile):
         if keyfile.zeroed:
             raise Internal("the key file buffer was already zeroed")
         parts += _keyfile_composite(keyfile)
+    if challenge_result is not None:
+        parts += bytes(challenge_result)
     if not parts:
         raise BadCredential(_BAD_CRED)
     return hashlib.sha256(parts).digest()
+
+
+# -- YubiKey HMAC-SHA1 challenge-response  (KeePassXC-compatible) -----------
+#
+# Read from KeePassXC 2.7.10's own source rather than from a description of it,
+# because every constant below is one that silently produces the WRONG key
+# rather than an error when it is wrong:
+#
+#   src/keys/CompositeKey.cpp  `transform()`  — for anything that is not the
+#     legacy KDBX3 AES-KDF, the challenge is `kdf.seed()`: the KDF salt out of
+#     the KDBX4 header, NOT the master seed and NOT the encryption IV.
+#   src/keys/CompositeKey.cpp  `challenge()`  — the component folded into the
+#     composite key is SHA-256 over each challenge-response key's raw answer,
+#     i.e. SHA-256(response) for a single token. The raw 20 bytes are NOT what
+#     gets hashed into the composite.
+#   src/keys/drivers/YubiKeyInterfaceUSB.cpp  `performChallenge()` — the
+#     challenge is PKCS#7-padded to exactly 64 bytes before it goes to the
+#     token ("for compatibility with all configurations"), and the answer is
+#     truncated to the 20 bytes of an HMAC-SHA1.
+#
+#: An HMAC-SHA1 answer. Fixed, because a response of any other length means the
+#: helper decoded something that is not a slot answer, and folding it in anyway
+#: would produce a key that fails with the same error as a wrong passphrase.
+_YUBIKEY_RESPONSE_LEN = 20
+#: The wire size the token expects. KeePassXC pads to this and so must we, or
+#: the token HMACs different bytes and every answer is wrong.
+_YUBIKEY_CHALLENGE_LEN = 64
+
+
+def _pkcs7_to(data, size):
+    """Pad `data` to `size` bytes, PKCS#7 — the padding KeePassXC sends."""
+    if len(data) > size:
+        raise Invalid("the challenge is longer than the %d bytes a hardware "
+                      "token accepts" % size)
+    pad = size - len(data)
+    return bytes(data) + bytes([pad]) * pad if pad else bytes(data)
+
+
+def _challenge_bytes(hdr):
+    """The exact bytes to send to the token for this database.
+
+    KDBX4 only, and the refusal is not a shrug. KeePassXC folds the response
+    into the FINAL key for a legacy KDBX3 AES-KDF database
+    (`SHA-256(master_seed || SHA-256(response) || transformed_key)`) rather than
+    into the composite key, so it is a genuinely different construction — and
+    KDBX 3.x is opened read-only here anyway because it has no authenticated
+    encryption (I20). Implementing a second, untestable construction for a
+    format we will not write is how a bug gets shipped with nothing to catch it.
+    """
+    if hdr.major < 4:
+        raise Unsupported(
+            "challenge-response is implemented for KDBX 4 only: KeePassXC "
+            "folds the token's answer into the final key rather than the "
+            "composite key for KDBX 3.x, which is a different construction")
+    seed = hdr.kdf_params.get("salt") or b""
+    if not seed:
+        raise Invalid("this database's header carries no KDF seed to "
+                      "challenge the token with")
+    return _pkcs7_to(seed, _YUBIKEY_CHALLENGE_LEN)
+
+
+def _yubikey_component(response):
+    """SHA-256 over the token's raw answer — the composite-key contribution."""
+    raw = bytes(response.bytes) if isinstance(response, Secret) \
+        else bytes(response)
+    if len(raw) != _YUBIKEY_RESPONSE_LEN:
+        raise Invalid("a hardware-token response is %d bytes; this one is %d"
+                      % (_YUBIKEY_RESPONSE_LEN, len(raw)))
+    return hashlib.sha256(raw).digest()
+
+
+def challenge_for(entry):
+    """What `probe` publishes so the caller can drive the hardware token.
+
+    Takes a **validated registry entry** — the same object a backend is built
+    from — because the challenge is a property of the FILE, and the registry is
+    the only thing allowed to say which file (I4).
+
+    Returns::
+
+        {"slot": 1|2, "algorithm": "hmac-sha1", "challenge_b64": str,
+         "challenge_bytes": 64, "source": "kdf-seed"}
+
+    None of that is secret: the KDF seed is in the outer header, in cleartext,
+    for anyone who already holds the file. That is the test a probe result has
+    to pass, and this passes it — the value that IS secret is the token's
+    answer, which never comes near this function.
+
+    Raises `Unsupported` when the entry declares no `yubikey_slot`, or when the
+    database is KDBX 3.x (see `_challenge_bytes`).
+    """
+    slot = entry.get("yubikey_slot")
+    if not slot:
+        raise Unsupported("this safe's registry entry declares no yubikey_slot")
+    with open_safe_fd(entry.get("path", "")) as sf:
+        data = sf.read_all()
+    challenge = _challenge_bytes(_read_header(data))
+    return {
+        "slot": int(slot),
+        "algorithm": "hmac-sha1",
+        "challenge_b64": base64.b64encode(challenge).decode("ascii"),
+        "challenge_bytes": len(challenge),
+        "source": "kdf-seed",
+    }
 
 
 def _aes_kdf(seed, rounds, composite):
@@ -990,7 +1122,17 @@ def _decrypt_prefix(hdr, master_key, blob, nbytes):
         prev = hdr.encryption_iv
         for i in range(0, want, 16):
             ct = chunk[i:i + 16]
-            pt = bc.decrypt(ct)
+            # bytes() is load-bearing, not tidiness: botan3's BlockCipher
+            # returns a `ctypes.c_char_Array_16`, and ITERATING one yields
+            # 1-byte `bytes` objects rather than ints — so `a ^ b` below raised
+            # `TypeError: unsupported operand type(s) for ^: 'bytes' and 'int'`
+            # and the whole KDBX3+Twofish path answered `internal`. MEASURED on
+            # this host while building tests/fixtures/gen_twofish_fixture.py;
+            # it had never been reachable before, because no Twofish fixture
+            # existed for it to run against (docs/COMPATIBILITY.md's one
+            # "UNTESTED" row, and exactly the kind of bug that row was warning
+            # about).
+            pt = bytes(bc.decrypt(ct))
             out += bytes(a ^ b for a, b in zip(pt, prev))
             prev = ct
         return bytes(out[:nbytes])
@@ -1308,6 +1450,21 @@ class KdbxBackend(Backend):
                 "this database is KDBX %s, newer than the 4.1 this backend "
                 "was written against; it is opened read-only until the "
                 "round-trip check passes" % hdr.version)
+
+        # The hardware-token challenge, when the registry says one is in play.
+        # It is published from `probe` — the verb that runs with no credential
+        # — because the caller has to hold the challenge BEFORE it can ask the
+        # operator to touch the token, and the challenge is header cleartext.
+        # An Unsupported here becomes a warning rather than an error: a KDBX3
+        # safe with a stale `yubikey_slot` should still probe and tell the
+        # operator why the token cannot be used, not fail the whole verb.
+        yubikey = None
+        if self.entry.get("yubikey_slot"):
+            try:
+                yubikey = challenge_for(self.entry)
+            except Unsupported as exc:
+                warnings.append("hardware key unavailable: %s" % exc.detail)
+
         return {
             "format": "kdbx",
             "version": hdr.version,
@@ -1319,29 +1476,25 @@ class KdbxBackend(Backend):
             "needs_password": bool(self.entry.get("password_required", True)),
             "needs_keyfile": bool(self.entry.get("keyfile")),
             "writable": writable,
+            "yubikey": yubikey,
             "warnings": warnings,
         }
 
     # -- unlock ------------------------------------------------------------
 
-    def unlock(self, password, keyfile=None, session=None):
+    def unlock(self, password, keyfile=None, session=None, *,
+               yubikey_response=None):
         """Clamp, derive, verify, and only then open. Never zeroes `password`.
 
         The sequence below is the one docs/CONTRACT.md and the ABC both spell
         out, and every step is here because skipping it has a name:
 
-          read -> header parse -> CLAMP (I7) -> composite -> derive (budgeted)
-               -> VERIFY MAC constant-time (I6) -> open with the transformed
-               key -> fingerprint from the same fd (I13) -> unlocked = True
+          read -> header parse -> CLAMP (I7) -> composite (+ hardware token)
+               -> derive (budgeted) -> VERIFY MAC constant-time (I6) -> open
+               with the transformed key -> fingerprint from the same fd (I13)
+               -> unlocked = True
         """
         _install_xml_hardening()                     # idempotent; fail closed
-        if self.entry.get("yubikey_slot"):
-            # Challenge-response needs a physical token on the host and a
-            # different composite-key construction. Refusing loudly beats
-            # opening the safe with a key that silently ignores the token.
-            raise Unsupported("YubiKey challenge-response is not implemented; "
-                              "clear yubikey_slot in the registry entry to "
-                              "open this safe with a passphrase or key file")
         if password is None and self.entry.get("password_required", True):
             # The schema permits password_required:false only alongside a key
             # file, but a schema is not an enforcement point (I1).
@@ -1351,7 +1504,9 @@ class KdbxBackend(Backend):
         hdr = _read_header(data)
         _clamp_kdf(hdr)                              # I7 — BEFORE deriving
 
-        composite = _composite_key(password, keyfile)
+        composite = _composite_key(password, keyfile,
+                                   self._challenge_component(hdr,
+                                                             yubikey_response))
         try:
             transformed = _derive(hdr, composite)
         finally:
@@ -1422,6 +1577,38 @@ class KdbxBackend(Backend):
             "groups_total": len(self._group_index),
             "warnings": list(self.warnings),
         }
+
+    def _challenge_component(self, hdr, yubikey_response):
+        """Turn a token answer into its composite-key contribution, or None.
+
+        Four cases, and each answer is deliberate:
+
+          slot set, no answer     -> `BadCredential`. A credential the registry
+                                     says is required was not supplied; that is
+                                     the same class of event as a missing
+                                     passphrase and it gets the same code, so
+                                     the failure path cannot be used to
+                                     enumerate which factor was missing (I6).
+          slot set, answer given  -> the SHA-256 component.
+          no slot, answer given   -> `Invalid`. Folding an unexpected key
+                                     component in would change the composite
+                                     key on the say-so of the request rather
+                                     than the registry, and the registry is the
+                                     only authority for what opens a safe (I1).
+          neither                 -> None; the composite key is unchanged, so
+                                     every existing database opens exactly as
+                                     it did before this parameter existed.
+        """
+        slot = self.entry.get("yubikey_slot")
+        if yubikey_response is None:
+            if slot:
+                raise BadCredential(_BAD_CRED)
+            return None
+        if not slot:
+            raise Invalid("this safe's registry entry declares no "
+                          "yubikey_slot, so a token response cannot be used")
+        _challenge_bytes(hdr)      # KDBX3 refusal, before any key material
+        return _yubikey_component(yubikey_response)
 
     def _map_pykeepass_error(self, exc):
         """Turn a pykeepass/construct exception into our taxonomy, no traceback.
@@ -1692,11 +1879,25 @@ class KdbxBackend(Backend):
         Field references (`{REF:P@I:...}`) are dereferenced, because handing a
         caller the literal reference text would be a reveal that reveals
         nothing and would push them to ask for the target entry instead.
+
+        `custom:<name>` addresses a non-reserved string field. The prefix is
+        REQUIRED for one and stripped for the other on purpose: a bare name is
+        looked up through `_BUILTIN_FIELDS` first, so without a distinct
+        namespace `reveal("Password")` and `reveal("password")` would be two
+        spellings of one door, and `custom:Password` would be a third that
+        reached the master password while the audit line said "custom field".
+        A prefixed name is therefore looked up ONLY among the custom fields,
+        and a reserved key behind the prefix is not-found, not a shortcut.
         """
         entry = self._entry(uuid)
         if not isinstance(field, str) or not field:
             raise NotFound("no such field")
-        key = _BUILTIN_FIELDS.get(field.casefold(), field)
+        if field.startswith(_CUSTOM_PREFIX):
+            key = field[len(_CUSTOM_PREFIX):]
+            if not key or key in _RESERVED_FIELDS:
+                raise NotFound("no such field")
+        else:
+            key = _BUILTIN_FIELDS.get(field.casefold(), field)
         value = _field_value(entry, key)
         if value is None:
             raise NotFound("no such field")
@@ -1787,20 +1988,35 @@ class KdbxBackend(Backend):
         raise NotFound("no such attachment")
 
     def history(self, uuid):
-        """Entry history, metadata only. Same rule as `entries()`: no values."""
+        """Entry history, metadata only. Same rule as `entries()`: no values.
+
+        Oldest first, because that is the order KeePass stores `History/Entry`
+        in and `index` therefore addresses the same version here, in
+        `history_restore`, and in the file. Re-sorting by timestamp would look
+        tidier and would break that identity the first time a database carried
+        two versions with the same second-precision mtime.
+        """
         entry = self._entry(uuid)
         versions = []
         for index, old in enumerate(entry.history):
             versions.append({
                 "index": index,
+                "when": _iso(old.mtime),
                 "title": old.title or "",
                 "username": old.username or "",
                 "url": old.url or "",
-                "modified": _iso(old.mtime),
+                # A boolean and a length. Not the password, not the notes —
+                # a history list is browsed to decide which version to restore,
+                # and restoring is the audited mutation that makes an old value
+                # reachable at all.
+                "has_password": bool(old.password),
+                "notes_len": len(old.notes or ""),
+                # Beyond the agreed shape, and useful for the same reason
+                # `entries()` carries them: presence without value.
                 "has_totp": _otp_config(old) is not None,
                 "attachments": len(old.attachments),
             })
-        return {"uuid": uuid, "total": len(versions), "versions": versions}
+        return versions
 
     # -- mutation: in memory only; nothing reaches disk until save() -------
 
@@ -1820,6 +2036,63 @@ class KdbxBackend(Backend):
                 "opens it read-only; use upgrade_to_kdbx4 to convert it")
         self._assert_lossless()
         self._dirty = True
+
+    def _meta_int(self, name, default):
+        """One `Meta/<name>` as an int, or `default`. Never raises."""
+        try:
+            text = self._kp.tree.getroot().findtext("Meta/%s" % name)
+            return int(text) if text is not None and text.strip() else default
+        except (AttributeError, TypeError, ValueError):
+            return default
+
+    def _archive_entry(self, entry):
+        """Push the current version onto History, then prune it to policy.
+
+        Every mutation in this module that used to call `entry.save_history()`
+        directly now comes through here, because `save_history()` on its own is
+        an unbounded append: pykeepass does not read `Meta/HistoryMaxItems` or
+        `Meta/HistoryMaxSize` at all, so a database edited through this backend
+        would grow a history KeePass itself would have trimmed — and grow it
+        with plaintext old passwords, which is the wrong thing to accumulate
+        without limit in a file whose whole risk model is "how much is in here".
+
+        KeePass's own rules, and the sign convention matters: **-1 means
+        unlimited and 0 means keep nothing**, so a bare `if max_items:` test
+        would treat "unlimited" as "keep none". Defaults are KeePass's (10
+        items, 6 MiB) for a database whose Meta does not say.
+
+        The oldest versions go first, which is the order KeePass drops them in
+        and the order `History/Entry` is stored in.
+
+        What this deliberately does NOT do: garbage-collect binaries a pruned
+        version was the last referrer to. Renumbering the pool is a whole-tree
+        rewrite (`_delete_binary`) and doing it as a side effect of an edit is
+        how a `Binary/Value/@Ref` ends up pointing at somebody else's bytes.
+        An orphaned pool entry is wasted space in a file, not corruption, and
+        KeePass likewise only collects those on an explicit maintenance action.
+        """
+        entry.save_history()
+        hist = entry._element.find("History")
+        if hist is None:
+            return
+        items = hist.findall("Entry")
+
+        max_items = self._meta_int("HistoryMaxItems", 10)
+        if max_items >= 0:
+            while len(items) > max_items:
+                hist.remove(items.pop(0))
+
+        max_size = self._meta_int("HistoryMaxSize", 6 * 1024 * 1024)
+        if max_size >= 0 and items:
+            # Serialised length is an approximation of KeePass's own size
+            # accounting — it counts XML rather than the value bytes KeePass
+            # sums — and it is an approximation in the SAFE direction: it
+            # over-counts, so we prune at or before the point KeePass would.
+            sizes = [len(etree.tostring(el)) for el in items]
+            total = sum(sizes)
+            while items and total > max_size:
+                total -= sizes.pop(0)
+                hist.remove(items.pop(0))
 
     def add(self, group, entry):
         """Create an entry. In memory only."""
@@ -1867,7 +2140,7 @@ class KdbxBackend(Backend):
         entry = self._entry(uuid)
         if not isinstance(changes, dict) or not changes:
             raise Invalid("changes must be a non-empty object")
-        entry.save_history()
+        self._archive_entry(entry)
         changed = []
         for name, value in changes.items():
             low = str(name).casefold()
@@ -1930,7 +2203,7 @@ class KdbxBackend(Backend):
         """Custom-field CRUD as its own verb, for a schema-driven UI."""
         self._mutable()
         entry = self._entry(uuid)
-        entry.save_history()
+        self._archive_entry(entry)
         self._set_custom(entry, name, {"value": value, "protected": protect})
         entry.touch(modify=True)
         return {"uuid": uuid, "changed": [name]}
@@ -1938,7 +2211,7 @@ class KdbxBackend(Backend):
     def custom_rm(self, uuid, name):
         self._mutable()
         entry = self._entry(uuid)
-        entry.save_history()
+        self._archive_entry(entry)
         self._set_custom(entry, name, None)
         entry.touch(modify=True)
         return {"uuid": uuid, "changed": [name]}
@@ -2022,17 +2295,22 @@ class KdbxBackend(Backend):
         self._kp.move_group(group, dest)
         return {"ok": True}
 
-    def attach_add(self, uuid, name, b64, replace=False):
-        """Attach bytes to an entry. The bytes arrive base64 in the request —
-        never as a path (I4), and never through a temp file (I10)."""
+    def attach_add(self, uuid, name, data, *, replace=False):
+        """Attach BYTES to an entry — never a path (I4), never a temp file (I10).
+
+        `data` is bytes and not base64: base64 is how the content crosses the
+        helper's stdin, and decoding it is the helper's job. A backend that
+        also accepted base64 would have two entry points for the same operation
+        and one of them would eventually get the length check wrong.
+        """
         self._mutable()
         entry = self._entry(uuid)
         if not isinstance(name, str) or not name:
             raise Invalid("an attachment needs a name")
-        try:
-            data = base64.b64decode(b64 or "", validate=True)
-        except (binascii.Error, ValueError, TypeError):
-            raise Invalid("the attachment content is not valid base64")
+        if isinstance(data, (bytearray, memoryview)):
+            data = bytes(data)
+        if not isinstance(data, bytes):
+            raise Invalid("the attachment content must be bytes")
         if len(data) > Limits.MAX_ATTACHMENT_BYTES:
             raise Invalid("the attachment is larger than the %d byte limit"
                           % Limits.MAX_ATTACHMENT_BYTES)
@@ -2044,7 +2322,7 @@ class KdbxBackend(Backend):
         # detach below sees the binary is still needed and leaves the pool
         # entry alone. Doing it the other way round loses the old attachment
         # from every historical version of the entry.
-        entry.save_history()
+        self._archive_entry(entry)
         if existing:
             self._detach(entry, name)
         binary_id = self._kp.add_binary(data)
@@ -2057,7 +2335,7 @@ class KdbxBackend(Backend):
         entry = self._entry(uuid)
         if not any(a.filename == name for a in entry.attachments):
             raise NotFound("no such attachment")
-        entry.save_history()
+        self._archive_entry(entry)
         self._detach(entry, name)
         entry.touch(modify=True)
         return {"ok": True}
@@ -2132,16 +2410,29 @@ class KdbxBackend(Backend):
         The CURRENT version is pushed onto the history first, so restoring is
         itself undoable — a restore that discards what you had is a data-loss
         bug wearing a feature's clothes.
+
+        `index` addresses `history()`'s list, oldest first. A NEGATIVE index is
+        `NotFound` and not a Python end-relative lookup: `history()` publishes
+        0..n-1, so `-1` is a caller that got its arithmetic wrong, and quietly
+        restoring the newest version instead of refusing would overwrite the
+        entry with something the operator never picked.
+
+        The version to restore is captured BEFORE the archive step on purpose.
+        `_archive_entry` prunes to the database's history policy and can drop
+        the very element being restored; the lxml element is already held here,
+        with its own subtree, so the restore still does what was asked.
         """
         self._mutable()
         entry = self._entry(uuid)
         versions = entry.history
         try:
             index = int(index)
-            old = versions[index]
-        except (TypeError, ValueError, IndexError):
+        except (TypeError, ValueError):
             raise NotFound("no such history version")
-        entry.save_history()
+        if index < 0 or index >= len(versions):
+            raise NotFound("no such history version")
+        old = versions[index]
+        self._archive_entry(entry)
         archived = deepcopy(old._element)
         hist = archived.find("History")
         if hist is not None:
@@ -2161,7 +2452,7 @@ class KdbxBackend(Backend):
             else:
                 parent.append(child)
         entry.touch(modify=True)
-        return {"uuid": uuid, "restored": index}
+        return {"uuid": uuid, "restored_from": index}
 
     def history_rm(self, uuid, index=None, all=False):      # noqa: A002
         self._mutable()
@@ -2172,8 +2463,17 @@ class KdbxBackend(Backend):
                 entry.delete_history(all=True)
             return {"ok": True, "removed": len(versions)}
         try:
-            old = versions[int(index)]
-        except (TypeError, ValueError, IndexError):
+            index = int(index)
+        except (TypeError, ValueError):
+            raise NotFound("no such history version")
+        # Same reasoning as history_restore: `history()` publishes 0..n-1, so a
+        # negative index is a caller mistake and must not silently delete the
+        # newest version instead.
+        if index < 0:
+            raise NotFound("no such history version")
+        try:
+            old = versions[index]
+        except IndexError:
             raise NotFound("no such history version")
         entry.delete_history(history_entry=old)
         return {"ok": True, "removed": 1}
@@ -2315,6 +2615,253 @@ class KdbxBackend(Backend):
         return {"ok": True, "backup": result["backup"],
                 "bytes": result["bytes"], "conflict": False}
 
+    def save_as(self, target_path, *, override_stale=False):
+        """Write this database to a NEW path. The original is not touched.
+
+        "Not touched" is enforced by construction rather than by care:
+
+          * `atomic_replace` is called with `expect_fingerprint=None` against a
+            path that `validate_new_path` has just proved does not exist, so it
+            never opens the original, never re-fingerprints it, and its backup
+            step finds nothing to back up. The original's `.bak.d` ring is not
+            entered at all.
+          * the `LockFile` taken is the TARGET's. Taking the original's would
+            be both pointless (we are not writing it) and harmful (it would
+            block the desktop client for the duration of a copy). That is also
+            what `override_stale` refers to here: two concurrent copies to the
+            same destination.
+          * `self.fingerprint` is deliberately NOT updated. It still describes
+            the file this object was unlocked from, so a later `save()` still
+            performs its changed-on-disk re-check against the right file (I13).
+
+        The refusals are `save()`'s, for `save()`'s reasons: KDBX 3.x is not
+        written at all (I20 — a new name does not give the format authenticated
+        encryption), and a database that would drop a field on serialisation
+        drops it into a copy just as thoroughly (I22).
+
+        `require_writable()` is deliberately NOT called. The registry's
+        `mode: "ro"` is a statement about THAT file — "do not modify this safe"
+        — and a copy modifies nothing. Whether the operator may write a
+        decrypted-then-re-encrypted database somewhere else at all is I21, and
+        that gate belongs to the helper, which owns `export_allowed` and the
+        destination directory.
+        """
+        self.require_unlocked()
+        if self._format_ro:
+            raise Unsupported(
+                "KDBX 3.x has no authenticated encryption, so this backend "
+                "never writes it; use upgrade_to_kdbx4 to convert it")
+        self._assert_lossless()
+        validate_new_path(target_path)
+
+        with LockFile(target_path, fmt="kdbx", override_stale=override_stale):
+            data = self._serialize(reseed=True)
+            # Same check `save()` runs, and for the sharper reason: this file
+            # is about to be the only copy of something an operator intends to
+            # rely on, and nothing else will ever have verified it.
+            self._verify_own_output(data)
+            result = atomic_replace(target_path, data,
+                                    expect_fingerprint=None)
+        return {"path": target_path, "bytes": result["bytes"]}
+
+    # -- plaintext export  (I21) ------------------------------------------
+
+    def export_plain(self, *, fmt):
+        """**The single most dangerous method in this codebase.** See the ABC.
+
+        One call returns every password, note, TOTP seed and protected custom
+        field in the safe, decrypted, in the clear — including every archived
+        password in every history version, which not even `reveal()` can reach.
+        It exists because an operator who cannot get their credentials out of a
+        tool does not trust the tool; it is gated because it is the shape of
+        every credential-exfiltration incident there has ever been (I21).
+
+        Three formats, all of which a foreign tool can actually read:
+
+          csv   KeePassXC's own ten export columns, in its order, so the file
+                imports into KeePassXC's CSV importer unchanged — then five
+                more of ours (tags, expiry, attachment NAMES, custom fields as
+                JSON) that KeePassXC's own CSV silently drops. Extra trailing
+                columns are ignored by a column-mapped importer.
+          xml   KeePass 2 XML in the dialect `keepassxc-cli export --format
+                xml` emits: protected values in the clear under
+                `ProtectInMemory="True"` rather than `Protected="True"`, which
+                is what tells a reader the value is NOT stream-encrypted. That
+                one attribute is the whole difference between a file KeePass
+                imports and a file it decodes into mojibake.
+          json  everything the other two cannot say — history, per-field
+                protection flags, icons, times, group tree — in this project's
+                own shape. No other tool reads it; it is the format for a
+                migration you are going to script.
+
+        Attachment CONTENT is excluded from all three and attachment NAMES are
+        listed. `keepassxc-cli export --format xml` does the same thing (it
+        writes `Ref="0"` for every binary), so this matches the reference tool
+        rather than inventing a rule.
+        """
+        self.require_unlocked()
+        if fmt == "csv":
+            return self._export_csv()
+        if fmt == "xml":
+            return self._export_xml()
+        if fmt == "json":
+            return self._export_json()
+        raise Unsupported("%s is not an export format this backend writes"
+                          % str(fmt)[:16])
+
+    #: KeePassXC 2.7.10's `export --format csv` header, verbatim and in order,
+    #: measured on this host. Ours are appended AFTER these so a column-mapped
+    #: importer that only knows KeePassXC's set still lines up.
+    _CSV_KEEPASSXC = ("Group", "Title", "Username", "Password", "URL", "Notes",
+                      "TOTP", "Icon", "Last Modified", "Created")
+    _CSV_EXTRA = ("Tags", "Expires", "Expiry Time", "Attachments",
+                  "Custom Fields")
+
+    def _export_csv(self):
+        buf = io.StringIO()
+        # QUOTE_ALL and CRLF are what KeePassXC writes and what RFC 4180 asks
+        # for. A password can contain a comma, a quote, a newline and a NUL-
+        # adjacent control character; quoting everything is the only setting
+        # under which the file a migrator reads back is the file we meant.
+        writer = csv.writer(buf, quoting=csv.QUOTE_ALL, lineterminator="\r\n")
+        writer.writerow(self._CSV_KEEPASSXC + self._CSV_EXTRA)
+        for entry in self._export_entries():
+            custom = {name: value for name, value, _p in
+                      self._custom_fields(entry)}
+            writer.writerow([
+                _group_path(entry.group),
+                entry.title or "",
+                entry.username or "",
+                entry.password or "",
+                entry.url or "",
+                entry.notes or "",
+                _totp_uri(entry),
+                str(entry.icon or ""),
+                _iso(entry.mtime),
+                _iso(entry.ctime),
+                ";".join(entry.tags or []),
+                "True" if entry.expires else "False",
+                _iso(entry.expiry_time) if entry.expires else "",
+                "; ".join(a.filename for a in entry.attachments),
+                json.dumps(custom, ensure_ascii=False, sort_keys=True)
+                if custom else "",
+            ])
+        return buf.getvalue().encode("utf-8")
+
+    def _export_xml(self):
+        """KeePass 2 XML, protected values in the clear, no attachment bytes."""
+        root = deepcopy(self._kp.tree.getroot())
+        # Protected="True" is the marker pykeepass's stream adapter matches on
+        # when it RE-ENCRYPTS a value at build time; a plaintext export that
+        # kept it would be read back as base64 ciphertext by anything that
+        # believed it. KeePassXC's own export renames it, and so do we.
+        for value in root.iter("Value"):
+            if (value.get("Protected") or "").strip() == "True":
+                del value.attrib["Protected"]
+                value.set("ProtectInMemory", "True")
+        # KDBX3 keeps attachment BYTES here as base64 gzip. KDBX4 keeps them in
+        # the inner header, which is not part of this tree at all, so this loop
+        # is the KDBX3 case and the one place bytes could leak into an export
+        # that promised only names.
+        meta = root.find("Meta")
+        if meta is not None:
+            binaries = meta.find("Binaries")
+            if binaries is not None:
+                meta.remove(binaries)
+        return etree.tostring(root, pretty_print=True, encoding="UTF-8",
+                              xml_declaration=True, standalone=True)
+
+    def _export_json(self):
+        groups = []
+        stack = [(self._kp.root_group, None, 0)]
+        while stack:
+            group, parent, depth = stack.pop()
+            if depth > Limits.MAX_GROUP_DEPTH:
+                raise Invalid("the group tree is nested deeper than %d levels"
+                              % Limits.MAX_GROUP_DEPTH)
+            uuid = str(group.uuid)
+            groups.append({"uuid": uuid, "name": group.name, "parent": parent,
+                           "path": _group_path(group),
+                           "notes": group.notes or ""})
+            for sub in reversed(group.subgroups):
+                stack.append((sub, uuid, depth + 1))
+
+        document = {
+            "format": "kdbx",
+            "version": self._header.version,
+            "generator": "cockpit-secrets %s" % VERSION,
+            "exported": _iso(_dt.datetime.now(_dt.timezone.utc)),
+            "database": {
+                "name": self._kp.database_name,
+                "description": self._kp.database_description,
+                "default_username": self._kp.default_username,
+            },
+            "groups": groups,
+            "entries": [self._export_entry_json(e, history=True)
+                        for e in self._export_entries()],
+        }
+        return json.dumps(document, ensure_ascii=False, indent=1,
+                          sort_keys=False).encode("utf-8")
+
+    def _export_entries(self):
+        """The entries an export covers, in the order `entries()` lists them.
+
+        Built from `self._index`, which `_reindex` already proved has no
+        duplicate uuid — so an export cannot silently carry two rows that a
+        later import would collapse into one.
+        """
+        return sorted(self._index.values(),
+                      key=lambda e: ((e.title or "").casefold(), str(e.uuid)))
+
+    @staticmethod
+    def _custom_fields(entry):
+        """`[(name, value, protected)]` for every non-reserved string field."""
+        out = []
+        for key in _entry_field_keys(entry):
+            if key in _RESERVED_FIELDS:
+                continue
+            out.append((key, _field_value(entry, key) or "",
+                        _field_protected(entry, key)))
+        return sorted(out)
+
+    def _export_entry_json(self, entry, history=False):
+        row = {
+            "uuid": str(entry.uuid),
+            "group": _group_path(entry.group) if entry.group is not None
+            else "",
+            "title": entry.title or "",
+            "username": entry.username or "",
+            "password": entry.password or "",
+            "url": entry.url or "",
+            "notes": entry.notes or "",
+            "tags": list(entry.tags or []),
+            "icon": entry.icon,
+            "custom_icon": entry._element.findtext("CustomIconUUID"),
+            "totp_uri": _totp_uri(entry),
+            "custom_fields": [{"name": n, "value": v, "protected": p}
+                              for n, v, p in self._custom_fields(entry)],
+            # Names and sizes. The bytes are what `attach_get` is for — see the
+            # method docstring for why an export does not carry them.
+            "attachments": [{"name": a.filename,
+                             "size": len(_attachment_bytes(a, strict=False))}
+                            for a in entry.attachments],
+            "expires": bool(entry.expires),
+            "times": {
+                "created": _iso(entry.ctime),
+                "modified": _iso(entry.mtime),
+                "accessed": _iso(entry.atime),
+                "expires": _iso(entry.expiry_time),
+            },
+        }
+        if history:
+            # One level only. A history version's own History element is
+            # stripped by KeePass when it archives, so there is nothing below
+            # this — and recursing on a file that DID nest them would be an
+            # unbounded walk over attacker-shaped XML.
+            row["history"] = [self._export_entry_json(old, history=False)
+                              for old in entry.history]
+        return row
+
     def _verify_own_output(self, data):
         """Re-run the full MAC verification over bytes we just built.
 
@@ -2390,18 +2937,13 @@ class KdbxBackend(Backend):
             KDBX4; it is removed rather than copied as a stale value.
         """
         self.require_unlocked()
-        if not isinstance(dest_path, str) or not dest_path.startswith("/"):
-            raise Invalid("the destination must be an absolute path")
-        if dest_path != os.path.normpath(dest_path):
-            # No "..", no doubled slashes, no trailing slash. The refusals
-            # below are all textual, and a path that does not equal its own
-            # normal form can walk straight past every one of them.
-            raise Invalid("the destination path must be in normal form")
-        if dest_path.startswith("/tmp/") or dest_path.startswith("/var/tmp/"):
-            raise Invalid("refusing to write a database under /tmp")
-        if os.path.lexists(dest_path):
-            raise Conflict("the destination already exists; "
-                           "this never overwrites")
+        # The absolute / normal-form / not-under-/tmp / does-not-already-exist
+        # rules used to be spelled out here and are now `validate_new_path` in
+        # base.py, shared with `save_as`. Two copies of a refusal list is how
+        # one of them quietly loses a case: this is the only other operation
+        # that creates a database at a path the registry does not name, and it
+        # must refuse exactly what that one refuses.
+        validate_new_path(dest_path)
         if self._header.major >= 4:
             raise Invalid("this database is already KDBX 4")
         if password is None:
@@ -2496,6 +3038,85 @@ def _totp_remaining(otp):
     """Seconds until the current TOTP window rolls over."""
     interval = getattr(otp, "interval", 30) or 30
     return int(interval - (int(time.time()) % interval))
+
+
+def _group_path(group):
+    """`"Root/Lab/Nested"` — the slash form `keepassxc-cli export` writes.
+
+    Built by walking `parentgroup` rather than by using pykeepass's own `path`,
+    because that property renders the root as an empty component and an export
+    column that starts with a bare "/" for every top-level entry is one a
+    migrator has to clean up by hand. The depth cap is here and not only in
+    `tree()`: a cyclic parent chain in a hand-built file would otherwise spin
+    forever inside an export, which is the one operation that has no other
+    bound on its work.
+    """
+    parts = []
+    walk = group
+    while walk is not None:
+        if len(parts) > Limits.MAX_GROUP_DEPTH:
+            raise Invalid("the group tree is nested deeper than %d levels"
+                          % Limits.MAX_GROUP_DEPTH)
+        parts.append(walk.name or "")
+        walk = walk.parentgroup
+    return "/".join(reversed(parts))
+
+
+def _totp_uri(entry):
+    """The entry's OTP configuration as an `otpauth://` URI, or `""`.
+
+    An export has to carry the SEED, not a code: a code is valid for thirty
+    seconds and a migration is not. `otpauth://` is the one encoding every
+    authenticator, KeePassXC and KeePass 2.x all accept, so both stored
+    dialects are normalised into it here rather than exported as whichever
+    private form the database happened to use.
+
+    Returns `""` — never raises — for an entry whose OTP configuration is
+    malformed. An export must not fail on one bad row out of a thousand; the
+    other 999 credentials are why the operator ran it.
+    """
+    kind = _otp_config(entry)
+    if kind is None:
+        return ""
+    label = urllib.parse.quote(entry.title or "OTP", safe="")
+    account = urllib.parse.quote(entry.username or "", safe="")
+    path = "%s:%s" % (label, account) if account else label
+    try:
+        if kind == "otp":
+            raw = _field_value(entry, "otp") or ""
+            if raw.startswith("otpauth://"):
+                return raw                    # already the portable form
+            params = {}
+            for part in raw.split("&"):
+                if "=" in part:
+                    name, _, value = part.partition("=")
+                    params[name.strip().casefold()] = value.strip()
+            seed = params.get("key")
+            if not seed:
+                return ""
+            query = {"secret": _b32(seed, "base32"),
+                     "period": params.get("step") or "30",
+                     "digits": params.get("size") or "6"}
+            return "otpauth://totp/%s?%s" % (
+                path, urllib.parse.urlencode(query))
+        if kind == "timeotp":
+            seed, encoding = _read_otp_secret(entry, _TIMEOTP_SECRET_FIELDS)
+            algo = (_field_value(entry, "TimeOtp-Algorithm") or "").upper()
+            query = {
+                "secret": _b32(seed, encoding),
+                "period": _field_value(entry, "TimeOtp-Period") or "30",
+                "digits": _field_value(entry, "TimeOtp-Length") or "6",
+                "algorithm": {"HMAC-SHA-256": "SHA256",
+                              "HMAC-SHA-512": "SHA512"}.get(algo, "SHA1"),
+            }
+            return "otpauth://totp/%s?%s" % (
+                path, urllib.parse.urlencode(query))
+        seed, encoding = _read_otp_secret(entry, _HMACOTP_SECRET_FIELDS)
+        query = {"secret": _b32(seed, encoding),
+                 "counter": _field_value(entry, "HmacOtp-Counter") or "0"}
+        return "otpauth://hotp/%s?%s" % (path, urllib.parse.urlencode(query))
+    except (Invalid, Unsupported):
+        return ""
 
 
 def _read_otp_secret(entry, candidates):
@@ -2597,4 +3218,241 @@ def _convert_times_to_kdbx4(root):
         el.text = base64.b64encode(struct.pack("<Q", seconds)).decode("ascii")
 
 
-__all__ = ["KdbxBackend", "VERSION"]
+# ===========================================================================
+# self-check — runnable proof, in the shape base.py and psafe3.py set
+# ===========================================================================
+
+def _selfcheck():                                       # noqa: C901
+    """`python3 -m backends.kdbx` — prove the parts nothing else can reach.
+
+    This exists because two things in this module have no other test:
+
+      * **the challenge-response key composition.** There is no YubiKey on this
+        host, so the end-to-end path cannot run at all. What CAN be checked is
+        the arithmetic — that the response is hashed before it joins the
+        composite, that it joins LAST, and that the challenge is PKCS#7-padded
+        to 64 bytes — and each of those is a value that produces a wrong key
+        silently rather than an error when it is wrong.
+      * **Twofish-CBC decryption.** The committed Twofish fixture is KDBX4, so
+        it exercises the pykeepass payload path; `_decrypt_prefix`'s Twofish
+        branch is KDBX3-only and no KDBX3+Twofish fixture exists. It is checked
+        here directly against ciphertext Botan produced.
+
+    Honest about what the vectors below are (I19): the composite-key digests
+    are **regression** vectors, not interop vectors. Nobody but us has ever
+    computed them. They pin the construction against a restatement of
+    KeePassXC's `CompositeKey::rawKey(transformSeed)` written beside them, so
+    an edit that reorders the concatenation or forgets the SHA-256 fails —
+    which is their whole job. They do NOT show that a real YubiKey and a real
+    KeePassXC would agree with us, and nothing on this host can.
+    """
+    import shutil
+    import tempfile
+
+    failures = []
+
+    def ok(label, cond):
+        print("  %s  %s" % ("PASS" if cond else "FAIL", label))
+        if not cond:
+            failures.append(label)
+
+    def raises(label, exc_type, fn):
+        try:
+            fn()
+        except exc_type:
+            ok(label, True)
+            return
+        except Exception as exc:                        # noqa: BLE001
+            ok("%s (got %s)" % (label, type(exc).__name__), False)
+            return
+        ok("%s (no error raised)" % label, False)
+
+    print("== hardware-token challenge and key composition ==")
+    seed = bytes(range(32))
+    ok("a 32-byte challenge is PKCS#7-padded to 64",
+       _pkcs7_to(seed, 64) == seed + b"\x20" * 32)
+    ok("an already-64-byte challenge is unchanged",
+       _pkcs7_to(bytes(64), 64) == bytes(64))
+    raises("an over-long challenge -> Invalid", Invalid,
+           lambda: _pkcs7_to(bytes(65), 64))
+
+    response = bytes(range(20))
+    ok("the component is SHA-256 OF the response, not the response",
+       _yubikey_component(response) == hashlib.sha256(response).digest())
+    raises("a 19-byte response -> Invalid", Invalid,
+           lambda: _yubikey_component(bytes(19)))
+    raises("a 32-byte response -> Invalid", Invalid,
+           lambda: _yubikey_component(bytes(32)))
+
+    pw = Secret("correct horse battery staple")
+    keyfile = Secret(bytes(range(32)))          # 32 raw bytes: used verbatim
+    try:
+        # The restatement, written from CompositeKey.cpp rather than from the
+        # implementation: hash every static key first, then the SHA-256 of the
+        # challenge-response answer, then SHA-256 the lot.
+        want_pw_cr = hashlib.sha256(
+            hashlib.sha256(bytes(pw.bytes)).digest()
+            + hashlib.sha256(response).digest()).digest()
+        want_all = hashlib.sha256(
+            hashlib.sha256(bytes(pw.bytes)).digest()
+            + bytes(keyfile.bytes)
+            + hashlib.sha256(response).digest()).digest()
+        got_pw_cr = _composite_key(pw, None, _yubikey_component(response))
+        got_all = _composite_key(pw, keyfile, _yubikey_component(response))
+
+        ok("passphrase + token matches the restatement",
+           constant_time_eq(got_pw_cr, want_pw_cr))
+        ok("passphrase + key file + token matches the restatement",
+           constant_time_eq(got_all, want_all))
+        # Frozen so that editing the code AND the restatement together still
+        # fails. Computed here, by us, once — see the docstring.
+        ok("passphrase + token matches the frozen regression vector",
+           binascii.hexlify(got_pw_cr) == b"2ec9767e4a9bbeefd0294073f04bc2bf"
+                                          b"7eaf8202119af35eb92be2e007f16b72")
+        ok("passphrase + key file + token matches the frozen vector",
+           binascii.hexlify(got_all) == b"7c99602d2ea8f4da6878cf0d38033b23"
+                                        b"4a8141f084558ee8802c74afcb9cc553")
+        # The ORDER is the thing a refactor breaks silently.
+        ok("the token component is appended LAST, not prepended",
+           not constant_time_eq(
+               got_pw_cr,
+               hashlib.sha256(hashlib.sha256(response).digest()
+                              + hashlib.sha256(bytes(pw.bytes)).digest()
+                              ).digest()))
+        ok("no token means the composite is unchanged from before",
+           constant_time_eq(
+               _composite_key(pw, None),
+               hashlib.sha256(hashlib.sha256(bytes(pw.bytes)).digest()
+                              ).digest()))
+    finally:
+        pw.zero()
+        keyfile.zero()
+
+    print("\n== Twofish-CBC decryption (the KDBX3 branch) ==")
+    try:
+        import botan3 as botan
+    except ImportError:
+        print("  skip  python3-botan is not installed — the Twofish branch "
+              "DID NOT RUN")
+    else:
+        key = hashlib.sha256(b"twofish selfcheck key").digest()
+        iv = bytes(range(16))
+        plain = b"KDBX3 stream start bytes, exactly 32 bytes here!"[:32]
+        bc = botan.BlockCipher("Twofish")
+        bc.set_key(key)
+        cipher = bytearray()
+        prev = iv
+        for off in range(0, len(plain), 16):
+            block = bytes(a ^ b for a, b in zip(plain[off:off + 16], prev))
+            prev = bytes(bc.encrypt(block))
+            cipher += prev
+        hdr = KdbxHeader()
+        hdr.cipher = "twofish"
+        hdr.encryption_iv = iv
+        ok("Botan-encrypted Twofish-CBC decrypts back to the plaintext",
+           _decrypt_prefix(hdr, key, bytes(cipher), 32) == plain)
+
+    print("\n== the committed Twofish fixture ==")
+    fixture = os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "tests", "fixtures",
+        "lab-kdbx40-twofish-argon2d.kdbx")
+    if not os.path.exists(fixture):
+        print("  skip  %s is not present" % os.path.basename(fixture))
+    else:
+        # NOT /tmp. `save_as` refuses a destination there (world-writable, and
+        # a decrypted-then-re-encrypted database landing in it is a
+        # disclosure), so a scratch directory under /tmp would fail the very
+        # check it is hosting. The XDG runtime directory is private, on this
+        # host's own filesystem, and cleaned up by the session — the same
+        # choice tests/integration/_env.py made for the same reason.
+        base = os.environ.get("XDG_RUNTIME_DIR") or os.path.expanduser(
+            "~/.cache")
+        try:
+            os.makedirs(base, exist_ok=True)
+        except OSError:
+            base = None
+        tmp = tempfile.mkdtemp(prefix="kdbx-selfcheck-", dir=base)
+        os.chmod(tmp, 0o700)
+        can_write_here = not tmp.startswith(("/tmp/", "/var/tmp/"))
+        try:
+            # Copied because open_safe_fd refuses a safe whose parent directory
+            # is group-writable, and this source tree is 0775 over SMB. That
+            # refusal is I5 working, not a problem with the fixture.
+            local = os.path.join(tmp, "twofish.kdbx")
+            shutil.copy2(fixture, local)
+            os.chmod(local, 0o600)
+            before = hashlib.sha256(open(local, "rb").read()).hexdigest()
+
+            backend = KdbxBackend({"id": "tf", "label": "tf", "format": "kdbx",
+                                   "path": local, "access": "admin",
+                                   "mode": "rw"})
+            secret = Secret("fixture-pass-do-not-reuse")
+            try:
+                backend.unlock(secret, None)
+            finally:
+                secret.zero()
+            rows = backend.entries(limit=50)["entries"]
+            router = [r for r in rows if r["title"] == "Router"][0]
+            ok("the Twofish fixture opens and lists both entries",
+               sorted(r["title"] for r in rows) == ["Router", "Switch"])
+            ok("its protected password decrypts",
+               backend.reveal(router["uuid"], "password")["value"]
+               == "SENTINEL-DO-NOT-LEAK-8f3a2b")
+            ok("history() on an entry with none is an empty list",
+               backend.history(router["uuid"]) == [])
+
+            for fmt, needle in (("csv", b"SENTINEL-DO-NOT-LEAK-8f3a2b"),
+                                ("xml", b'ProtectInMemory="True"'),
+                                ("json", b'"totp_uri"')):
+                blob = backend.export_plain(fmt=fmt)
+                ok("the %s export is produced and holds what it claims" % fmt,
+                   isinstance(blob, bytes) and needle in blob)
+            raises("an unknown export format -> Unsupported", Unsupported,
+                   lambda: backend.export_plain(fmt="sqlite"))
+            ok("no export carries attachment bytes",
+               b"twofish fixture attachment"
+               not in backend.export_plain(fmt="json"))
+
+            copy = os.path.join(tmp, "copy.kdbx")
+            raises("save_as under /tmp -> Invalid", Invalid,
+                   lambda: backend.save_as("/tmp/never-written.kdbx"))
+            raises("save_as to a relative path -> Invalid", Invalid,
+                   lambda: backend.save_as("copy.kdbx"))
+            if not can_write_here:
+                print("  skip  no scratch directory outside /tmp is "
+                      "available — the save_as checks DID NOT RUN")
+            else:
+                result = backend.save_as(copy)
+                ok("save_as wrote the copy", os.path.exists(copy)
+                   and result["bytes"] > 0)
+                after = hashlib.sha256(open(local, "rb").read()).hexdigest()
+                # constant_time_eq and not `==`: this is a digest comparison,
+                # and every digest comparison in this tree goes through the one
+                # helper so that the standing ban in validate.sh can be a plain
+                # grep rather than a judgement call about which ones matter.
+                ok("save_as left the original byte-for-byte identical",
+                   constant_time_eq(after, before))
+                ok("save_as took no backup of the original",
+                   not os.path.exists(local + ".bak.d"))
+                ok("save_as left no lock file beside the original",
+                   not os.path.exists(local + ".lock"))
+                raises("save_as onto an existing path -> Conflict", Conflict,
+                       lambda: backend.save_as(copy))
+            backend.lock()
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    print()
+    if failures:
+        print("kdbx self-check: %d FAILURE(S)" % len(failures))
+        return 1
+    print("kdbx self-check: OK")
+    return 0
+
+
+if __name__ == "__main__":
+    import sys
+    sys.exit(_selfcheck())
+
+
+__all__ = ["KdbxBackend", "challenge_for", "VERSION"]

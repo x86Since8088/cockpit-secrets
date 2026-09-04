@@ -72,13 +72,52 @@
  *             fields: [FIELD]|null,             — control "object": a subform
  *             partial: bool }                   — object: send only what changed
  *
- *   controls seen: text · textarea · password · number · toggle · select ·
- *                  search · tags · file-bytes · object · hidden
+ *   controls: the helper publishes the closed list as enums.control, and this
+ *   page draws every one of them —
+ *       text · password · password-reveal · number · toggle · select · radio ·
+ *       textarea · tags · search · object · file-bytes · readonly · hidden
+ *   plus the aliases a differently-shaped schema might use for the same thing.
  *
  * A control type this page does not know is drawn as text WITH A VISIBLE NOTE,
  * never dropped. Where the schema says nothing (the keys of an entries[] row,
  * for instance) the page falls back to what docs/CONTRACT.md pins and says so
  * at the point of use.
+ *
+ * ------------------------------------------------------------------------
+ * THE SECOND WAVE OF CAPABILITIES, AND THE ONE RULE THEY ALL OBEY
+ *
+ * Export, save-as, the backup ring, entry history, attachment upload/replace/
+ * removal, the strength meter, the breach check, the agent banner and the
+ * YubiKey challenge are all rendered the same way everything else here is:
+ * from the schema, or not at all. Each one is reached through verbFor(), which
+ * asks the helper's own verb table for the name; when the helper does not
+ * publish the verb, the control does not exist. There is no build of this page
+ * that shows an Export button to a helper with no export verb.
+ *
+ * Three of them carry an extra gate beyond "the verb exists", because the verb
+ * existing is not the same question as "may this safe do it":
+ *
+ *   EXPORT (I21)   also needs `export_allowed` on the safe's own `list` row,
+ *                  and the row omitting the key means NO — the restrictive
+ *                  default, the same way a registry entry with no `access` is
+ *                  admin (I1). The confirm names the destination path in plain
+ *                  words before the operator can proceed, and the result view
+ *                  reports the path and the byte count and NOTHING ELSE: the
+ *                  exported plaintext is never rendered in this browser.
+ *
+ *   BREACH         also needs the helper to say a corpus is configured. When it
+ *                  answers available:false the page prints the REASON it gave;
+ *                  the feature is never dropped silently, because "the button
+ *                  is missing" and "there is no corpus" look identical from the
+ *                  outside and only one of them is a configuration problem.
+ *
+ *   AGENT (I18)    is not a capability the page offers at all — it is a state
+ *                  the page REPORTS. The banner exists only while the helper
+ *                  says a safe is being held, it is above the view switch so it
+ *                  survives navigating anywhere, and there is no placeholder
+ *                  when nothing is held. An unlocked safe must never be
+ *                  invisible; an agent that is off must not look like one that
+ *                  is on and idle.
  * ------------------------------------------------------------------------
  */
 (function () {
@@ -99,6 +138,31 @@
     var PERM = null;            // cockpit.permission({admin:true})
     var SESSION = null;         // the one open unlock session, or null
     var BROWSE = null;          // the browse view's state for that session
+
+    /* The agent's own state (I18). `rows` is what the helper last said it is
+     * holding — never what this page decided; an empty array means the banner
+     * is empty, which is the default because the agent is off by default.
+     * Nothing in here is a handle: the page cannot use an agent's unlock, it
+     * can only display it and ask for it to be locked. */
+    var AGENT = { rows: [], timer: null, poll: null, said: "", failed: null,
+                  polling: false };
+
+    /* Breach-corpus availability, asked once per safe and cached for the page's
+     * life. Per safe, not once globally, because the helper's breach verb is
+     * `needs: "safe"` and `access: "class"` — whether a corpus is configured is
+     * a question about a registry entry, and two safes need not answer it the
+     * same way. Each entry is { state, reason, pending } where state is
+     * "asking" | "yes" | "no" | "error". */
+    var BREACH = {};
+
+    /* The last `health` reply. It is the one verb that answers two questions
+     * this page needs and cannot get anywhere else: what the unlock agent is
+     * holding (I18), and where an export of a given safe would actually land
+     * (I21) — the registry may override the default directory per entry, and
+     * the confirm has to name the real destination, not a plausible one.
+     * Fetched once at load, unescalated, and re-fetched only while there is an
+     * agent to watch. */
+    var HEALTH = null;
 
     /* Wipers: one function per rendered secret, so lock() scrubs the DOM
      * rather than merely navigating away from it (I17, task rule 7). */
@@ -130,6 +194,42 @@
         "group-rm": 1, "group-mv": 1, "generate": 1, "health": 1,
         "audit-tail": 1
     };
+    /* Verb names docs/CONTRACT.md does NOT pin.
+     *
+     * The contract fixes the twenty-two verbs of the first build by name. The
+     * capabilities added afterwards are fixed by SIGNATURE — the task brief
+     * agreed `export_plain`, `save_as`, `history`, `history_restore`,
+     * `attach_add`, `attach_rm` on the Backend ABC — but the helper is free to
+     * spell the verb that carries each one however it likes.
+     *
+     * So this page does not hard-code a name; it asks the helper's verb table
+     * for the first spelling it actually publishes. Each list below is ordered
+     * most-likely-first and every entry is a name a reasonable helper might
+     * choose for that signature. A helper that publishes none of them gets NO
+     * control for that capability, which is the correct outcome: this page
+     * renders nothing it invented, and a button that calls a verb the helper
+     * does not have is exactly that.
+     *
+     * There is deliberately NO alias here for the agent. Its state does not
+     * arrive through a verb of its own: `health` reports what the daemon is
+     * holding, and `lock` accepts a bare safe id to release it. Both are
+     * contract verbs with fixed names, so the agent banner needs no discovery
+     * — see the agent section below. */
+    var VERB_ALIASES = {
+        "export":         ["export", "export-plain", "export-db", "export-database"],
+        "saveAs":         ["save-as", "save_as", "saveas", "save-copy"],
+        "backups":        ["backups", "backup-list", "backups-list", "backup-ls"],
+        "restore":        ["restore", "backup-restore", "restore-backup"],
+        "history":        ["history", "entry-history", "history-list"],
+        "historyRestore": ["history-restore", "restore-history", "entry-restore"],
+        "attachAdd":      ["attach-add", "attach-put", "attach-set"],
+        "attachRm":       ["attach-rm", "attach-remove", "attach-del"],
+        "attachList":     ["attach-list", "attachments", "attach-ls"],
+        "strength":       ["strength", "password-strength", "strength-check"],
+        "breach":         ["breach", "breach-check", "pwned", "hibp"],
+        "yubikey":        ["yubikey-challenge", "yubikey", "challenge"]
+    };
+
     /* The keys docs/CONTRACT.md pins for one entries[] row. Used only when the
      * schema declares no list columns. */
     var CONTRACT_LIST_COLUMNS = [
@@ -165,7 +265,20 @@
     }
     function txt(v) {
         if (v === undefined || v === null) return "";
-        if (Array.isArray(v)) return v.join(", ");
+        if (Array.isArray(v))
+            return v.map(function (x) {
+                /* An array of OBJECTS — an attachment list is one, [{name,size}]
+                 * — joined with the default toString gives "[object Object]",
+                 * which is the least useful string in JavaScript and exactly
+                 * what the entry metadata panel was printing. Prefer whatever
+                 * the object calls itself; fall back to its JSON rather than to
+                 * that. */
+                if (x && typeof x === "object")
+                    return String(x.name !== undefined ? x.name
+                                : (x.label !== undefined ? x.label
+                                : (x.id !== undefined ? x.id : JSON.stringify(x))));
+                return String(x);
+            }).join(", ");
         if (typeof v === "object") return JSON.stringify(v);
         return String(v);
     }
@@ -175,6 +288,34 @@
         var m = Math.floor(s / 60);
         var r = s % 60;
         return m + ":" + (r < 10 ? "0" : "") + r;
+    }
+
+    /* Byte counts, for backups, attachments and exports. Binary units because
+     * that is what a file size is, and the exact figure in parentheses because
+     * "1.4 MiB" is not enough to notice that yesterday's backup is a tenth of
+     * the size of today's. */
+    function fmtBytes(n) {
+        var v = Number(n);
+        if (!isFinite(v) || v < 0) return "";
+        if (v < 1024) return v + " bytes";
+        var units = ["KiB", "MiB", "GiB", "TiB"];
+        var i = -1;
+        var x = v;
+        while (x >= 1024 && i < units.length - 1) { x /= 1024; i++; }
+        return x.toFixed(x < 10 ? 1 : 0) + " " + units[i] + " (" + v + " bytes)";
+    }
+
+    /* A timestamp from the helper, in the operator's own locale and zone.
+     *
+     * The helper writes UTC; the person reading the backup list is deciding
+     * "is this the copy from before I broke it", and they think in local time.
+     * Anything unparseable is printed verbatim rather than turned into
+     * "Invalid Date" — the helper's string is more useful than our failure. */
+    function fmtWhen(v) {
+        if (v === undefined || v === null || v === "") return "";
+        var d = (typeof v === "number") ? new Date(v * 1000) : new Date(String(v));
+        if (!d || isNaN(d.getTime())) return String(v);
+        try { return d.toLocaleString(); } catch (e) { return d.toISOString(); }
     }
 
     /* The polite live region: one sentence per state change. The visible
@@ -513,6 +654,27 @@
             if (hasVerb(names[i])) return names[i];
         return null;
     }
+    /* The name this helper actually publishes for one of the capabilities in
+     * VERB_ALIASES, or null when it publishes none of them. Every second-wave
+     * control on this page is behind one of these. */
+    function verbFor(key) { return findVerb(VERB_ALIASES[key] || []); }
+
+    /* Does this page already draw a purpose-built control for that verb?
+     *
+     * HANDLED_VERBS answers it for the twenty-two the contract names. The
+     * second wave has to be resolved through the alias table instead, because
+     * the name is the helper's choice — and the answer has to be right, or the
+     * generic "every unhandled verb gets a button" loops below would put a
+     * second, unlabelled Export button next to the purpose-built one that
+     * carries the confirm. A generic button for `export` would be an export
+     * with no warning attached, which is precisely the thing I21 forbids. */
+    function isHandled(name) {
+        if (HANDLED_VERBS[name]) return true;
+        var keys = Object.keys(VERB_ALIASES);
+        for (var i = 0; i < keys.length; i++)
+            if (verbFor(keys[i]) === name) return true;
+        return false;
+    }
     /* A verb's form: its `request` list of field ids, resolved through the
      * field dictionary. A dict-shaped schema may inline `args` instead. */
     function verbArgs(name) {
@@ -681,6 +843,396 @@
     }
 
     /* ================================================================== *
+     * Password strength, and the breach corpus
+     *
+     * Both are the helper's opinion, rendered. Neither is computed here, and
+     * that is not laziness: a scorer written in this file would be a number
+     * this page invented, and the whole design rule is that it does not invent
+     * numbers. The helper owns the entropy model and the dictionary; this page
+     * owns five rectangles and a sentence.
+     *
+     * THE COST, STATED PLAINLY. A live meter sends the candidate password to
+     * the helper on every debounced keystroke, so the string leaves the browser
+     * more than once instead of exactly once. It leaves the same way every
+     * other secret does — as JSON on the helper's stdin, which is then closed;
+     * never on argv, never in the environment (I10) — and no reference to it is
+     * kept here between two calls. It is switched OFF for the unlock dialog,
+     * where it would be both useless (the passphrase is whatever already opens
+     * the file) and wasteful (N more copies of the master passphrase in flight
+     * to answer a question nobody asked).
+     * ================================================================== */
+
+    /* Which request field a verb wants the candidate in. Read from the verb's
+     * own descriptor — the first field it marks secret — so a helper that calls
+     * it `candidate` or `value` instead of `password` works with no edit. */
+    function secretArgName(verbName, fallback) {
+        var args = verbArgs(verbName), i, n;
+        for (i = 0; i < args.length; i++)
+            if (isSecretSpec(args[i])) return specName(args[i]);
+        /* No field is marked secret. Take the first that is not one of the
+         * plumbing fields the caller supplies, rather than guessing a name. */
+        for (i = 0; i < args.length; i++) {
+            n = specName(args[i]);
+            if (n && n !== "handle" && n !== "safe" && n !== "session") return n;
+        }
+        return fallback;
+    }
+
+    /* Send one candidate to one verb and drop our reference to it immediately.
+     * Both call paths serialize the body synchronously — callOnce writes it
+     * inside the Promise executor, and a session frame is stringified inside
+     * send() — so by the time this returns, the value is on its way and the
+     * object we built no longer needs to hold it. */
+    function callWithCandidate(verbName, value, extra) {
+        var field = secretArgName(verbName, "value");
+        var inner = {};
+        Object.keys(extra || {}).forEach(function (k) { inner[k] = extra[k]; });
+        inner[field] = value;
+        var env = envelopeFor(verbName);
+        var body = inner;
+        if (env) { body = {}; body[env] = inner; }
+        var p = (needsSession(verbName) && SESSION)
+            ? SESSION.call(verbName, body)
+            : callOnce(verbName, body, adminForVerb(verbName));
+        inner[field] = null;
+        return p;
+    }
+
+    /* Availability of the breach corpus, asked once per safe.
+     *
+     * The helper's breach verb is `needs: "safe"`, and the question it answers
+     * is "is a corpus configured for THIS registry entry" — so this asks with
+     * the safe and no candidate. A helper with no corpus answers
+     * {available:false, reason} and the reason is what gets printed; one that
+     * has a corpus either says available:true or complains that the request is
+     * missing its candidate, and both of those mean "the corpus is there, ask
+     * properly".
+     *
+     * The outcome this refuses is a check that disappears in silence. "No
+     * button" and "no corpus" look identical from the outside, and only one of
+     * them is something an operator can go and fix — so an unavailable corpus
+     * prints the helper's sentence where the button would have been.
+     *
+     * Note what is NOT sent here: no candidate. Asking whether the feature
+     * exists must not cost a password.
+     */
+    function breachAvailability(safeId) {
+        var key = safeId || "";
+        var st = BREACH[key];
+        if (st && st.pending) return st.pending;
+        st = BREACH[key] = { state: "asking", reason: "", pending: null };
+        var verb = verbFor("breach");
+        if (!verb) {
+            st.state = "no";
+            st.pending = Promise.resolve(st);
+            return st.pending;
+        }
+        var req = {};
+        if (safeId) req.safe = safeId;
+        st.pending = callOnce(verb, req, adminForVerb(verb, safeSpecById(safeId)))
+        .then(function (res) {
+            if (res && res.available === false) {
+                st.state = "no";
+                st.reason = String(res.reason || res.detail ||
+                    "the helper reports no breach corpus is configured");
+            } else {
+                st.state = "yes";
+                st.reason = "";
+            }
+            return st;
+        }).catch(function (e) {
+            /* "invalid" from a candidate-less request is the corpus saying it
+             * is there and wants the real question. Anything else is reported
+             * with the helper's own sentence rather than swallowed. */
+            if (errCode(e) === "invalid") { st.state = "yes"; st.reason = ""; }
+            else { st.state = "error"; st.reason = errText(e); }
+            return st;
+        });
+        return st.pending;
+    }
+
+    /* The registry row for a safe id, for the escalation decision. */
+    function safeSpecById(id) {
+        if (!id) return null;
+        for (var i = 0; i < SAFES.length; i++)
+            if (SAFES[i] && SAFES[i].id === id) return SAFES[i];
+        return null;
+    }
+
+    /* strengthWidget() -> { node, update(value), reset() }
+     *
+     * `update` is debounced; `reset` clears the readout and is what a control's
+     * wipe() calls, so locking or clearing a form does not leave "18 bits,
+     * found in 4 breaches" sitting under an emptied box. */
+    function strengthWidget() {
+        var verb = verbFor("strength");
+        var breachVerb = verbFor("breach");
+        var node = el("div", "sec-strength");
+        var track = el("div", "sec-strength-track");
+        var segs = [];
+        var i;
+        for (i = 0; i < 5; i++) {
+            var sg = el("span", "sec-strength-seg");
+            segs.push(sg);
+            track.appendChild(sg);
+        }
+        track.hidden = true;
+        track.setAttribute("aria-hidden", "true");   /* the text below IS the message */
+        node.appendChild(track);
+
+        /* One sentence per debounced answer, not one per keystroke: the region
+         * is polite and atomic, and nothing writes to it while the operator is
+         * still typing. */
+        var text = el("div", "sec-strength-text");
+        text.setAttribute("role", "status");
+        text.setAttribute("aria-live", "polite");
+        text.setAttribute("aria-atomic", "true");
+        node.appendChild(text);
+        var weak = el("ul", "sec-weak");
+        weak.hidden = true;
+        node.appendChild(weak);
+        var breachLine = el("div", "sec-breach");
+        node.appendChild(breachLine);
+
+        var timer = null;
+        var inFlight = 0;
+
+        function paint(lit, total) {
+            if (!isFinite(lit) || lit < 0 || !isFinite(total) || total <= 0) {
+                /* No scale published, so no bar. Drawing five segments against
+                 * a threshold this file made up would be this page inventing
+                 * the verdict, which is the one thing it may not do. The
+                 * entropy figure and the weaknesses below still say everything
+                 * the helper actually said. */
+                track.hidden = true;
+                return;
+            }
+            track.hidden = false;
+            /* The helper's five categories map one-for-one onto five segments
+             * here. If it ever publishes a different number, the ratio still
+             * holds and the bar still means what the helper said. */
+            lit = Math.max(0, Math.min(segs.length, Math.round((lit / total) * segs.length)));
+            var cls = lit <= 1 ? "bad" : (lit <= 3 ? "warn" : "on");
+            segs.forEach(function (sg, ix) {
+                sg.className = "sec-strength-seg" + (ix < lit ? " " + cls : "");
+            });
+        }
+
+        function reset() {
+            if (timer) { window.clearTimeout(timer); timer = null; }
+            inFlight++;                       /* invalidate any answer in flight */
+            text.textContent = "";
+            clear(weak);
+            weak.hidden = true;
+            clear(breachLine);
+            breachLine.className = "sec-breach";
+            paint(NaN, NaN);
+        }
+
+        /* The helper publishes strength_category as an ORDERED list — very-weak,
+         * weak, fair, strong, excellent — each with the effective-bit threshold
+         * that defines it. THAT LIST IS THE SCALE, and it is the helper's,
+         * which is the only reason this page is willing to draw a bar at all. A
+         * helper that stops publishing it gets the text and no bar, rather than
+         * five rectangles measured against a number invented here. */
+        function categoryScale() {
+            var e = SCHEMA && SCHEMA.enums && SCHEMA.enums.strength_category;
+            return Array.isArray(e) ? e : [];
+        }
+        function categoryEntry(value) {
+            var scale = categoryScale();
+            for (var i = 0; i < scale.length; i++)
+                if (String(scale[i].value) === String(value))
+                    return { index: i, total: scale.length, spec: scale[i] };
+            return null;
+        }
+
+        function render(res) {
+            var bits = Number(res && res.entropy_bits);
+            var eff = Number(res && res.effective_bits);
+            var cat = categoryEntry(res && res.category);
+
+            clear(text);
+            /* effective_bits leads, because it is the figure the category is
+             * derived from: raw entropy minus what each named weakness costs.
+             * Both are shown when they differ, because the GAP is the finding —
+             * "62 bits, 34 after its weaknesses" says more than either alone. */
+            if (isFinite(eff)) {
+                text.appendChild(el("span", "bits", Math.round(eff) + " bits"));
+                text.appendChild(document.createTextNode(" of effective entropy"));
+                if (isFinite(bits) && Math.round(bits) !== Math.round(eff))
+                    text.appendChild(document.createTextNode(
+                        " (" + Math.round(bits) + " before its weaknesses)"));
+            } else if (isFinite(bits)) {
+                text.appendChild(el("span", "bits", Math.round(bits) + " bits"));
+                text.appendChild(document.createTextNode(" of entropy"));
+            }
+            if (cat) {
+                text.appendChild(document.createTextNode(
+                    (text.firstChild ? " — " : "") + String(cat.spec.label)));
+                /* The threshold sentence the helper wrote for this category. It
+                 * is the difference between being told "Fair" and knowing what
+                 * fair buys you, and it is not this page's sentence to write. */
+                if (cat.spec.help)
+                    text.appendChild(el("span", "sec-subtle", ": " + String(cat.spec.help)));
+            } else if (res && res.category) {
+                text.appendChild(document.createTextNode(
+                    (text.firstChild ? " — " : "") + String(res.category)));
+            }
+            if (!text.firstChild)
+                text.appendChild(document.createTextNode(
+                    "The helper answered, but named neither an entropy figure nor a category."));
+            /* The arithmetic, when the helper shows its working. */
+            if (res && res.calculation)
+                text.appendChild(el("span", "sec-subtle", " " + String(res.calculation)));
+
+            paint(cat ? cat.index + 1 : NaN, cat ? cat.total : NaN);
+
+            clear(weak);
+            var list = (res && (res.weaknesses || res.warnings || res.problems || res.issues));
+            if (Array.isArray(list) && list.length) {
+                list.forEach(function (w) {
+                    /* The contract's weakness is {id, label, cost_bits}. The
+                     * label names a CATEGORY of flaw and never quotes the text
+                     * that triggered it — the helper is explicit that this is
+                     * deliberate, because a response is a thing that gets
+                     * screenshotted — so it is printed verbatim and nothing
+                     * here tries to be more specific than the helper was. */
+                    if (w && typeof w === "object") {
+                        var li = el("li", null, String(w.label || w.id ||
+                            w.detail || w.message || w.reason || ""));
+                        if (w.cost_bits !== undefined)
+                            li.appendChild(el("span", "sec-subtle",
+                                "  −" + w.cost_bits + " bits"));
+                        weak.appendChild(li);
+                    } else {
+                        weak.appendChild(el("li", null, String(w)));
+                    }
+                });
+                weak.hidden = false;
+            } else {
+                weak.hidden = true;
+            }
+        }
+
+        /* The breach control, drawn only after the helper has answered whether
+         * a corpus exists. It is never automatic: a check sends the candidate
+         * to whatever corpus the operator configured, and that is an explicit
+         * act, not something a keystroke should trigger. */
+        function drawBreach(getValue) {
+            clear(breachLine);
+            breachLine.className = "sec-breach";
+            if (!breachVerb) return;
+            /* The verb is per-safe, so the question and the check both carry
+             * the safe currently open. Outside a session there is none, and
+             * the helper answers for that. */
+            var safeId = BROWSE ? BROWSE.safe.id : null;
+            breachAvailability(safeId).then(function (b) {
+                clear(breachLine);
+                if (b.state === "no") {
+                    breachLine.appendChild(el("span", "sec-subtle",
+                        "Breach check unavailable — " +
+                        (b.reason || "the helper did not say why") + "."));
+                    return;
+                }
+                if (b.state === "error") {
+                    breachLine.appendChild(el("span", "sec-subtle",
+                        "Breach check could not be reached — " + b.reason));
+                    return;
+                }
+                breachLine.appendChild(btn(verbLabel(breachVerb), "tiny", function () {
+                    var v = getValue();
+                    if (!v) {
+                        clear(breachLine);
+                        breachLine.appendChild(el("span", "sec-subtle",
+                            "Type a password first."));
+                        drawBreach(getValue);
+                        return;
+                    }
+                    clear(breachLine);
+                    breachLine.appendChild(el("span", "sec-subtle", "Checking…"));
+                    callWithCandidate(breachVerb, v, safeId ? { safe: safeId } : null)
+                    .then(function (res) {
+                        v = null;
+                        clear(breachLine);
+                        if (res && res.available === false) {
+                            breachLine.className = "sec-breach";
+                            breachLine.appendChild(el("span", "sec-subtle",
+                                "Breach check unavailable — " +
+                                (res.reason || "the helper did not say why") + "."));
+                            return;
+                        }
+                        var count = Number(res && (res.count !== undefined ? res.count : res.hits));
+                        var found = res && (res.found === true || res.breached === true ||
+                                            (isFinite(count) && count > 0));
+                        breachLine.className = "sec-breach " + (found ? "hit" : "miss");
+                        breachLine.appendChild(el("span", null, found
+                            ? ("This password is in the corpus" +
+                               (isFinite(count) && count > 0 ? " (" + count + " occurrence" +
+                                   (count === 1 ? "" : "s") + ")" : "") +
+                               ". Choose a different one.")
+                            : "Not found in the configured corpus. That is not a guarantee " +
+                              "it is unknown — only that this corpus has not seen it."));
+                        /* The helper states, in its own contract, that this
+                         * corpus is local and that there is no online
+                         * fallback. Showing that is not decoration: the first
+                         * question anyone sensible asks of a breach check is
+                         * "did my password just leave this machine". */
+                        if (res && (res.offline_only || res.network === "none"))
+                            breachLine.appendChild(el("span", "sec-subtle",
+                                " Checked against a local corpus only" +
+                                (res.method ? " (" + res.method + ")" : "") +
+                                "; nothing left this host."));
+                        announce(found ? "This password was found in the breach corpus."
+                                       : "This password was not found in the breach corpus.");
+                    }).catch(function (e) {
+                        v = null;
+                        clear(breachLine);
+                        breachLine.className = "sec-breach";
+                        breachLine.appendChild(errNode(e));
+                    });
+                }));
+            });
+        }
+
+        return {
+            node: node,
+            reset: reset,
+            /* Called by the control's own change handler. `getValue` is a
+             * function rather than a value so the candidate is read at the
+             * moment it is sent, and this widget never holds one. */
+            attach: function (getValue) {
+                drawBreach(getValue);
+                return function () {
+                    var v = getValue();
+                    if (timer) window.clearTimeout(timer);
+                    if (!v) { reset(); drawBreach(getValue); return; }
+                    if (!verb) return;
+                    timer = window.setTimeout(function () {
+                        var mine = ++inFlight;
+                        var val = getValue();
+                        if (!val) { reset(); drawBreach(getValue); return; }
+                        callWithCandidate(verb, val).then(function (res) {
+                            val = null;
+                            if (mine !== inFlight) return;    /* a newer answer won */
+                            render(res);
+                        }).catch(function (e) {
+                            val = null;
+                            if (mine !== inFlight) return;
+                            clear(text);
+                            /* The meter failing must not look like a verdict. */
+                            text.textContent = "Strength not available — " + errText(e);
+                            clear(weak);
+                            weak.hidden = true;
+                            paint(NaN, NaN);
+                        });
+                    }, uiNum("strength_debounce_ms", 350));
+                };
+            }
+        };
+    }
+
+    /* ================================================================== *
      * The generic control renderer — every input on this page comes from here
      * ================================================================== */
     var TYPE_ALIAS = {
@@ -688,6 +1240,16 @@
         "url": "text", "email": "text", "uuid": "text", "search": "search",
         "password": "password", "secret": "password", "passphrase": "password",
         "password-stdin": "password", "protected": "password",
+        /* The helper's own enums.control lists `password-reveal` as a distinct
+         * control. It is the same input as `password` — the difference it names
+         * is the Show/Hide affordance, which the password branch below already
+         * draws for every password control, so mapping it here is not a
+         * simplification that loses anything. Mapping it to `password` also
+         * puts it on the right side of isSecretSpec(): a control that can show
+         * a credential is treated as holding one whatever `secret` says. */
+        "password-reveal": "password", "reveal": "password",
+        "radio": "radio", "radiogroup": "radio",
+        "readonly": "readonly", "static": "readonly", "display": "readonly",
         "textarea": "textarea", "multiline": "textarea", "notes": "textarea",
         "int": "int", "integer": "int", "number": "int",
         "float": "float", "double": "float",
@@ -714,6 +1276,21 @@
         var kind = TYPE_ALIAS[c] || TYPE_ALIAS[t] || null;
         if (kind === "int" && (t === "float" || t === "number")) kind = "float";
         if (kind === "search") kind = "text";
+        /* Two controls are refused for a field the helper marked secret, and
+         * both refusals fail towards the password box rather than away from it.
+         *
+         *   radio     the only inputs on this page that carry a `name`, and a
+         *             radio's value is visible on screen and in the a11y tree.
+         *   readonly  prints its value as text; a credential printed with no
+         *             countdown and no re-mask is the whole of what I17 exists
+         *             to prevent.
+         *
+         * A schema that asked for either is a schema bug, but the failure mode
+         * of complying is a plaintext credential on screen, so this page does
+         * not comply. `spec.secret` is read directly rather than through
+         * isSecretSpec(), which would call back into here. */
+        if ((kind === "radio" || kind === "readonly") && spec && spec.secret === true)
+            kind = "password";
         return kind;                          /* null => unknown, say so out loud */
     }
     function isSecretSpec(spec) {
@@ -764,6 +1341,15 @@
                 "plain text so the field is not silently dropped."));
 
         var input = null, extra = null, fileBytes = null, sub = null;
+        /* The two kinds whose value does not live in a DOM property: a
+         * radiogroup with nothing checked, and a readonly display whose text is
+         * a rendering of the value rather than the value itself (an array is
+         * "a, b" on screen and must go back on the wire as an array). */
+        var radioValue, readonlyValue;
+        /* The strength/breach readout attached to a password control, so wipe()
+         * can clear it: emptying the box must not leave the last verdict about
+         * what used to be in it sitting underneath. */
+        var strengthCtl = null;
         var errLine = el("div", "err");
 
         function attrs(n) {
@@ -804,6 +1390,23 @@
                     generateInto(input);
                 }));
             wrap.appendChild(extra);
+            /* The live meter and the breach control, when the helper offers the
+             * verbs and the caller has not opted out. `spec.strength === false`
+             * is set by exactly one caller — the unlock dialog — and its reason
+             * is written there: scoring the passphrase that already opens a
+             * file answers nothing and costs a copy of it in flight per
+             * keystroke. */
+            if (spec.strength !== false && (verbFor("strength") || verbFor("breach"))) {
+                strengthCtl = strengthWidget();
+                wrap.appendChild(strengthCtl.node);
+                var onType = strengthCtl.attach(function () { return input.value; });
+                input.addEventListener("input", onType);
+                /* generateInto() dispatches this after writing a generated
+                 * value, so the meter scores what the generator produced
+                 * instead of going quiet the moment the box stops being typed
+                 * into by hand. */
+                input.addEventListener("change", onType);
+            }
             break;
         case "textarea":
             input = attrs(el("textarea"));
@@ -852,6 +1455,62 @@
             wrap.appendChild(input);
             break;
         }
+        case "radio": {
+            /* A radiogroup is not a <select> with a different skin: it is a
+             * group, and a group needs a <fieldset>/<legend> or a screen reader
+             * reads five orphaned options with no idea what question they
+             * answer. So the <label for> built above is discarded and rebuilt
+             * as a legend.
+             *
+             * These are the only inputs on this page that carry a `name`, and
+             * the reason is native behaviour: without a shared name the browser
+             * does not treat them as one group, arrow keys stop working, and
+             * more than one can be checked at a time. The name is this
+             * control's own generated id ("sec-c17-radio"), not a field name —
+             * nothing an autofill heuristic looks for — and radioSafe below
+             * refuses the control outright for a secret field, so a credential
+             * can never reach one. */
+            clear(wrap);
+            var fs = el("fieldset", "sec-radios");
+            var lg = el("legend", null, spec.label || fname);
+            fs.appendChild(lg);
+            if (spec.help) fs.appendChild(el("div", "hint", spec.help));
+            if (spec.breaks_when_wrong)
+                fs.appendChild(el("div", "hint", String(spec.breaks_when_wrong)));
+            input = el("div", "sec-radiolist");
+            input.id = id;
+            var ropts = choicesFor(spec);
+            if (!ropts.length) ropts = optionsFrom(spec) || [];
+            ropts.forEach(function (c, ix) {
+                var rid = id + "-r" + ix;
+                var rb = el("input");
+                rb.type = "radio";
+                rb.id = rid;
+                rb.name = id + "-radio";
+                rb.value = String(c.value);
+                var rl = el("label", "sec-check");
+                rl.setAttribute("for", rid);
+                rl.appendChild(rb);
+                rl.appendChild(el("span", null, c.label));
+                input.appendChild(rl);
+            });
+            if (!ropts.length && spec.options_from)
+                fs.appendChild(el("div", "hint",
+                    "The option list for this control comes from the “" +
+                    spec.options_from + "” verb, which has not been read yet."));
+            fs.appendChild(input);
+            wrap.appendChild(fs);
+            break;
+        }
+        case "readonly":
+            /* A value the helper fixed and the operator may not change, shown
+             * so the request is not a black box. It still travels in the
+             * request: hiding a value that is about to be sent is worse than
+             * showing one that cannot be edited. */
+            input = el("div", "sec-readonly");
+            input.id = id;
+            wrap.appendChild(input);
+            break;
         case "multi":
             input = el("div", "sec-checklist");
             input.id = id;
@@ -894,11 +1553,27 @@
                 var f = input.files && input.files[0];
                 if (!f) return;
                 /* The helper publishes the cap: `max` on a file-bytes field,
-                 * or max_bytes on a dict-shaped schema. */
-                var cap = Number(spec.max_bytes) || Number(spec.max) || 0;
+                 * or max_bytes on a dict-shaped schema. But the cap that
+                 * actually bites is usually the TRANSPORT: these bytes travel
+                 * base64 inside the one JSON request, which the helper caps at
+                 * constants.max_request_bytes, and base64 costs a third. A
+                 * control that accepted 32 MiB because the format allows it
+                 * would fail at a tenth of that with an error about request
+                 * size, which is a bewildering way to learn the real limit.
+                 * Both numbers are the helper's; neither is enforced here. */
+                var declared = Number(spec.max_bytes) || Number(spec.max) || 0;
+                var reqCap = Number((SCHEMA && SCHEMA.constants &&
+                                     SCHEMA.constants.max_request_bytes) || 0);
+                var transport = reqCap ? Math.floor((reqCap * 3 / 4) - 4096) : 0;
+                var cap = (declared && transport) ? Math.min(declared, transport)
+                                                  : (declared || transport || 0);
                 if (cap && f.size > cap) {
-                    sizeNote.textContent = "That file is " + f.size + " bytes; the helper accepts " +
-                        cap + " at most.";
+                    sizeNote.textContent = "That file is " + fmtBytes(f.size) +
+                        "; at most " + fmtBytes(cap) + " fits through the helper's request" +
+                        (transport && cap === transport && declared > transport
+                            ? " (the format itself allows " + fmtBytes(declared) +
+                              ", but the request is capped below it)"
+                            : "") + ".";
                     input.value = "";
                     return;
                 }
@@ -956,6 +1631,21 @@
             }
             if (!input) return;
             if (kind === "bool") { input.checked = !!v; return; }
+            if (kind === "radio") {
+                /* held separately: an unchecked radiogroup and a group whose
+                 * value is the empty string are different answers, and the DOM
+                 * cannot tell them apart once nothing is checked. */
+                radioValue = (v === undefined || v === null) ? undefined : String(v);
+                Array.prototype.forEach.call(input.querySelectorAll("input"), function (rb) {
+                    rb.checked = (rb.value === radioValue);
+                });
+                return;
+            }
+            if (kind === "readonly") {
+                readonlyValue = v;
+                input.textContent = (v === undefined || v === null) ? "—" : txt(v);
+                return;
+            }
             if (kind === "multi") {
                 var want = Array.isArray(v) ? v.map(String) : [];
                 Array.prototype.forEach.call(input.querySelectorAll("input"), function (cb) {
@@ -987,6 +1677,11 @@
             if (!input) return undefined;
             switch (kind) {
             case "bool": return !!input.checked;
+            case "readonly": return readonlyValue;
+            case "radio": {
+                var picked = input.querySelector("input:checked");
+                return picked ? picked.value : undefined;
+            }
             case "multi":
                 return Array.prototype.filter.call(input.querySelectorAll("input"), function (cb) {
                     return cb.checked;
@@ -1068,6 +1763,16 @@
             set: setValue,
             focus: function () {
                 if (kind === "object") { if (sub) sub.focusFirst(); return; }
+                if (kind === "readonly") return;     /* nothing to type into */
+                /* A radiogroup and a checklist are <div>s holding the real
+                 * inputs: a div has a .focus method and calling it does
+                 * nothing, so focus the checked option, or the first one. */
+                if (kind === "radio" || kind === "multi") {
+                    var target = input && (input.querySelector("input:checked") ||
+                                           input.querySelector("input"));
+                    if (target) target.focus();
+                    return;
+                }
                 if (input && input.focus) input.focus();
             },
             setVisible: function (yes) { wrap.hidden = !yes; },
@@ -1078,7 +1783,8 @@
                     return;
                 }
                 if (!input) return;
-                if (kind === "multi") {
+                if (kind === "readonly") return;      /* nothing can change it */
+                if (kind === "multi" || kind === "radio") {
                     Array.prototype.forEach.call(input.querySelectorAll("input"), function (cb) {
                         cb.addEventListener("change", fn);
                     });
@@ -1100,11 +1806,18 @@
              * not a wipe and the page footer says so. */
             wipe: function () {
                 fileBytes = null;
+                if (strengthCtl) strengthCtl.reset();
                 if (kind === "object") { if (sub) sub.wipeAll(); return; }
                 if (!input) return;
                 try {
                     if (kind === "bool") { input.checked = false; return; }
-                    if (kind === "multi") {
+                    if (kind === "readonly") {
+                        readonlyValue = null;
+                        input.textContent = "";
+                        return;
+                    }
+                    if (kind === "radio" || kind === "multi") {
+                        radioValue = undefined;
                         Array.prototype.forEach.call(input.querySelectorAll("input"), function (cb) {
                             cb.checked = false;
                         });
@@ -1547,6 +2260,32 @@
      * ================================================================== */
     function adminAllowed() { return !!(PERM && PERM.allowed); }
 
+    /* Is this safe's "you cannot use it" nothing more than "we have not
+     * escalated yet"?
+     *
+     * THIS IS THE DIFFERENCE BETWEEN A REFUSAL AND A NOT-YET, AND GETTING IT
+     * WRONG MADE THE DEFAULT ACCESS CLASS UNOPENABLE. `list` is called with NO
+     * escalation on purpose: it names what exists, and naming is not opening.
+     * The helper answers it from the euid it actually has, so its class gate
+     * fails for EVERY admin-class entry, for EVERY caller, on EVERY list — an
+     * operator in `sudo` with administrative access already on gets exactly the
+     * same `usable:false` as a stranger, because the process that asked was not
+     * root either way. Reading that verdict as "unreachable" disabled the
+     * Unlock control on every admin safe permanently, and admin is the DEFAULT
+     * class (I1), so the ordinary configuration could not be opened at all —
+     * including through "Check this safe", which was itself gated on
+     * reachability and therefore never drawn in the one situation it exists
+     * for. The escalation banner's own sentence, "just open one below and
+     * Cockpit will ask you for it", described something the page did not do.
+     *
+     * Whether this operator may open it is decided by the ESCALATED verb, and
+     * the helper re-checks the class inside it from kernel identity (I3). That
+     * is the refusal that counts; this one is a statement about a spawn that
+     * did not ask. */
+    function pendingEscalation(safe) {
+        return isAdminClass(safe) && !adminAllowed();
+    }
+
     function escalationBanner() {
         if (adminAllowed()) return null;
         var box = el("div", "sec-alert warn");
@@ -1572,6 +2311,13 @@
         callOnce("list", {}, false).then(function (res) {
             SAFES = (res && res.safes) || [];
             renderSafes();
+            /* Only now can health be asked usefully: whether to keep polling
+             * it, and whether to ask escalated, are both decided from the
+             * registry rows that have just arrived. The first call is
+             * unconditional and unescalated — it is what makes the export
+             * confirm name the right directory, and it reports any hold the
+             * agent already has. */
+            refreshHealth(false);
             SAFES.forEach(probeSafe);
         }).catch(function (e) {
             clear(host);
@@ -1592,6 +2338,22 @@
          * class inside every verb, and that is what refuses. The test suite
          * drives the helper directly as a non-admin to prove it. */
         if (!safe) return false;
+        /* An ADMIN-class safe's usability cannot be read off this list AT ALL,
+         * and not merely while escalation is off.
+         *
+         * `list` is spawned without escalation, always. The helper's class gate
+         * raises for an admin entry before it checks anything else, so the row
+         * comes back usable:false with the same sentence whoever asked and
+         * whatever Cockpit's administrative access is currently set to. There
+         * is no state of the world in which an unescalated list says an admin
+         * safe IS usable, so the verdict carries no information and reading it
+         * as a refusal is what disabled every admin card permanently. The
+         * escalated verb is what decides, and a probe that comes back refused
+         * lands on the card as an error where an operator can see it (I3).
+         *
+         * The helper's sentence is still shown, because it is the instruction:
+         * this safe wants administrative access. It just is not a locked door. */
+        if (isAdminClass(safe)) return true;
         if (safe.usable !== undefined) return !!safe.usable;
         return !(safe.locked && safe.reason);
     }
@@ -1662,7 +2424,7 @@
         /* Every other global verb the helper offers, rendered from its own
          * descriptor. Add a verb to the helper and its button appears here. */
         Object.keys(verbTable()).sort().forEach(function (name) {
-            if (HANDLED_VERBS[name]) return;
+            if (isHandled(name)) return;
             if (verbScope(name) !== "global") return;
             tools.appendChild(btn(verbLabel(name), verbSpec(name).danger ? "danger" : "",
                 function () { verbDialog(name, {}, null); }));
@@ -1717,7 +2479,21 @@
             open.title = String(safe.reason || "");
         }
         acts.appendChild(open);
-        if (reachable && !p && isAdminClass(safe) && !adminAllowed())
+        /* The backup ring is readable without unlocking anything: it is a list
+         * of files, not of secrets, and the moment an operator needs it is
+         * usually the moment the safe will not open. */
+        if (reachable && verbFor("backups"))
+            acts.appendChild(btn("Backups…", "", function () { backupsDialog(safe); }));
+        /* Export from the list, for the safes whose registry row allows it. The
+         * dialog asks for the passphrase like every other single-shot verb —
+         * being allowed to export is not being allowed to skip the unlock. */
+        if (reachable && exportAllowed(safe))
+            acts.appendChild(btn("Export…", "danger", function () { exportDialog(safe); }));
+        /* NOT gated on `reachable`. It used to be, and that was the bug: the
+         * only state this button exists for is the one in which an unescalated
+         * list reports an admin safe unusable, so the guard removed it exactly
+         * when it was needed. */
+        if (!p && pendingEscalation(safe))
             acts.appendChild(btn("Check this safe", "", function () {
                 /* Deliberately triggers Cockpit's own administrative prompt. */
                 callOnce("probe", { safe: safe.id }, true).then(function (res) {
@@ -1729,7 +2505,14 @@
                 });
             }));
         card.appendChild(acts);
-        if (!reachable)
+        /* The helper's own sentence, whenever it sent one. For a safe this
+         * caller genuinely cannot reach it is the refusal; for an admin-class
+         * one it is the instruction — "turn on Cockpit's Administrative access
+         * and try again" — and dropping it there would leave an operator with
+         * an enabled button and no warning that Cockpit is about to ask them
+         * for a password. It was previously printed only for unreachable
+         * cards, which is why making admin cards reachable has to widen it. */
+        if (safe.reason)
             card.appendChild(el("div", "sec-subtle", String(safe.reason)));
         return card;
     }
@@ -1785,6 +2568,17 @@
              * opens this file — offering it here only invites a mis-click into
              * a failed unlock and a lockout counter increment (I16). */
             copy.generate = false;
+            /* No strength meter here either, for two reasons that both point
+             * the same way. It answers nothing: the passphrase that opens this
+             * file is whatever it is, and being told it is weak at the moment
+             * you are typing it to READ the safe changes nothing you can act
+             * on. And it costs: the meter sends its candidate to the helper on
+             * every debounced keystroke, so scoring here would put a dozen
+             * partial copies of the master passphrase in flight to answer a
+             * question nobody asked. The meter belongs where a password is
+             * being CHOSEN — add, edit, generate — and it is on by default
+             * there. */
+            copy.strength = false;
             if (controlType(copy) === "password" && isSecretSpec(copy)) {
                 /* The schema marks `password` optional because SOME safe may be
                  * keyed. For THIS safe the registry has already answered, so
@@ -1806,10 +2600,82 @@
         return specs;
     }
 
+    /* ---- YubiKey (hardware challenge-response) ------------------------
+     *
+     * The challenge-response itself happens on the HOST, not here. A browser
+     * cannot do HMAC-SHA1 challenge-response against a YubiKey slot — that is a
+     * USB HID conversation, and reaching it from a web page would need a
+     * capability this package deliberately does not have (I9: no CSP
+     * relaxation, no WASM, nothing but default-src 'self'). What this page does
+     * is what a browser can honestly do: tell the operator to touch the key,
+     * ask the helper for the response, and put it in the unlock request.
+     *
+     * Two answers matter and they are opposites:
+     *
+     *   needs_challenge   the file wants a response and the operator must
+     *                     touch the key. Prompt, then send it.
+     *   unsupported       the backend cannot do challenge-response for this
+     *                     format at all. SAY EXACTLY THAT. Do not offer to try
+     *                     without it: a safe whose key file or hardware key is
+     *                     part of its composite key does not open with the
+     *                     passphrase alone, and quietly attempting one would
+     *                     produce bad-credential — an answer that reads as
+     *                     "you typed it wrong" for a problem that is nothing of
+     *                     the sort, and one that walks the lockout counter
+     *                     towards a lockout on the way (I16).
+     */
+    function yubikeyState(safe, probe) {
+        var p = probe || {};
+        var yk = p.yubikey;
+        var out = { needed: false, unsupported: false, slot: null, detail: "",
+                    challenge: null };
+        out.slot = (p.yubikey_slot !== undefined && p.yubikey_slot !== null)
+            ? p.yubikey_slot
+            : ((safe && safe.yubikey_slot !== undefined) ? safe.yubikey_slot : null);
+        if (typeof yk === "string") {
+            if (yk === "needs_challenge") out.needed = true;
+            if (yk === "unsupported") out.unsupported = true;
+        } else if (yk && typeof yk === "object") {
+            if (yk.needs_challenge) out.needed = true;
+            if (yk.unsupported || yk.supported === false) out.unsupported = true;
+            if (yk.slot !== undefined && yk.slot !== null) out.slot = yk.slot;
+            if (yk.detail) out.detail = String(yk.detail);
+        }
+        if (p.needs_challenge === true) out.needed = true;
+        if (p.yubikey_supported === false) out.unsupported = true;
+        if (p.yubikey_detail) out.detail = String(p.yubikey_detail);
+        /* The probe's own key for the challenge. It is present only when the
+         * registry declares a slot for this safe, so its presence is itself the
+         * signal that this file wants one. */
+        if (p.challenge_b64) {
+            out.challenge = String(p.challenge_b64);
+            out.needed = true;
+        }
+        if (yk && typeof yk === "object" && yk.challenge_b64)
+            out.challenge = String(yk.challenge_b64);
+        /* A registry entry naming a slot means the operator configured one.
+         * That is not on its own a challenge this file needs — the probe says
+         * that — but it does mean the key is part of this safe's story and the
+         * dialog should not be silent about it. */
+        return out;
+    }
+
+    /* Which request field the unlock verb carries the response in. From the
+     * verb's own descriptor, never a name written here. */
+    function yubikeyField() {
+        var names = argNames("unlock");
+        for (var i = 0; i < names.length; i++)
+            if (/yubi|challenge|hmac/i.test(names[i])) return names[i];
+        return null;
+    }
+
     function unlockDialog(safe) {
         var probe = PROBES[safe.id];
         if (probe && probe._error) probe = null;
         var admin = isAdminClass(safe);
+        var yk = yubikeyState(safe, probe);
+        var ykField = yubikeyField();
+        var ykVerb = verbFor("yubikey");
 
         modal("Unlock " + (safe.label || safe.id), function (box, m) {
             var intro = el("p", "sec-modal-intro");
@@ -1826,6 +2692,120 @@
             (probe && probe.warnings ? probe.warnings : []).forEach(function (w) {
                 box.appendChild(el("div", "sec-alert warn", String(w)));
             });
+
+            /* ---- the hardware key, before the passphrase box ------------
+             * It goes above the form because it changes what the operator is
+             * about to do with their hands, and because the "unsupported" case
+             * means the Unlock button below it is not going to work. */
+            var ykResponse = null;      /* one variable, this dialog's scope only */
+            var ykHost = el("div");
+            box.appendChild(ykHost);
+
+            if (yk.unsupported) {
+                var ub = el("div", "sec-alert err");
+                ub.appendChild(el("p", null,
+                    "This backend answered “unsupported” for hardware challenge-response" +
+                    (yk.slot !== null && yk.slot !== undefined
+                        ? " on slot " + yk.slot : "") + "."));
+                if (yk.detail) ub.appendChild(el("p", null, yk.detail));
+                ub.appendChild(el("p", null,
+                    "That is the answer, and this page will not paper over it by trying the " +
+                    "passphrase on its own. A safe whose hardware key is part of its composite " +
+                    "key does not open without it: the attempt would come back as " +
+                    "“wrong passphrase”, which is not what happened, and it would count " +
+                    "towards a lockout on the way (I16)."));
+                ykHost.appendChild(ub);
+            } else if (yk.needed) {
+                var nb = el("div", "sec-alert warn");
+                nb.appendChild(el("p", null,
+                    "This safe needs a response from your YubiKey" +
+                    (yk.slot !== null && yk.slot !== undefined
+                        ? " on slot " + yk.slot : "") +
+                    ". The key is read on the host, not in this browser."));
+                if (yk.detail) nb.appendChild(el("p", null, yk.detail));
+
+                if (ykVerb) {
+                    /* The helper can run the challenge itself. Press, touch the
+                     * key, and the response goes into the unlock request. */
+                    var status = el("div", "sec-countdown");
+                    status.setAttribute("aria-live", "polite");
+                    var ask = btn("Challenge the key — touch it when it flashes", "primary",
+                    function () {
+                        ask.disabled = true;
+                        status.textContent = "Waiting for the key. Touch it now.";
+                        announce("Touch your YubiKey now.");
+                        callOnce(ykVerb, { safe: safe.id }, admin).then(function (res) {
+                            ask.disabled = false;
+                            /* The response is a credential: it is held in this
+                             * one variable, for this one unlock, and is never
+                             * displayed, stored or logged. */
+                            ykResponse = res && (res.response !== undefined
+                                ? res.response
+                                : (res.b64 !== undefined ? res.b64 : res.value));
+                            if (ykResponse === undefined || ykResponse === null) {
+                                status.textContent =
+                                    "The key answered, but the helper named no response field.";
+                                return;
+                            }
+                            status.textContent = "The key answered. Press Unlock.";
+                            announce("The key answered. Press Unlock.");
+                        }).catch(function (e) {
+                            ask.disabled = false;
+                            ykResponse = null;
+                            clear(status);
+                            status.textContent = "";
+                            nb.appendChild(errNode(e));
+                            if (errCode(e) === "unsupported")
+                                nb.appendChild(el("p", null,
+                                    "Unsupported. This page will not retry without the key."));
+                        });
+                    });
+                    nb.appendChild(ask);
+                    nb.appendChild(status);
+                } else if (!ykField) {
+                    /* The probe asks for a challenge and the helper publishes
+                     * neither a verb to run it nor a field to carry it. Say so;
+                     * do not offer an Unlock that cannot succeed without
+                     * explaining why. */
+                    nb.appendChild(el("p", null,
+                        "This helper reports that a challenge is required but publishes " +
+                        "neither a verb to perform it nor a request field to carry the " +
+                        "response, so there is no way to supply one from this page."));
+                } else {
+                    /* The helper hands over the challenge itself, in
+                     * probe.challenge_b64, and expects the response back in the
+                     * request field the unlock verb declares. The challenge is
+                     * NOT a secret — it is the input to the key, and the whole
+                     * point of challenge-response is that knowing the challenge
+                     * buys nothing — so it is shown in full and can be copied.
+                     * The RESPONSE is a credential and is handled like one. */
+                    if (yk.challenge) {
+                        nb.appendChild(el("p", null,
+                            "Take this challenge to the key, and put what it answers back " +
+                            "in the “" + ykField + "” control below."));
+                        nb.appendChild(el("code", "sec-path", yk.challenge));
+                        nb.appendChild(btn("Copy the challenge", "tiny", function () {
+                            /* The clipboard countdown exists for values that
+                             * must not linger. A challenge is public, so it is
+                             * copied plainly and no countdown is armed:
+                             * pretending it needed one would teach the operator
+                             * that the countdown means nothing. */
+                            if (navigator.clipboard && navigator.clipboard.writeText)
+                                navigator.clipboard.writeText(yk.challenge).then(function () {
+                                    announce("Challenge copied.");
+                                }).catch(function () { /* best effort */ });
+                        }));
+                    } else {
+                        nb.appendChild(el("p", null,
+                            "Supply the response in the “" + ykField + "” control below."));
+                    }
+                }
+                ykHost.appendChild(nb);
+            } else if (yk.slot !== null && yk.slot !== undefined) {
+                ykHost.appendChild(el("div", "sec-alert info",
+                    "This safe is registered with a hardware key on slot " + yk.slot +
+                    ". The helper did not ask for a challenge for this file."));
+            }
 
             var form = buildForm(unlockArgSpecs(safe, probe));
             box.appendChild(form.node);
@@ -1875,6 +2855,16 @@
                     pw = "\0".repeat(pw ? pw.length : 0);
                     pw = null;
                 }
+                /* The challenge response, if the key was asked and answered. It
+                 * is treated exactly like the passphrase: read once, put in the
+                 * body, and the variable dropped on the next statements. It is
+                 * sent under the field name the UNLOCK verb declares, so a
+                 * helper that calls it something else works with no edit; when
+                 * the verb declares no such field the response is not smuggled
+                 * in under a name this page made up. */
+                if (ykResponse !== null && ykResponse !== undefined && ykField)
+                    req[ykField] = ykResponse;
+                ykResponse = null;
                 var body = JSON.stringify(req);
                 /* Drop every reference we hold to the plaintext. A JavaScript
                  * string is immutable, so this releases rather than scrubs —
@@ -1883,6 +2873,7 @@
                  * What it does guarantee is that nothing retains a reference
                  * once the request is on its way (I11). */
                 names.forEach(function (nm) { req[nm] = null; });
+                if (ykField) req[ykField] = null;
                 req = null;
                 form.wipeSecrets();
 
@@ -1903,6 +2894,18 @@
                     errHost.appendChild(errNode(e));
                     if (errCode(e) === "locked-out" && errSeconds(e))
                         lockoutCountdown(errHost, errSeconds(e));
+                    /* "unsupported" from an unlock is the backend saying it
+                     * cannot do what this file needs — most often the hardware
+                     * challenge. It is repeated in this page's own words so it
+                     * cannot be mistaken for a typo, and NOTHING is retried:
+                     * there is no passphrase-only fallback here, silent or
+                     * otherwise. */
+                    if (errCode(e) === "unsupported")
+                        errHost.appendChild(el("div", "sec-alert err",
+                            "Unsupported: the backend cannot open this safe the way it is " +
+                            "configured. No second attempt was made — in particular, nothing " +
+                            "was retried without the hardware key" +
+                            (needsKeyfile(safe, probe) ? " or key file" : "") + "."));
                     form.focusFirst();
                 });
             }
@@ -1958,6 +2961,12 @@
         show(byId("sec-lock"), true);
         enterBrowse();
         announce("Unlocked " + (safe.label || safe.id) + ".");
+        /* The unlock reply carries an `agent` block when, and only when, the
+         * registry enabled the agent AND the daemon actually took the handle.
+         * That reply is the moment the hold comes into existence, so it is the
+         * moment the banner learns about it — no poll interval to wait out, and
+         * no window in which a safe is held and not shown (I18). */
+        agentNoted(safe, unlockRes);
     }
 
     function startSessionTicker() {
@@ -1998,6 +3007,7 @@
     function lockNow(reason) {
         if (SESSION_TIMER) { window.clearInterval(SESSION_TIMER); SESSION_TIMER = null; }
         var hadDirty = BROWSE && BROWSE.dirty;
+        var lockedSafeId = BROWSE ? BROWSE.safe.id : null;
         var s = SESSION;
         SESSION = null;
         if (s) {
@@ -2027,6 +3037,12 @@
         if (hadDirty) msg += " Unsaved changes were discarded; the safe on disk is unchanged.";
         alertText(msg, "info");
         announce(msg);
+        /* This safe's own hold, if it had one, ends with the session. Any OTHER
+         * safe the agent is holding is untouched and stays in the banner: the
+         * one direction the banner must never go stale in is showing fewer
+         * unlocked safes than there are. */
+        if (lockedSafeId) agentDrop(lockedSafeId);
+        refreshAgent();
     }
 
     function setDirty(n) {
@@ -2133,11 +3149,32 @@
                 generateDialog(null);
             }));
 
+        /* Save-as, the backup ring, and the export — each drawn only when the
+         * helper publishes the verb, and the export only when this safe's own
+         * registry row also permits it (I21). */
+        if (verbFor("saveAs") && BROWSE.writable)
+            host.appendChild(btn(verbLabel(verbFor("saveAs")), "", saveAsDialog));
+        if (verbFor("backups"))
+            host.appendChild(btn("Backups…", "", function () {
+                backupsDialog(BROWSE.safe);
+            }));
+        if (exportAllowed(BROWSE.safe))
+            host.appendChild(btn("Export in the clear…", "danger", function () {
+                exportDialog(BROWSE.safe);
+            }));
+        else if (verbFor("export"))
+            /* The verb exists and this safe is not allowed to use it. Saying so
+             * is better than an absent button: "export is off for this safe" is
+             * a registry decision an operator can look at and change, and a
+             * missing control looks like a missing feature. */
+            host.appendChild(el("span", "sec-subtle",
+                "Export is not enabled for this safe in the registry."));
+
         /* Every other safe-scoped verb the helper offers — upgrade-to-kdbx4,
-         * export, restore-from-backup, breach-check, whatever Task 6 and 7 add
-         * later. No edit here is needed to make them appear. */
+         * breach-check, whatever a later task adds. No edit here is needed to
+         * make them appear. */
         Object.keys(verbTable()).sort().forEach(function (name) {
-            if (HANDLED_VERBS[name]) return;
+            if (isHandled(name)) return;
             if (verbScope(name) !== "safe") return;
             host.appendChild(btn(verbLabel(name), verbSpec(name).danger ? "danger" : "",
                 function () { verbDialog(name, {}, afterMutation); }));
@@ -2257,7 +3294,7 @@
             });
             /* Any other group-scoped verb the helper publishes. */
             Object.keys(verbTable()).sort().forEach(function (name) {
-                if (HANDLED_VERBS[name]) return;
+                if (isHandled(name)) return;
                 if (verbScope(name) !== "group") return;
                 acts.appendChild(btn(verbLabel(name), "tiny", function () {
                     verbDialog(name, { uuid: BROWSE.group, group: BROWSE.group }, afterMutation);
@@ -2383,6 +3420,18 @@
         wrap.appendChild(t);
         host.appendChild(wrap);
 
+        /* Keep the detail pane in step with the row it is showing. Adding or
+         * removing an attachment, or restoring a version, changes the entry;
+         * without this the pane keeps rendering the row from before the
+         * mutation and an operator sees an attachment they have just deleted.
+         * Only when the selected entry is on THIS page of results — a search
+         * that filters it out should leave the pane alone rather than blank it. */
+        if (BROWSE.selected) {
+            var sel = null;
+            rows.forEach(function (r) { if (r.uuid === BROWSE.selected) sel = r; });
+            if (sel) renderDetail(sel);
+        }
+
         var pager = el("div", "sec-pager");
         var from = BROWSE.total ? BROWSE.offset + 1 : 0;
         var to = Math.min(BROWSE.offset + BROWSE.rows.length, BROWSE.total);
@@ -2504,13 +3553,7 @@
         renderAttachments(host, row);
 
         /* --- history --- */
-        var histVerb = findVerb(["history", "entry-history", "history-list"]);
-        if (histVerb) {
-            host.appendChild(el("h4", null, "History"));
-            host.appendChild(btn("Browse history…", "tiny", function () {
-                historyDialog(histVerb, row);
-            }));
-        }
+        renderHistory(host, row);
 
         /* --- actions: from the schema, so a new entry verb appears here --- */
         host.appendChild(el("h4", null, "Actions"));
@@ -2524,7 +3567,7 @@
             acts.appendChild(b);
         });
         Object.keys(verbTable()).sort().forEach(function (name) {
-            if (HANDLED_VERBS[name]) return;
+            if (isHandled(name)) return;
             if (verbScope(name) !== "entry") return;
             acts.appendChild(btn(verbLabel(name), "tiny", function () {
                 verbDialog(name, { uuid: row.uuid }, afterMutation, row);
@@ -2566,50 +3609,212 @@
         });
     }
 
+    /* ================================================================== *
+     * Attachments
+     *
+     * Upload, replace, remove and download. Only the download is unusual, and
+     * it is unusual in the direction that matters: the bytes come back through
+     * the Cockpit channel as base64 in the verb's reply, are turned into a Blob
+     * in this page, and are handed to the browser's own save mechanism. NOTHING
+     * IS WRITTEN TO THE SERVER'S DISK ON THE WAY (I21). There is no temporary
+     * file to forget to delete, because there is no temporary file.
+     *
+     * Uploads go the same road backwards: FileReader -> base64 -> the JSON
+     * request on the helper's stdin, which is then closed (I10).
+     * ================================================================== */
+
+    /* Whatever the helper said about an entry's attachments, as
+     * [{name, bytes|undefined}] plus a flag saying whether we actually know the
+     * names or merely the count. Four shapes are accepted because the contract
+     * pins `attachments` on an entries[] row without pinning which of them it
+     * is; anything else yields `known:false`, which prints a count and says the
+     * names are not available rather than inventing them. */
+    function attachmentRows(row) {
+        var raw = row.attachments;
+        var named = Array.isArray(row.attachment_names) ? row.attachment_names : null;
+        if (Array.isArray(raw)) named = raw;
+        if (!named) {
+            var n = Number(raw);
+            return { known: false, count: isFinite(n) && n > 0 ? n : 0, rows: [] };
+        }
+        var out = named.map(function (a) {
+            if (a && typeof a === "object")
+                return { name: String(a.name === undefined ? a.filename : a.name),
+                         bytes: (a.bytes !== undefined ? a.bytes : a.size) };
+            return { name: String(a), bytes: undefined };
+        }).filter(function (a) { return a.name && a.name !== "undefined"; });
+        return { known: true, count: out.length, rows: out };
+    }
+
+    /* The cap the helper publishes for one attachment, read off whichever
+     * file-bytes control its add verb declares. Client-side it is FEEDBACK —
+     * makeControl already refuses an oversized file before it is even read —
+     * and the helper's own refusal is the gate (backends/base.py Limits). */
+    function attachmentCap() {
+        var adder = verbFor("attachAdd");
+        if (!adder) return { format: 0, effective: 0 };
+        var format = 0;
+        var args = verbArgs(adder);
+        for (var i = 0; i < args.length; i++) {
+            if (controlType(args[i]) !== "file") continue;
+            format = Number(args[i].max_bytes) || Number(args[i].max) || 0;
+            if (format) break;
+        }
+        /* THE CAP THAT ACTUALLY BITES IS THE TRANSPORT, NOT THE FORMAT.
+         *
+         * The helper's own descriptor says so: the format allows 32 MiB per
+         * attachment, but the whole request is capped at max_request_bytes and
+         * the bytes travel base64 inside it, which costs a third. So roughly
+         * three quarters of the request cap is what fits, and telling an
+         * operator "up to 32 MiB" would be a promise that fails at 800 KiB with
+         * an error about the request size — a confusing way to find out.
+         *
+         * The margin leaves room for the rest of the JSON around it. Neither
+         * number is enforced here; both are the helper's, and the helper is
+         * what refuses. */
+        var reqCap = Number((SCHEMA && SCHEMA.constants &&
+                             SCHEMA.constants.max_request_bytes) || 0);
+        var transport = reqCap ? Math.floor((reqCap * 3 / 4) - 4096) : 0;
+        var effective = (format && transport) ? Math.min(format, transport)
+                                              : (format || transport || 0);
+        return { format: format, effective: effective };
+    }
+
     function renderAttachments(host, row) {
-        var count = row.attachments;
-        var names = Array.isArray(count) ? count
-                  : (Array.isArray(row.attachment_names) ? row.attachment_names : null);
-        var n = names ? names.length : (Number(count) || 0);
-        if (!n && !hasVerb("attach-get")) return;
+        var info = attachmentRows(row);
+        var adder = verbFor("attachAdd");
+        var remover = verbFor("attachRm");
+        var lister = verbFor("attachList");
+        if (!info.count && !adder && !hasVerb("attach-get")) return;
+
         host.appendChild(el("h4", null, "Attachments"));
-        if (!n) {
+
+        if (!info.count && info.known) {
             host.appendChild(el("p", "sec-subtle", "None."));
-        } else if (!names) {
-            /* The helper sent a count, not names, and offers no verb that lists
-             * them. Say so instead of inventing names. */
-            var lister = findVerb(["attach-list", "attachments", "attach-ls"]);
+        } else if (!info.known && info.count) {
+            /* A count with no names. Ask the helper for the names if it offers
+             * a verb for them; otherwise say plainly that a download needs a
+             * name this helper does not provide, rather than guessing one. */
+            host.appendChild(el("p", "sec-subtle",
+                info.count + " attachment(s) on this entry."));
             if (lister) {
-                host.appendChild(btn("List " + n + " attachment(s)", "tiny", function () {
+                host.appendChild(btn("List them", "tiny", function () {
                     SESSION.call(lister, { uuid: row.uuid }).then(function (res) {
-                        var list = res.names || res.attachments || [];
-                        row.attachment_names = list;
+                        row.attachment_names =
+                            res.names || res.attachments || res.files || [];
                         renderDetail(row);
-                    }).catch(function (e) { host.appendChild(errNode(e)); });
+                    }).catch(function (e) {
+                        alertBox(errNode(e));
+                        handleSessionError(e);
+                    });
                 }));
             } else {
                 host.appendChild(el("p", "sec-subtle",
-                    n + " attachment(s). This helper reports a count only — downloading one " +
-                    "needs its name, which comes from a verb this helper does not offer."));
+                    "Downloading one needs its name, and this helper publishes no verb that " +
+                    "lists them."));
             }
-        } else {
-            names.forEach(function (name) {
-                var rowEl = el("div", "sec-tools");
-                rowEl.appendChild(el("span", null, String(name)));
+        } else if (info.rows.length) {
+            var panel = el("div", "sec-panel");
+            info.rows.forEach(function (a) {
+                var line = el("div", "sec-file-row");
+                line.appendChild(el("span", "sec-file-name", a.name));
+                if (a.bytes !== undefined)
+                    line.appendChild(el("span", "sec-file-size", fmtBytes(a.bytes)));
+                line.appendChild(el("span", "sec-spacer"));
                 if (hasVerb("attach-get"))
-                    rowEl.appendChild(btn("Download", "tiny", function () {
-                        downloadAttachment(row.uuid, String(name));
+                    line.appendChild(btn("Download", "tiny", function () {
+                        downloadAttachment(row.uuid, a.name);
                     }));
-                host.appendChild(rowEl);
+                if (adder && BROWSE.writable)
+                    /* Replace is the add verb with the name fixed and the
+                     * helper's own `replace` flag set, so there is one upload
+                     * path and not two. Presetting both means neither control
+                     * is drawn: the operator picked the file to overwrite by
+                     * pressing the button beside it. */
+                    line.appendChild(btn("Replace…", "tiny", function () {
+                        attachUploadDialog(row, a.name);
+                    }));
+                if (remover && BROWSE.writable)
+                    line.appendChild(btn("Remove", "danger tiny", function () {
+                        attachRemoveDialog(remover, row, a);
+                    }));
+                panel.appendChild(line);
+            });
+            host.appendChild(panel);
+        }
+
+        if (adder && BROWSE.writable) {
+            host.appendChild(btn("Add an attachment…", "tiny", function () {
+                attachUploadDialog(row, null);
+            }));
+            var cap = attachmentCap();
+            if (cap.effective) {
+                host.appendChild(el("div", "hint",
+                    "Up to about " + fmtBytes(cap.effective) + " per attachment. The file is " +
+                    "read in this browser and sent inline to the helper; it never lands on " +
+                    "the server as a temporary file."));
+                if (cap.format && cap.format > cap.effective)
+                    host.appendChild(el("div", "hint",
+                        "The format itself allows " + fmtBytes(cap.format) + ", but the " +
+                        "request the bytes travel in is capped below that, and base64 costs " +
+                        "a third on the way. The smaller number is the one that applies."));
+            }
+        } else if (adder && !BROWSE.writable) {
+            host.appendChild(el("p", "sec-subtle",
+                "This safe is open read-only, so attachments cannot be changed."));
+        }
+    }
+
+    /* One dialog for both add and replace. `existingName` non-null means
+     * replace: the name is fixed and the helper's replace flag is preset, so
+     * the operator is choosing a file and nothing else. */
+    function attachUploadDialog(row, existingName) {
+        var verb = verbFor("attachAdd");
+        if (!verb) return;
+        var presets = { uuid: row.uuid };
+        var names = argNames(verb);
+        if (existingName !== null && existingName !== undefined) {
+            presets.name = existingName;
+            /* Only set the flag the verb actually declares. A helper whose add
+             * verb has no replace flag gets no invented field; it will refuse
+             * the duplicate name, which is the correct outcome and a clearer
+             * error than a silent overwrite. */
+            ["replace", "overwrite", "force"].forEach(function (k) {
+                if (names.indexOf(k) >= 0 && presets[k] === undefined) presets[k] = true;
             });
         }
-        /* Uploading is whatever verb the helper offers for it, rendered from
-         * its own descriptor — the file control sends the bytes inline. */
-        var adder = findVerb(["attach-add", "attach-put", "attach-set"]);
-        if (adder && BROWSE.writable)
-            host.appendChild(btn(verbLabel(adder), "tiny", function () {
-                verbDialog(adder, { uuid: row.uuid }, afterMutation, row);
-            }));
+        verbDialog(verb, presets, afterMutation, null, {
+            title: existingName ? ("Replace “" + existingName + "”") : "Add an attachment",
+            runLabel: existingName ? "Replace the file" : "Attach the file",
+            intro: existingName
+                ? "The bytes of the file you choose replace the ones stored under this name. " +
+                  "Nothing reaches disk until you press Save."
+                : "The file is read in this browser and sent inline to the helper. Nothing " +
+                  "reaches disk until you press Save.",
+            confirm: existingName
+                ? "I understand the attachment stored under this name will be overwritten."
+                : null
+        });
+    }
+
+    function attachRemoveDialog(verb, row, a) {
+        verbDialog(verb, { uuid: row.uuid, name: a.name }, afterMutation, null, {
+            title: "Remove “" + a.name + "”",
+            runLabel: "Remove the attachment",
+            beforeForm: function (box) {
+                box.appendChild(el("div", "sec-alert warn",
+                    "Removes “" + a.name + "”" +
+                    (a.bytes !== undefined ? " (" + fmtBytes(a.bytes) + ")" : "") +
+                    " from this entry, in the helper's memory. It is written to disk when " +
+                    "you press Save, and the copy of the safe from before that save is kept " +
+                    "in the backup ring (I12) — which is the only way back."));
+            }
+            /* No `confirm` of this page's own here: attach-rm already declares
+             * one, and stacking a second tick box on a small, in-memory,
+             * still-undoable action is how operators learn to tick without
+             * reading. The two places that DO stack are export and
+             * restore-backup, where the action is neither small nor undoable. */
+        });
     }
 
     function downloadAttachment(uuid, name) {
@@ -2617,7 +3822,17 @@
             /* The bytes arrive through the Cockpit channel and are handed
              * straight to the browser. Nothing is written to the server's disk
              * on the way (I21). */
-            var bytes = b64ToBytes(res.b64);
+            var bytes;
+            try { bytes = b64ToBytes(res.b64); }
+            catch (e) {
+                alertBox(errNode(mkErr("internal",
+                    "The helper's reply for this attachment is not valid base64.")));
+                return;
+            }
+            /* application/octet-stream on purpose. Handing the browser the
+             * helper's idea of the type would let a file stored inside a safe
+             * choose how this page's origin renders it, and "text/html" is a
+             * perfectly ordinary thing to find in an attachment. */
             var blob = new Blob([bytes], { type: "application/octet-stream" });
             var url = URL.createObjectURL(blob);
             var a = el("a");
@@ -2626,40 +3841,234 @@
             document.body.appendChild(a);
             a.click();
             document.body.removeChild(a);
+            /* Revoke on a timer rather than immediately: the click has started
+             * a save the browser finishes on its own schedule, and revoking
+             * under it truncates the file. */
             window.setTimeout(function () { URL.revokeObjectURL(url); }, 10000);
-            announce("Downloaded " + name + ".");
+            var sz = (res.size !== undefined) ? res.size : bytes.length;
+            announce("Downloaded " + name + " — " + fmtBytes(sz) + ".");
+            alertText("Downloaded “" + name + "” (" + fmtBytes(sz) +
+                      ") straight to this browser; no copy was written on the server.", "ok");
         }).catch(function (e) {
             alertBox(errNode(e));
             handleSessionError(e);
         });
     }
 
-    function historyDialog(verb, row) {
-        modal("History — " + (txt(row.title) || row.uuid), function (box, m) {
-            var body = el("div");
-            box.appendChild(body);
-            body.appendChild(el("p", "sec-subtle", "Loading…"));
-            var restore = findVerb(["history-restore", "restore-history", "entry-restore"]);
+    /* ================================================================== *
+     * Entry history
+     *
+     * The helper's row for one version is
+     *     {index, when, title, username, url, has_password, notes_len}
+     * and what is NOT in it is the whole point: THERE IS NO PASSWORD IN A
+     * HISTORY ROW. The helper does not send one, so this page has nothing to
+     * mask, nothing to cache, and no countdown to run. `has_password` is a
+     * boolean and it is drawn as one; `notes_len` is a length, which is why the
+     * helper sends it instead of the notes.
+     *
+     * Seeing a value that a restore brought back is the ordinary `reveal` path,
+     * with its ordinary fifteen-second countdown and its ordinary audit line
+     * (I17). There is deliberately no shortcut from here to a value.
+     * ================================================================== */
+
+    /* Which of the metadata fields differ between two versions, using only the
+     * keys the helper actually sent. A field the helper did not publish is not
+     * compared, because "absent" and "changed to nothing" are different facts
+     * and pretending otherwise would report edits that never happened. */
+    var HISTORY_FIELDS = [
+        { key: "title", label: "title" },
+        { key: "username", label: "username" },
+        { key: "url", label: "URL" },
+        { key: "has_password", label: "password" },
+        { key: "notes_len", label: "notes" }
+    ];
+
+    function historyChanges(older, newer) {
+        var out = [];
+        HISTORY_FIELDS.forEach(function (f) {
+            var a = older ? older[f.key] : undefined;
+            var b = newer ? newer[f.key] : undefined;
+            if (a === undefined && b === undefined) return;
+            if (txt(a) !== txt(b)) out.push(f.label);
+        });
+        return out;
+    }
+
+    /* The per-entry panel. It is loaded on demand rather than with the entry:
+     * history is one verb call per entry, and paying it for every row an
+     * operator merely clicks through would be a lot of audit lines for a
+     * question nobody asked. */
+    function renderHistory(host, row) {
+        var verb = verbFor("history");
+        if (!verb) return;
+        host.appendChild(el("h4", null, "History"));
+        var panel = el("div");
+        host.appendChild(panel);
+
+        var load = btn("Show history", "tiny", function () {
+            clear(panel);
+            panel.appendChild(el("p", "sec-subtle", "Loading…"));
             SESSION.call(verb, { uuid: row.uuid }).then(function (res) {
-                clear(body);
-                var list = res.history || res.entries || res.versions || [];
-                if (!list.length) { body.appendChild(el("p", "sec-empty", "No history.")); return; }
-                body.appendChild(resultTable(list, restore ? function (item, idx) {
-                    return btn("Restore", "tiny", function () {
-                        m.close();
-                        verbDialog(restore,
-                            { uuid: row.uuid,
-                              index: item.index !== undefined ? item.index : idx },
-                            afterMutation, row);
-                    });
-                } : null));
+                clear(panel);
+                var list = (res && (res.history || res.versions || res.entries)) || [];
+                if (!Array.isArray(list) || !list.length) {
+                    panel.appendChild(el("p", "sec-subtle",
+                        "No previous versions are recorded for this entry."));
+                    panel.appendChild(load);
+                    return;
+                }
+                renderHistoryList(panel, row, list);
             }).catch(function (e) {
-                clear(body);
-                body.appendChild(errNode(e));
+                clear(panel);
+                panel.appendChild(errNode(e));
+                panel.appendChild(load);
                 handleSessionError(e);
             });
-            actionRow(box, [btn("Close", "", function () { m.close(); })]);
-        }, { wide: true });
+        });
+        panel.appendChild(load);
+    }
+
+    function renderHistoryList(panel, row, list) {
+        var restoreVerb = verbFor("historyRestore");
+
+        /* OLDEST FIRST, so "what changed" reads forwards in time the way a
+         * person reads it. `index` counts forwards too — 0 is the oldest
+         * recorded version — so ascending is both.
+         *
+         * This sort was descending for a while because the helper's `index`
+         * descriptor claimed 0 was "the most recently archived version". The
+         * descriptor was wrong and the `when` timestamps say so: an entry
+         * edited twice comes back with index 0 carrying the ORIGINAL
+         * modification time. Both were corrected together; do not change one
+         * of them alone.
+         *
+         * `index` itself is preserved on every row rather than recomputed from
+         * this ordering, because it is what a restore is addressed by. */
+        var rows = list.slice().sort(function (a, b) {
+            return (Number(a.index) || 0) - (Number(b.index) || 0);
+        });
+
+        var box = el("div", "sec-panel");
+        rows.forEach(function (v, ix) {
+            var line = el("div", "sec-hist-row");
+
+            var head = el("div", "sec-hist-head");
+            var when = fmtWhen(v.when !== undefined ? v.when : v.modified);
+            head.appendChild(el("span", "sec-hist-when",
+                (when || "no timestamp recorded") +
+                (v.index !== undefined ? "  ·  version " + v.index : "")));
+            if (restoreVerb && BROWSE && BROWSE.writable)
+                head.appendChild(btn("Restore this version", "tiny", function () {
+                    historyRestoreConfirm(restoreVerb, row, v);
+                }));
+            line.appendChild(head);
+
+            line.appendChild(el("div", "sec-hist-title",
+                txt(v.title) || "(untitled in this version)"));
+
+            /* The metadata this version carried. Never a value: a key that
+             * looks like one is dropped and the drop is reported, so a helper
+             * that starts sending passwords in history rows is noticed here
+             * rather than quietly rendered. */
+            var meta = [];
+            var leaked = [];
+            Object.keys(v).forEach(function (k) {
+                if (k === "index" || k === "when" || k === "modified" || k === "title") return;
+                if (k === "password" || k === "value" || k === "b64" || k === "secret") {
+                    if (v[k] !== undefined && v[k] !== null) leaked.push(k);
+                    return;
+                }
+                if (k === "has_password") {
+                    meta.push(v[k] ? "had a password" : "no password");
+                    return;
+                }
+                if (k === "notes_len") {
+                    meta.push(Number(v[k]) ? (v[k] + " characters of notes") : "no notes");
+                    return;
+                }
+                if (v[k] === undefined || v[k] === null || v[k] === "") return;
+                meta.push(k.replace(/_/g, " ") + ": " + txt(v[k]));
+            });
+            if (meta.length) line.appendChild(el("div", "sec-hist-change", meta.join("  ·  ")));
+            if (leaked.length)
+                line.appendChild(el("div", "sec-alert warn",
+                    "This helper put " + leaked.join(", ") + " in a history row. This page " +
+                    "does not render it: a value belongs behind the reveal countdown, not in " +
+                    "a list (I17)."));
+
+            var changed = ix === 0 ? null : historyChanges(rows[ix - 1], v);
+            var ch = el("div", "sec-hist-change");
+            if (changed === null) {
+                ch.textContent = "The oldest recorded version.";
+            } else if (!changed.length) {
+                ch.textContent = "No change in any field the helper reports.";
+            } else {
+                ch.appendChild(document.createTextNode("Changed: "));
+                ch.appendChild(el("span", "changed", changed.join(", ")));
+                ch.appendChild(document.createTextNode("."));
+            }
+            line.appendChild(ch);
+            box.appendChild(line);
+        });
+        panel.appendChild(box);
+
+        /* The live entry, so the newest history row can be read against what is
+         * in the safe now rather than against nothing. */
+        var last = rows[rows.length - 1];
+        var vsNow = historyChanges(last, row);
+        panel.appendChild(el("p", "sec-subtle", vsNow.length
+            ? ("Since the newest recorded version, this entry's " + vsNow.join(", ") +
+               " changed.")
+            : "The entry as it stands matches the newest recorded version in every field " +
+              "the helper reports."));
+        if (!restoreVerb)
+            panel.appendChild(el("p", "sec-subtle",
+                "This helper lists history but offers no restore verb."));
+    }
+
+    /* Restoring is in the helper's MEMORY, not on disk. Saying so is the whole
+     * job of this confirm: an operator who restores and then closes the tab has
+     * changed nothing, and one who restores the wrong version can lock without
+     * saving and lose only the restore. */
+    function historyRestoreConfirm(verb, row, version) {
+        var when = fmtWhen(version.when !== undefined ? version.when : version.modified);
+        var presets = { uuid: row.uuid };
+        var names = argNames(verb);
+        var key = ["index", "version", "n"].filter(function (k) {
+            return names.indexOf(k) >= 0;
+        })[0] || "index";
+        presets[key] = (version.index !== undefined) ? version.index : 0;
+
+        verbDialog(verb, presets, afterMutation, null, {
+            title: "Restore a previous version",
+            runLabel: "Restore this version",
+            beforeForm: function (box) {
+                var w = el("div", "sec-alert warn");
+                w.appendChild(el("p", null,
+                    "This replaces the entry's current fields with the version recorded " +
+                    (when ? "at " + when : "under that index") + ", including its password."));
+                w.appendChild(el("p", null,
+                    "It happens in the helper's memory only. Nothing reaches disk until you " +
+                    "press Save, and locking without saving discards it — the safe on disk " +
+                    "is left exactly as it is."));
+                w.appendChild(el("p", null,
+                    "The value it brings back is not shown here. Reveal it afterwards the " +
+                    "usual way, with the usual countdown."));
+                box.appendChild(w);
+            },
+            onResult: function (res) {
+                var msg = "Restored version " +
+                    (res && res.restored_from !== undefined ? res.restored_from : presets[key]) +
+                    " into memory. Press Save to write it to disk.";
+                alertText(msg, "ok");
+                announce(msg);
+                /* No reload here: `afterMutation` is this dialog's `done`
+                 * callback and it already reloads the tree and the entries,
+                 * which is what rebuilds the detail pane from the restored
+                 * entry. Calling it twice would be two more verb round trips
+                 * for the same screen. */
+            }
+        });
     }
 
     /* ================================================================== *
@@ -2690,11 +4099,18 @@
      * class decides, and admin is the default class (I1). A verb reached from
      * the safe list with no safe open is called unescalated and the helper is
      * left to refuse if it disagrees — the browser never decides this (I3). */
-    function adminForVerb(name) {
+    function adminForVerb(name, safe) {
         var spec = verbSpec(name) || {};
         if (spec.admin === true) return true;
         if (spec.access === "any") return false;
-        return BROWSE ? isAdminClass(BROWSE.safe) : false;
+        /* `safe` is passed by the flows that run a verb against a safe which is
+         * NOT the one currently open — export and restore are both reachable
+         * from the safe list, with nothing unlocked. Without it those would be
+         * spawned unescalated against an admin-class safe, and the helper's
+         * refusal would read as "not permitted" when the truth is "you were
+         * never asked for administrative access". */
+        var s = safe || (BROWSE ? BROWSE.safe : null);
+        return s ? isAdminClass(s) : false;
     }
 
     /* The fields the open session already supplies, so no form should ask for
@@ -2715,10 +4131,34 @@
     }
 
     /* presets: values supplied by the page (uuid, group, safe...) — they are
-     * not drawn and not editable. `values` pre-fills drawn controls. */
-    function verbDialog(name, presets, done, values) {
+     * not drawn and not editable. `values` pre-fills drawn controls.
+     *
+     * `opts` is how the purpose-built flows below (export, save-as, restore)
+     * reuse this dialog instead of growing their own copy of the submit path.
+     * Everything that is delicate — the argv refusal for a secret, the envelope
+     * nesting, reading secrets one at a time and dropping them immediately —
+     * lives here once and nowhere else, so a new flow cannot get it subtly
+     * wrong. What `opts` may change is the wording around the form, not the
+     * handling of what the form collects:
+     *
+     *   title       heading, when the verb's own is too terse for the context
+     *   intro       a sentence under the heading
+     *   safe        the safe this runs against, when it is not the open one —
+     *               decides escalation (see adminForVerb)
+     *   beforeForm  a callback that may put anything above the controls; used
+     *               for the export warning, which must be read before the
+     *               format selector is even reached
+     *   confirm     an EXTRA sentence the operator must tick, on top of any the
+     *               helper attached. Both must be ticked; they are AND-ed,
+     *               never replaced, so a page-side warning cannot swallow the
+     *               helper's own
+     *   runLabel    the primary button's text
+     *   onResult    render the answer instead of the generic result view
+     */
+    function verbDialog(name, presets, done, values, opts) {
         var spec = verbSpec(name);
         if (!spec) return;
+        opts = opts || {};
         presets = defined(presets);
         var onArgv = !usesStdin(name);
         var inSession = !!SESSION && needsSession(name);
@@ -2730,44 +4170,57 @@
             return !Object.prototype.hasOwnProperty.call(presets, n);
         });
 
-        modal(verbLabel(name), function (box, m) {
+        modal(opts.title || verbLabel(name), function (box, m) {
             if (spec.danger)
                 box.appendChild(el("div", "sec-alert warn",
                     "This action is destructive. There is no undo except the backup ring the " +
                     "helper writes before a save."));
+            if (opts.intro) box.appendChild(el("p", "sec-modal-intro", String(opts.intro)));
             if (spec.help) box.appendChild(el("p", "sec-modal-intro", spec.help));
             if (spec.breaks_when_wrong)
                 box.appendChild(el("div", "sec-alert info", String(spec.breaks_when_wrong)));
+            /* Anything that has to be READ before the form is reached — the
+             * export warning naming the destination, the restore warning naming
+             * what is about to be overwritten. Above the controls on purpose. */
+            if (opts.beforeForm) opts.beforeForm(box);
 
             var form = buildForm(specs, { values: values || {} });
             box.appendChild(form.node);
+            /* A caller that needs to reach the controls themselves — save-as
+             * annotating whichever control turns out to carry the file name.
+             * It gets the form object, not a DOM query into the modal host:
+             * the second works right up until two dialogs are open. */
+            if (opts.afterForm) opts.afterForm(form, box);
 
             /* The helper can demand an explicit confirmation, in its own
-             * words. When it does, Run stays disabled until the box is
-             * ticked — the sentence is not decoration. */
-            var confirmBox = null;
-            if (spec.confirm) {
+             * words, and a caller can demand one of its own. Run stays disabled
+             * until EVERY one of them is ticked — the sentences are not
+             * decoration, and a caller's warning never replaces the helper's. */
+            var confirmBoxes = [];
+            [spec.confirm, opts.confirm].forEach(function (sentence) {
+                if (!sentence) return;
                 var cid = "sec-confirm" + (++CTRL_SEQ);
-                confirmBox = el("input");
-                confirmBox.type = "checkbox";
-                confirmBox.id = cid;
+                var cb = el("input");
+                cb.type = "checkbox";
+                cb.id = cid;
                 var cl = el("label", "sec-check");
                 cl.setAttribute("for", cid);
-                cl.appendChild(confirmBox);
-                cl.appendChild(el("span", null, String(spec.confirm)));
+                cl.appendChild(cb);
+                cl.appendChild(el("span", null, String(sentence)));
                 var cw = el("div", "sec-alert warn");
                 cw.appendChild(cl);
                 box.appendChild(cw);
-                confirmBox.addEventListener("change", function () {
-                    go.disabled = !confirmBox.checked;
+                confirmBoxes.push(cb);
+                cb.addEventListener("change", function () {
+                    go.disabled = confirmBoxes.some(function (x) { return !x.checked; });
                 });
-            }
+            });
 
             var errHost = el("div");
             box.appendChild(errHost);
 
-            var go = btn("Run", spec.danger ? "danger" : "primary", submit);
-            if (confirmBox) go.disabled = true;
+            var go = btn(opts.runLabel || "Run", spec.danger ? "danger" : "primary", submit);
+            if (confirmBoxes.length) go.disabled = true;
             actionRow(box, [go, btn("Cancel", "", function () { m.close(); })]);
 
             function submit() {
@@ -2810,7 +4263,7 @@
                 var p = needsSession(name)
                     ? (SESSION ? SESSION.call(name, req)
                                : Promise.reject(mkErr("access-denied", "The safe is locked.")))
-                    : callOnce(name, req, adminForVerb(name), argv);
+                    : callOnce(name, req, adminForVerb(name, opts.safe), argv);
 
                 p.then(function (res) {
                     /* Drop every reference to whatever we just sent. */
@@ -2818,7 +4271,8 @@
                     form.wipeAll();
                     m.close();
                     if (done) done(res, name);
-                    showResult(verbLabel(name), res, mutates(name));
+                    if (opts.onResult) opts.onResult(res, name);
+                    else showResult(verbLabel(name), res, mutates(name));
                 }).catch(function (e) {
                     dropDeep(bag);
                     form.wipeSecrets();
@@ -3055,6 +4509,17 @@
                                 return Promise.resolve({ value: generated === null ? "" : generated });
                             }
                         }));
+                        /* The generator's own entropy figure is the helper's
+                         * arithmetic over the policy it was given. The strength
+                         * verb is its opinion of the string that came out —
+                         * a different question, and the one that catches a
+                         * policy which happens to have produced something the
+                         * dictionary knows. Both are shown when both exist. */
+                        if (verbFor("strength") || verbFor("breach")) {
+                            var sw = strengthWidget();
+                            out.appendChild(sw.node);
+                            sw.attach(function () { return generated || ""; })();
+                        }
                         if (onValue)
                             out.appendChild(btn("Use this value", "primary", function () {
                                 onValue(generated);
@@ -3074,6 +4539,14 @@
         generateDialog(function (value) {
             input.value = value;
             value = null;
+            /* Setting .value from script fires no event, so the strength meter
+             * attached to this control would keep showing the verdict on
+             * whatever was typed before. Dispatching `change` is what makes the
+             * meter score the generated value — the requirement is a live meter
+             * on the generator as well as on a typed field, and a meter that
+             * goes stale exactly when the value changes is worse than none. */
+            try { input.dispatchEvent(new Event("change")); }
+            catch (e) { /* an engine without the Event constructor: no meter update */ }
         });
     }
 
@@ -3124,7 +4597,7 @@
     /* A conflict is a decision, not an alert: the file on disk changed under
      * us, or a desktop client holds the lock. Nothing has been written (I13). */
     function conflictDialog(e) {
-        var saveAs = findVerb(["save-as", "save_as", "saveas", "save-copy"]);
+        var saveAs = verbFor("saveAs");
         modal("The safe changed on disk", function (box, m) {
             box.appendChild(errNode(e));
             box.appendChild(el("p", null,
@@ -3141,11 +4614,10 @@
             });
             var sa = btn(saveAs ? verbLabel(saveAs) : "Save as…", "", function () {
                 m.close();
-                verbDialog(saveAs, {}, function (res, v) {
-                    setDirty(0);
-                    updateSaveButton();
-                    showResult(verbLabel(v), res);
-                });
+                /* The same save-as flow the toolbar uses, with its name
+                 * advisory and its result line. A conflict is a bad moment to
+                 * be given a second, subtly different dialog. */
+                saveAsDialog();
             });
             if (!saveAs) {
                 sa.disabled = true;
@@ -3157,6 +4629,778 @@
                 "“Keep my changes here” leaves them in the helper's memory only. They " +
                 "are gone when this session ends, and the safe on disk stays as it is."));
         }, { noEscape: true });
+    }
+
+    /* ================================================================== *
+     * The agent banner (I18)
+     *
+     * This is the one place in the program where a safe is unlocked while
+     * nobody is looking at it. Everywhere else the unlock lives inside a helper
+     * process the page is holding open, so closing the tab ends it; an agent
+     * holds a key behind an AF_UNIX socket that outlives this page entirely.
+     *
+     * The rule that follows is short: AN UNLOCKED SAFE MUST NEVER BE INVISIBLE.
+     * So the banner
+     *   - lives above the view switch, in an element neither view clears, and
+     *     is therefore on screen from the safe list, from inside a different
+     *     safe, and from anywhere else this page can be;
+     *   - is sticky, because scrolling is not permission to forget;
+     *   - counts down to the lock the helper will actually perform, from the
+     *     helper's own number;
+     *   - carries a Lock button per held safe, so ending it is one click from
+     *     wherever the operator is standing.
+     *
+     * And the other half of the rule, which is just as important: WHEN NOTHING
+     * IS HELD THERE IS NO BANNER. Not a greyed-out one, not "no safes are
+     * unlocked". The agent is off unless a registry entry opts in, and the
+     * default configuration must not grow furniture implying that something is
+     * being watched. An empty host collapses to nothing (`.sec-agent-host:empty`
+     * in the stylesheet) and a helper with no agent verb at all is never even
+     * polled.
+     * ================================================================== */
+
+    function agentPollSeconds() { return uiNum("agent_poll_seconds", 15); }
+
+    /* WHERE THE PAGE LEARNS THAT A SAFE IS HELD.
+     *
+     * Two sources, and both matter.
+     *
+     *  1. THE UNLOCK REPLY, immediately. `unlock` answers with an `agent` block
+     *     — {held, expires_in, idle_seconds, max_seconds, socket} — present only
+     *     when the registry enabled the agent AND the daemon took the handle.
+     *     That reply is the instant the hold begins, so the banner learns about
+     *     it then rather than up to a poll interval later. There must be no
+     *     window in which a safe is held and not shown.
+     *
+     *  2. THE `health` VERB, authoritatively. The helper probes both class
+     *     sockets for this uid and returns what the daemon says it is holding —
+     *     with no handle and no passphrase, which is the whole point: a page
+     *     that has just been reloaded, or that never created the hold at all,
+     *     can still see it. This is what makes "an unlocked safe must never be
+     *     invisible" true across a page reload and not merely within one.
+     *
+     * The daemon's own status reply carries the handle; the helper strips it
+     * before it reaches here, and nothing on this page wants it. Locking does
+     * not need one: the `lock` verb takes a bare safe id for exactly this case,
+     * because "once the helper that unlocked a safe has exited, the agent is
+     * the only thing still saying it is unlocked, and a Lock button that could
+     * not reach it would be a button that lies".
+     */
+
+    /* Pull the holdings out of a `health` reply. Shape:
+     *   agent: { user: ROW, admin: ROW }
+     *   ROW  : { socket, present, reachable, reason, status }
+     *   status.holdings: [{safe, age, expires_in, idle_expires_in}]
+     * A class whose socket is present but NOT reachable is a fault, not an
+     * absence, and it is reported as one. */
+    function agentRowsFromHealth(res) {
+        var out = { rows: [], faults: [] };
+        var blk = res && res.agent;
+        if (!blk || typeof blk !== "object") return out;
+        var now = Date.now();
+        ["user", "admin"].forEach(function (cls) {
+            var row = blk[cls];
+            if (!row || typeof row !== "object") return;
+            if (row.present && !row.reachable) {
+                out.faults.push({ cls: cls,
+                    reason: String(row.reason || "the agent socket did not answer") });
+                return;
+            }
+            var held = row.status && row.status.holdings;
+            if (!Array.isArray(held)) return;
+            held.forEach(function (h) {
+                if (!h || !h.safe) return;
+                var known = safeSpecById(h.safe);
+                /* The idle timeout usually fires long before the absolute one,
+                 * so the number that matters is whichever comes first. Showing
+                 * the larger would be a countdown that is wrong in the
+                 * dangerous direction: it would say a safe stays open longer
+                 * than it will, and an operator would stop watching. */
+                var abs = Number(h.expires_in);
+                var idle = Number(h.idle_expires_in);
+                var secs = [abs, idle].filter(function (n) {
+                    return isFinite(n) && n >= 0;
+                }).sort(function (a, b) { return a - b; })[0];
+                out.rows.push({
+                    safe: h.safe,
+                    label: (known && (known.label || known.id)) || h.safe,
+                    cls: cls,
+                    idle_expires_in: idle,
+                    expires_in: abs,
+                    _deadline: (secs !== undefined && secs > 0) ? now + secs * 1000 : 0
+                });
+            });
+        });
+        return out;
+    }
+
+    /* The immediate signal, straight off the unlock reply. */
+    function agentNoted(safe, unlockRes) {
+        var a = unlockRes && unlockRes.agent;
+        if (!a || a.held === false) return;
+        var secs = Number(a.expires_in !== undefined ? a.expires_in : a.max_seconds);
+        AGENT.rows = AGENT.rows.filter(function (r) { return r.safe !== safe.id; });
+        AGENT.rows.push({
+            safe: safe.id,
+            label: safe.label || safe.id,
+            cls: isAdminClass(safe) ? "admin" : "user",
+            idle_seconds: a.idle_seconds,
+            max_seconds: a.max_seconds,
+            _deadline: (isFinite(secs) && secs > 0) ? Date.now() + secs * 1000 : 0
+        });
+        renderAgentBanner();
+        /* And confirm against the daemon, so the row this page just invented
+         * from its own reply is replaced by the one the agent actually holds. */
+        refreshAgent();
+    }
+
+    function agentDrop(safeId) {
+        var before = AGENT.rows.length;
+        AGENT.rows = AGENT.rows.filter(function (r) { return r.safe !== safeId; });
+        if (AGENT.rows.length !== before) renderAgentBanner();
+    }
+
+    /* Ask the helper what the daemon is holding. `health` needs no handle, no
+     * passphrase and no escalation to answer for the user-class socket; it is
+     * run escalated only when administrative access is ALREADY on, so that the
+     * admin-class socket is visible too without this poll being the thing that
+     * throws a password prompt at somebody who left the page open. */
+    /* Whether the agent is worth asking about at all.
+     *
+     * In the default configuration the agent is off for every safe, and in that
+     * configuration this page must cost NOTHING: no poll, no spawn, and above
+     * all no root helper process every fifteen seconds to interrogate a daemon
+     * that is not running. The agent is opt-in per registry entry, so the poll
+     * is too — it happens only when an entry has opted in, or when something is
+     * currently held, which can only be true if one did. */
+    function agentWatched() {
+        if (AGENT.rows.length) return true;
+        for (var i = 0; i < SAFES.length; i++)
+            if (SAFES[i] && SAFES[i].agent_enabled === true) return true;
+        return false;
+    }
+
+    /* Escalate the poll only when an ADMIN-class safe has opted in AND Cockpit
+     * has already granted administrative access.
+     *
+     * Escalating otherwise spawns a root helper on every poll to look at a
+     * socket that no admin-class safe uses; and escalating when access is NOT
+     * already granted would turn a background poll into an administrative
+     * password prompt that the operator did not ask for and cannot connect to
+     * anything they did. The user-class socket is visible unescalated, which is
+     * the case that matters for a safe the caller owns. */
+    function agentPollAdmin() {
+        if (!adminAllowed()) return false;
+        for (var i = 0; i < SAFES.length; i++)
+            if (SAFES[i] && SAFES[i].agent_enabled === true && isAdminClass(SAFES[i]))
+                return true;
+        return false;
+    }
+
+    /* One `health` call, cached, feeding both the agent banner and the export
+     * destination. It carries no secret, needs no handle and needs no
+     * escalation for the user-class view, which is why it can be a background
+     * call at all. */
+    function refreshHealth(escalate) {
+        if (!hasVerb("health")) { renderAgentBanner(); return Promise.resolve(); }
+        return callOnce("health", {}, !!escalate).then(function (res) {
+            HEALTH = res || null;
+            var got = agentRowsFromHealth(res);
+            AGENT.failed = got.faults.length ? got.faults : null;
+            /* The daemon's answer replaces this page's guesses outright. A row
+             * this page added from an unlock reply that the agent turns out not
+             * to be holding must disappear, not linger. */
+            AGENT.rows = got.rows;
+            renderAgentBanner();
+        }).catch(function (e) {
+            /* A health call that fails must not silently empty the banner:
+             * "cannot tell" and "nothing is held" are different answers, and
+             * showing the second when the first is true is exactly the
+             * invisible unlocked safe this section exists to prevent. */
+            AGENT.failed = [{ cls: "", reason: errText(e) }];
+            renderAgentBanner();
+        });
+    }
+
+    /* The periodic half. `health` is fetched ONCE at load whatever the registry
+     * says, because the export confirm needs its destination; after that it is
+     * re-fetched only while a registry entry has actually opted into the agent.
+     * In the default configuration that means one call for the life of the
+     * page, not one every fifteen seconds — and never a root one. */
+    function refreshAgent() {
+        if (!agentWatched()) { renderAgentBanner(); return Promise.resolve(); }
+        return refreshHealth(agentPollAdmin());
+    }
+
+    function agentLock(r) {
+        var nm = r.label || r.safe || "the safe";
+        /* When the hold belongs to the session this page is browsing, end it
+         * the ordinary way: lockNow() asks the helper politely first, so it can
+         * zero its buffers and write its audit line, and it also tears down the
+         * view. Going straight to the lock verb would leave this page showing
+         * an unlocked safe that is not one. */
+        if (SESSION && BROWSE && r.safe && BROWSE.safe.id === r.safe) {
+            agentDrop(r.safe);
+            lockNow("you locked it from the banner");
+            return;
+        }
+        /* Otherwise: a bare safe id, no handle. The lock verb takes one for
+         * precisely this case — the helper that unlocked this safe has exited
+         * and the agent is the only thing still holding it. */
+        var known = safeSpecById(r.safe);
+        callOnce("lock", { safe: r.safe }, known ? isAdminClass(known) : true)
+        .then(function (res) {
+            agentDrop(r.safe);
+            var msg = "Locked " + nm +
+                (res && res.agent_dropped ? " and released the agent's ticket." : ".");
+            alertText(msg, "ok");
+            announce(msg);
+            refreshAgent();
+        }).catch(function (e) {
+            alertBox(errNode(e));
+            refreshAgent();
+        });
+    }
+
+    function renderAgentBanner() {
+        var host = byId("sec-agent-banner");
+        if (!host) return;
+        clear(host);
+
+        if (AGENT.failed) {
+            var fb = el("div", "sec-agent-banner");
+            fb.appendChild(el("h2", null, "The unlock agent could not be asked"));
+            fb.appendChild(el("p", null,
+                "It may be holding a safe unlocked right now, and this page cannot tell:"));
+            AGENT.failed.forEach(function (f) {
+                fb.appendChild(el("p", null,
+                    (f.cls ? f.cls + "-class socket: " : "") + f.reason));
+            });
+            fb.appendChild(el("p", null,
+                "Treat any safe with the agent enabled as open until this clears."));
+            host.appendChild(fb);
+            /* Fall through: a fault on one class socket does not hide holdings
+             * the other one reported. */
+        }
+
+        if (!AGENT.rows.length) {
+            /* Nothing held. In the default configuration — the agent off for
+             * every safe — nothing at all is drawn: no placeholder, no "0 safes
+             * unlocked", no furniture implying this page is watching something.
+             * The agent is opt-in per safe, and the page should look like it
+             * does not exist until a registry entry opts in. */
+            AGENT.said = "";
+            return;
+        }
+
+        var box = el("div", "sec-agent-banner");
+        box.appendChild(el("h2", null, AGENT.rows.length === 1
+            ? "A safe is unlocked"
+            : AGENT.rows.length + " safes are unlocked"));
+        AGENT.rows.forEach(function (r) {
+            var line = el("div", "sec-agent-row");
+            line.appendChild(el("span", "sec-agent-name", String(r.label || r.safe || "safe")));
+            /* aria-hidden: the digits change once a second, and the sentence a
+             * screen reader needs is announced once, on change, into the polite
+             * region instead. */
+            var left = el("span", "sec-agent-left");
+            left.setAttribute("aria-hidden", "true");
+            line.appendChild(left);
+            r._node = left;
+            line.appendChild(el("span", "sec-spacer"));
+            line.appendChild(btn("Lock now", "danger", function () { agentLock(r); }));
+            box.appendChild(line);
+        });
+        box.appendChild(el("p", "sec-subtle",
+            "Held by secrets-agent rather than by this page, so they outlive closing this " +
+            "tab. They lock on the timeouts shown, which no client can extend (I18)."));
+        host.appendChild(box);
+        agentTick();
+
+        /* One sentence to the polite region when the SET changes — not on every
+         * tick, and not on a poll that returned the same thing. */
+        var key = AGENT.rows.map(function (r) {
+            return String(r.safe || r.label);
+        }).sort().join(", ");
+        if (key !== AGENT.said) {
+            AGENT.said = key;
+            announce("Held unlocked by the agent: " + key +
+                     ". Each one has a Lock button in the banner at the top of the page.");
+        }
+    }
+
+    function agentTick() {
+        AGENT.rows.forEach(function (r) {
+            if (!r._node) return;
+            if (!r._deadline) { r._node.textContent = "no expiry published"; return; }
+            var left = Math.ceil((r._deadline - Date.now()) / 1000);
+            r._node.textContent = left > 0
+                ? "locks in " + fmtSeconds(left)
+                : "locking now…";
+            if (left > 0) return;
+            /* The deadline the helper gave has passed. Ask what is actually
+             * true rather than deciding here that the safe is locked: this page
+             * REPORTS the agent's state, it does not maintain it. The daemon
+             * sweeps on its own schedule and its answer is the one that counts.
+             *
+             * The countdown is deliberately the SOONER of the idle and absolute
+             * timers, so a row reaching zero and then being re-reported with
+             * time left is normal — activity pushed the idle timer out — and
+             * the poll simply corrects it. */
+            if (AGENT.polling) return;
+            AGENT.polling = true;
+            window.setTimeout(function () {
+                AGENT.polling = false;
+                refreshAgent();
+            }, 1000);
+        });
+    }
+
+    /* Started once, after the schema. The ticker runs whenever there is a row
+     * to tick. The poll asks `health`, which every helper publishes, so there
+     * is no configuration in which a held safe goes unseen — but a helper with
+     * no agent simply reports none, and nothing is drawn. */
+    function startAgentWatch() {
+        if (AGENT.timer) window.clearInterval(AGENT.timer);
+        if (AGENT.poll) { window.clearInterval(AGENT.poll); AGENT.poll = null; }
+        AGENT.timer = window.setInterval(agentTick, 500);
+        /* The interval is armed unconditionally; refreshAgent() is what decides
+         * each time whether there is anything to ask about. Arming it on the
+         * registry instead would mean a safe whose entry gains agent.enabled
+         * needs a page reload before it is ever watched. */
+        AGENT.poll = window.setInterval(refreshAgent, agentPollSeconds() * 1000);
+        /* No initial call here: SAFES has not loaded yet at this point, so the
+         * decisions above would both be made against an empty registry. The
+         * first poll is fired from refreshAll(), once the rows are in. */
+    }
+
+    /* ================================================================== *
+     * Export (I21) — the most dangerous control on this page
+     *
+     * Everything else here is a value on screen for fifteen seconds. An export
+     * is every value in the safe, unencrypted, in a file, indefinitely. There
+     * is no countdown that re-hides a file and no lock that scrubs it, so the
+     * defences are all in front of the action rather than behind it:
+     *
+     *   1. the helper must publish an export verb at all;
+     *   2. the safe's own registry row must say export_allowed — and a row that
+     *      does NOT carry the key means no, the same restrictive default that
+     *      makes an entry with no `access` an admin entry (I1);
+     *   3. the confirm names, in plain words and before the operator can reach
+     *      the Run button, exactly what is about to be written and where;
+     *   4. the result view reports the path and the byte count and refuses to
+     *      render the content, whatever the helper sent back.
+     *
+     * Point 4 is not theoretical. A helper that answered with the export inline
+     * would put every password in the safe into this page's DOM, where the lock
+     * button cannot reach it and a screenshot can. The result renderer below
+     * drops any content-bearing key by name and says that it did.
+     * ================================================================== */
+
+    /* May this caller export THIS safe? Both gates, and the row's silence is a
+     * no. `list` publishes export_allowed per safe; when an older helper does
+     * not, the answer is no rather than "probably fine". */
+    function exportAllowed(safe) {
+        if (!verbFor("export")) return false;
+        return !!(safe && safe.export_allowed === true);
+    }
+
+    /* Where the file is going to land, as far as the helper has said.
+     *
+     * I21 puts the destination under the helper's control — never a path from
+     * this page — so the page has to ASK rather than offer, and the answer may
+     * simply not be published. Sources in order of specificity; the returned
+     * `exact` distinguishes "this file" from "somewhere in this directory" so
+     * the warning can be worded truthfully instead of implying a filename we
+     * do not have. */
+    function exportTarget(safe) {
+        var spec = verbSpec(verbFor("export")) || {};
+        var probe = PROBES[safe && safe.id] || {};
+        var consts = (SCHEMA && SCHEMA.constants) || {};
+        /* `health.export.enabled_safes` carries the directory THIS safe would be
+         * written to, which is the accurate answer whenever a registry entry
+         * overrides the host default. The constant is the fallback, not the
+         * first choice: naming the default when the entry points somewhere else
+         * would be a confirm that tells the operator the wrong place. */
+        var perSafe = null;
+        var eh = HEALTH && HEALTH["export"];
+        if (eh && Array.isArray(eh.enabled_safes) && safe)
+            eh.enabled_safes.forEach(function (r) {
+                if (r && r.safe === safe.id && r.dir) perSafe = String(r.dir);
+            });
+        var exact = [spec.target, spec.path, safe && safe.export_path, probe.export_path];
+        var dir = [perSafe, spec.directory, spec.dir, safe && safe.export_dir,
+                   probe.export_dir, (eh && eh.default_dir),
+                   consts.export_dir_default, consts.export_dir, consts.export_directory];
+        var i;
+        for (i = 0; i < exact.length; i++)
+            if (exact[i]) return { path: String(exact[i]), exact: true };
+        for (i = 0; i < dir.length; i++)
+            if (dir[i]) return { path: String(dir[i]), exact: false };
+        return { path: null, exact: false };
+    }
+
+    /* The sentence the operator must read. The wording is fixed deliberately:
+     * "every password in this safe", "in plain text", and the destination. Not
+     * "sensitive data may be written" — the whole failure mode of a warning is
+     * that it is vague enough to skim. */
+    function exportWarningNode(safe, dest) {
+        var box = el("div", "sec-danger-block");
+        var p = el("p");
+        p.appendChild(el("strong", null,
+            "This writes every password in this safe to disk in plain text"));
+        if (dest.path) {
+            p.appendChild(document.createTextNode(dest.exact ? " at:" : " into the directory:"));
+            box.appendChild(p);
+            box.appendChild(el("code", "sec-path", dest.path));
+        } else {
+            /* No destination published. Say that, rather than a reassuring
+             * blank: an operator who cannot see where the file goes should
+             * know that is what is happening. */
+            p.appendChild(document.createTextNode(
+                " at a path this helper does not publish in advance. The exact path is " +
+                "reported the moment the file exists, and not before."));
+            box.appendChild(p);
+        }
+        box.appendChild(el("p", null,
+            "The file is not encrypted, nothing re-hides it after " +
+            fmtSeconds(uiNum("reveal_seconds", 15)) + " the way a revealed value is, and " +
+            "locking this safe does not remove it. Deleting it afterwards is yours to do."));
+        box.appendChild(el("p", null,
+            "The export is written by the helper and audited by name (I21). This page never " +
+            "sees its contents and will not display them."));
+        return box;
+    }
+
+    /* The confirmation TOKEN the helper refuses to export without.
+     *
+     * Its field help is unusually direct about the division of labour: the
+     * token is "export-plaintext:" plus the safe's id, and "the UI MUST show
+     * the operator, in full, what is about to be written in the clear and
+     * where, and send this only after they agree". So the operator does not
+     * TYPE it — making someone transcribe a token is a ritual, and a ritual is
+     * something people learn to perform without reading. The page shows the
+     * warning, the operator ticks the box that says they have read it, and the
+     * token is sent. It names THIS safe, so an agreement given for a throwaway
+     * safe cannot be replayed against the domain administrator one (I21).
+     *
+     * The prefix comes from the helper's constants, never from a literal here:
+     * a page that hard-coded it would keep sending a token the helper had
+     * stopped accepting, and the failure would look like a permissions bug. */
+    function exportConfirmToken(safe) {
+        var consts = (SCHEMA && SCHEMA.constants) || {};
+        var prefix = consts.export_confirm_prefix;
+        if (!prefix) return null;
+        return String(prefix) + String(safe.id);
+    }
+
+    function exportDialog(safe) {
+        var verb = verbFor("export");
+        if (!verb) return;
+        var dest = exportTarget(safe);
+        /* Inside an open session the handle identifies the safe; outside one the
+         * safe id has to be a preset, and the helper will ask for the passphrase
+         * through the form exactly as it does for any other single-shot verb —
+         * exporting is not a reason to stop prompting. */
+        var presets = (SESSION && BROWSE && BROWSE.safe.id === safe.id && needsSession(verb))
+            ? {} : { safe: safe.id };
+        /* Preset, so the token control is not drawn: it is not a decision the
+         * operator makes, it is the machine-readable half of the decision they
+         * make by ticking the confirm below. Only set it when the verb declares
+         * the field and the helper published the prefix — never a value this
+         * page composed out of nothing. */
+        var token = exportConfirmToken(safe);
+        if (token && argNames(verb).indexOf("confirm") >= 0) presets.confirm = token;
+        verbDialog(verb, presets, null, null, {
+            title: "Export " + (safe.label || safe.id) + " in the clear",
+            safe: safe,
+            runLabel: "Write the plaintext export",
+            beforeForm: function (box) { box.appendChild(exportWarningNode(safe, dest)); },
+            confirm: "I understand this writes every password in this safe to disk in plain " +
+                     "text, and that removing the file afterwards is my responsibility.",
+            onResult: function (res) { exportResultDialog(res); }
+        });
+    }
+
+    /* The result: where it went and how big it is. Nothing else.
+     *
+     * The content keys are dropped BY NAME and the drop is reported, because a
+     * silent drop and a helper that sent nothing look the same, and one of them
+     * means the operator is about to go looking for a file that is actually in
+     * their browser. */
+    var EXPORT_CONTENT_KEYS = { "b64": 1, "content": 1, "data": 1, "csv": 1,
+                                "xml": 1, "json": 1, "body": 1, "text": 1,
+                                "value": 1, "entries": 1 };
+
+    /* A key from that list is only WITHHELD when its value is shaped like a
+     * payload. The distinction is load-bearing: the helper's export reply
+     * carries `entries` as a ROW COUNT, and treating the number 42 as "the
+     * contents, withheld" would both hide a useful figure and print a warning
+     * about a leak that did not happen. A number is a measurement; a non-empty
+     * string or array is the thing itself. */
+    function looksLikeContent(v) {
+        if (typeof v === "string") return v.length > 0;
+        if (Array.isArray(v)) return v.length > 0;
+        return false;
+    }
+
+    function exportResultDialog(res) {
+        modal("Export written", function (box, m) {
+            var path = res && (res.path || res.file || res.target);
+            if (path) {
+                box.appendChild(el("p", null, "The plaintext export was written to:"));
+                box.appendChild(el("code", "sec-path", String(path)));
+            } else {
+                box.appendChild(el("div", "sec-alert warn",
+                    "The helper reported success but did not name the file it wrote. " +
+                    "Its audit log records the export by name (I15, I21)."));
+            }
+            var meta = {};
+            var withheld = [];
+            Object.keys(res || {}).forEach(function (k) {
+                if (EXPORT_CONTENT_KEYS[k] && looksLikeContent(res[k])) {
+                    withheld.push(k);
+                    return;
+                }
+                if (k === "path" || k === "file" || k === "target") return;
+                meta[k] = res[k];
+            });
+            if (res && res.bytes !== undefined)
+                box.appendChild(el("p", null, fmtBytes(res.bytes) + " on disk."));
+            if (Object.keys(meta).length) box.appendChild(kvList(meta));
+            if (withheld.length)
+                box.appendChild(el("div", "sec-alert info",
+                    "The helper also returned the export's contents inline (" +
+                    withheld.join(", ") + "). This page does not render them: every password " +
+                    "in the safe in the browser's DOM is not something the Lock button can " +
+                    "take back."));
+            box.appendChild(el("div", "sec-danger-block",
+                "That file is plaintext and it is still there. Remove it when you are done " +
+                "with it — nothing in this program will."));
+            actionRow(box, [btn("Close", "", function () { m.close(); })]);
+        }, { wide: true });
+        announce("The plaintext export was written.");
+    }
+
+    /* ================================================================== *
+     * Save-as, the backup ring, and restore
+     *
+     * Three operations that all touch files beside the safe, and one shared
+     * honesty problem: the operator has to be told what is about to be
+     * overwritten BEFORE it is, because none of it is undoable from this page.
+     * ================================================================== */
+
+    /* Save-as takes a NAME, not a path (I4: no verb accepts a caller-supplied
+     * path, and that has not stopped being true because the file is new). This
+     * advisory is CLIENT-SIDE FEEDBACK ONLY: it exists so the operator finds
+     * out at the moment of typing rather than at the moment of refusal. The
+     * helper is the gate. If this check and the helper ever disagree, the
+     * helper is right and this is a bug in the hint. */
+    function attachNameAdvisory(ctrl) {
+        if (!ctrl || !ctrl.node) return;
+        ctrl.node.appendChild(el("div", "hint",
+            "A name, not a path. The helper chooses the directory the copy is written to \u2014 " +
+            "there is no verb on this page that takes a path from the browser (I4)."));
+        /* Polite, never assertive: this fires while the operator is still
+         * typing, and interrupting a screen reader mid-word to say a half-typed
+         * name is wrong is worse than saying nothing at all. */
+        var live = el("div", "err");
+        live.setAttribute("aria-live", "polite");
+        ctrl.node.appendChild(live);
+        ctrl.onChange(function () {
+            var v = ctrl.get();
+            v = (v === undefined || v === null) ? "" : String(v);
+            var why = "";
+            /* The rules the helper's own `name` descriptor states it refuses:
+             * a slash, a backslash, a leading dot or a NUL. Repeating them here
+             * buys the operator an answer while they type; the helper is what
+             * actually refuses, and if these two ever disagree the helper is
+             * right and this hint is the bug. */
+            if (v.indexOf("/") >= 0)
+                why = "That is a path. Give a name with no \u201c/\u201d in it.";
+            else if (v.indexOf("\\") >= 0)
+                why = "A backslash is refused. Give a name with no path separator in it.";
+            else if (v === "." || v === "..")
+                why = "\u201c" + v + "\u201d names a directory, not a file.";
+            else if (v.indexOf("\u0000") >= 0)
+                why = "That name contains a NUL byte and cannot be a filename.";
+            else if (v.charAt(0) === ".")
+                why = "A leading dot is refused by the helper. Start the name with a letter " +
+                      "or a digit.";
+            live.textContent = why;
+        });
+    }
+
+    function saveAsDialog() {
+        var verb = verbFor("saveAs");
+        if (!verb || !SESSION || !BROWSE) return;
+        verbDialog(verb, {}, null, null, {
+            title: verbLabel(verb),
+            safe: BROWSE.safe,
+            runLabel: "Write the copy",
+            intro: "Writes what is in memory — including changes not yet saved — to a NEW " +
+                   "file. The safe this session opened is not touched, and its own unsaved " +
+                   "changes stay unsaved.",
+            beforeForm: function (box) {
+                box.appendChild(el("div", "sec-alert info",
+                    "The copy is a new file, so the changed-on-disk check that guards a " +
+                    "normal save does not apply to it. If a file of that name is already " +
+                    "there, the helper decides what happens — this page does not overwrite " +
+                    "anything on its own."));
+            },
+            onResult: function (res) {
+                var msg = "Copy written" +
+                    (res && res.path ? " to " + res.path : "") +
+                    (res && res.bytes !== undefined ? " — " + fmtBytes(res.bytes) : "") + ".";
+                alertText(msg, "ok");
+                announce(msg);
+            },
+            /* Which control carries the file name is the helper's choice, so
+             * the advisory goes on every plain text control the verb declared
+             * rather than on one this page picked by guessing at an id. There
+             * is normally exactly one. */
+            afterForm: function (form) {
+                form.controls.forEach(function (c) {
+                    if (c.kind === "text" && !c.secret) attachNameAdvisory(c);
+                });
+            }
+        });
+    }
+
+    /* The backup ring (I12). The helper copies the current file into it before
+     * the first new byte of a save exists, so this list is the undo that a
+     * password safe is otherwise missing. Timestamps in local time and sizes in
+     * bytes, because "which one was before I broke it" is answered by both. */
+    function backupsDialog(safe) {
+        var listVerb = verbFor("backups");
+        if (!listVerb) return;
+        var restoreVerb = verbFor("restore");
+        var target = safe || (BROWSE ? BROWSE.safe : null);
+        modal("Backups — " + ((target && (target.label || target.id)) || "this safe"),
+        function (box, m) {
+            var body = el("div");
+            box.appendChild(body);
+            body.appendChild(el("p", "sec-subtle", "Loading the backup ring…"));
+
+            var req = {};
+            if (target && !(SESSION && needsSession(listVerb))) req.safe = target.id;
+            var p = (needsSession(listVerb) && SESSION)
+                ? SESSION.call(listVerb, req)
+                : callOnce(listVerb, req, adminForVerb(listVerb, target));
+
+            p.then(function (res) {
+                clear(body);
+                var rows = (res && (res.backups || res.entries || res.files || res.ring)) || [];
+                if (!Array.isArray(rows) || !rows.length) {
+                    body.appendChild(el("p", "sec-empty",
+                        "No backups yet. The helper writes one before the first mutation of " +
+                        "a save, so this list fills up the first time this safe is saved."));
+                    return;
+                }
+                if (res && res.keep !== undefined)
+                    body.appendChild(el("p", "sec-subtle",
+                        "The ring keeps " + res.keep + " generation(s); the oldest is pruned " +
+                        "when a new one is written."));
+                /* Where they are. An operator who needs a backup usually needs
+                 * it from a shell, and the directory is the helper's to choose
+                 * — this page has never named it and could not. */
+                if (res && res.dir)
+                    body.appendChild(el("code", "sec-path", String(res.dir)));
+                var panel = el("div", "sec-panel");
+                rows.forEach(function (r, ix) {
+                    var line = el("div", "sec-file-row");
+                    var nm = r.name || r.path || r.file || ("backup " + ix);
+                    line.appendChild(el("span", "sec-file-name", String(nm)));
+                    var when = fmtWhen(r.when !== undefined ? r.when
+                                     : (r.modified !== undefined ? r.modified : r.mtime));
+                    if (when) line.appendChild(el("span", "sec-file-size", when));
+                    var sz = (r.bytes !== undefined ? r.bytes : r.size);
+                    if (sz !== undefined) line.appendChild(el("span", "sec-file-size", fmtBytes(sz)));
+                    line.appendChild(el("span", "sec-spacer"));
+                    if (restoreVerb)
+                        line.appendChild(btn("Restore…", "danger tiny", function () {
+                            m.close();
+                            restoreDialog(restoreVerb, target, r);
+                        }));
+                    panel.appendChild(line);
+                });
+                body.appendChild(panel);
+                if (!restoreVerb)
+                    body.appendChild(el("p", "sec-subtle",
+                        "This helper lists backups but offers no restore verb, so they are " +
+                        "recovered outside this page."));
+            }).catch(function (e) {
+                clear(body);
+                body.appendChild(errNode(e));
+                handleSessionError(e);
+            });
+            actionRow(box, [btn("Close", "", function () { m.close(); })]);
+        }, { wide: true });
+    }
+
+    /* Restoring puts an old copy back over the live safe. The confirm has to
+     * say both halves of that: what is about to be overwritten, and that the
+     * thing being overwritten is itself copied into the ring first — an
+     * operator who restores the wrong generation must be able to undo it, and
+     * must be told so before they are frightened out of the decision. */
+    function restoreDialog(verb, safe, item) {
+        var nm = item && (item.name || item.path || item.file);
+        var when = fmtWhen(item && (item.when !== undefined ? item.when : item.modified));
+        var presets = {};
+        if (safe && !(SESSION && needsSession(verb))) presets.safe = safe.id;
+        if (nm) {
+            /* Name whichever request field the verb declares for it, rather
+             * than assuming "backup": the helper's descriptor is the authority
+             * on its own request shape. */
+            var names = argNames(verb);
+            var key = ["backup", "name", "generation", "file", "index"].filter(function (k) {
+                return names.indexOf(k) >= 0;
+            })[0];
+            if (key) presets[key] = (key === "index" && item.index !== undefined)
+                ? item.index : nm;
+        }
+        verbDialog(verb, presets, null, null, {
+            title: "Restore " + (nm ? String(nm) : "a backup"),
+            safe: safe,
+            runLabel: "Overwrite the safe with this backup",
+            beforeForm: function (box) {
+                var w = el("div", "sec-danger-block");
+                w.appendChild(el("p", null,
+                    "This overwrites the live safe" +
+                    (safe ? " “" + (safe.label || safe.id) + "”" : "") +
+                    " with the copy taken " + (when || "at the time shown") + "."));
+                w.appendChild(el("p", null,
+                    "Everything added or changed in the safe since then is gone from the " +
+                    "file — including anything a desktop client wrote."));
+                w.appendChild(el("p", null,
+                    "The safe as it stands right now is copied into the backup ring first, " +
+                    "so this is reversible by restoring the newest generation."));
+                box.appendChild(w);
+            },
+            confirm: "I understand the safe on disk is about to be replaced by this backup.",
+            onResult: function (res) {
+                var msg = "Restored" + (nm ? " from " + nm : "") +
+                    (res && res.backup ? "; the previous state was kept at " + res.backup : "") + ".";
+                alertText(msg, "ok");
+                announce(msg);
+                /* The file underneath the open session is not the file that
+                 * was unlocked any more. Continuing to browse it would show the
+                 * operator the OLD contents out of the helper's memory while
+                 * the disk holds something else, and the first save would
+                 * either conflict or clobber. So lock, and say why.
+                 *
+                 * ONLY when it is the same safe. A restore is reachable from
+                 * the safe list, so the safe being restored is not necessarily
+                 * the one that happens to be open — and locking an unrelated
+                 * session would throw away that session's unsaved changes for
+                 * an action that had nothing to do with it. */
+                var openId = BROWSE ? BROWSE.safe.id : null;
+                if (SESSION && safe && openId === safe.id)
+                    lockNow("the safe on disk was replaced by a backup");
+                else if (!SESSION)
+                    refreshAll();
+            }
+        });
     }
 
     /* ================================================================== *
@@ -3215,13 +5459,26 @@
         byId("sec-refresh").addEventListener("click", function () {
             if (SESSION) { loadTree(); loadEntries(); }
             else refreshAll();
+            /* Whatever else Refresh means, it means "tell me the truth about
+             * what is unlocked right now". */
+            refreshAgent();
         });
         byId("sec-lock").addEventListener("click", function () { confirmLock(); });
         bindLifetime();
 
         PERM = cockpit.permission({ admin: true });
         PERM.addEventListener("changed", function () {
-            if (!SESSION) renderSafes();
+            if (SESSION) return;
+            renderSafes();
+            /* Administrative access has just come on. The admin-class safes
+             * were deliberately not probed while it was off — one Cockpit
+             * prompt per card on load is an interrogation, not a page — so this
+             * is the first moment they can be, and without it an operator who
+             * escalates from Cockpit's own header watches the cards stay blank
+             * until they think to press Refresh. Only the ones not already
+             * probed, because this event can fire more than once. */
+            if (adminAllowed())
+                SAFES.forEach(function (s) { if (!PROBES[s.id]) probeSafe(s); });
         });
 
         /* The schema is fetched first and everything else waits for it: this
@@ -3235,6 +5492,10 @@
                 fmtSeconds(uiNum("reveal_seconds", 15));
             renderHelperRules();
             refreshAll();
+            /* Started after the schema, because it is the schema that says
+             * whether this helper has an agent at all. A helper without one is
+             * never polled and never draws a banner (I18). */
+            startAgentWatch();
         }).catch(function (e) {
             byId("sec-sub").textContent = "";
             var host = byId("sec-safes");

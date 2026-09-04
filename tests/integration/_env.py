@@ -40,9 +40,21 @@ PW = "fixture-pass-do-not-reuse"
 
 
 def default_root():
-    """Somewhere private, not group-writable, and not under /tmp."""
+    """Somewhere private, not group-writable, not under /tmp, and NOT SHARED.
+
+    The pid segment is not decoration. `build()` opens with `shutil.rmtree`, so
+    a fixed root means two scripts run at the same time delete each other's
+    registry mid-run — which surfaces as "hermetic registry did not load:
+    entries=0" or a FileNotFoundError from an unlink, both of which read
+    exactly like a real registry bug and cost two people real debugging time
+    during this build. `COCKPIT_SECRETS_TEST_ROOT` overrides it outright for a
+    caller that wants a stable, inspectable directory.
+    """
+    override = os.environ.get("COCKPIT_SECRETS_TEST_ROOT")
+    if override:
+        return override
     base = os.environ.get("XDG_RUNTIME_DIR") or os.path.expanduser("~/.cache")
-    return os.path.join(base, "cockpit-secrets-integration")
+    return os.path.join(base, "cockpit-secrets-integration-%d" % os.getpid())
 
 
 #: id -> (fixture file, registry overrides). Kept here so every script names a
@@ -192,6 +204,29 @@ class Session:
         if self.verbose:
             print("    %-11s -> %s" % (verb, json.dumps(out)[:220]))
         return out
+
+    def call_may_close(self, verb, **kw):
+        """Like `call`, for a frame the helper is expected to answer and then
+        hang up on — an over-long line is the case that exists.
+
+        A line-oriented stream cannot be resynchronised after an oversized
+        line: the helper cannot know where the next frame starts. So it answers
+        `invalid`, writes a closing frame and shuts down, which is right. The
+        write can therefore fail with EPIPE *before* the reply is read, because
+        the helper closed first; the reply is still in our pipe buffer and is
+        read regardless. Returning it, rather than letting BrokenPipeError kill
+        the test, is what lets a caller assert the refusal itself.
+        """
+        kw["verb"] = verb
+        try:
+            self.p.stdin.write(json.dumps(kw) + "\n")
+            self.p.stdin.flush()
+        except (BrokenPipeError, ValueError):
+            pass
+        try:
+            return self._read()
+        except Exception as exc:
+            return {"_no_reply": str(exc)}
 
     def close(self):
         try:

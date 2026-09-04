@@ -78,8 +78,11 @@ Licence: GPL-3.0 — see ../LICENSE.
 
 import base64
 import binascii
+import csv
 import hashlib
 import hmac
+import io
+import json
 import os
 import secrets as _sysrandom
 import sys
@@ -91,12 +94,13 @@ from .base import (
     AccessDenied, BadCredential, Conflict, Invalid, NotFound, Unsupported,
     Backend, LockFile, Limits, Secret,
     atomic_replace, constant_time_eq, open_safe_fd, redact, register_backend,
-    VERSION,
+    validate_new_path, VERSION,
 )
 
 __all__ = [
     "Psafe3Backend", "Pws3Db", "Field", "StretchedKey",
     "parse_bytes", "serialize", "read_file", "write_file",
+    "parse_password_history", "build_password_history",
     "twofish_provider", "set_twofish_provider",
     "HEADER_FIELDS", "RECORD_FIELDS",
 ]
@@ -135,6 +139,14 @@ MAX_FIELDS_PER_RECORD = 4096
 #: format version because we saved it would be a claim about features we did
 #: not add.
 DEFAULT_NEW_VERSION = 0x030D
+
+#: Format version that introduced the attachment fields 0x25..0x29 — §3.3 note
+#: [30], "These parameters were introduced in version 0x030F (PasswordSafe
+#: V3.68)". `attach_add` refuses below this rather than bumping the file's
+#: declared version, for the reason stated on DEFAULT_NEW_VERSION: raising a
+#: version is a claim about the file, and the operator is the one entitled to
+#: make it.
+ATTACHMENT_MIN_VERSION = 0x030F
 
 # -- header field types (§3.2) ---------------------------------------------
 HDR_VERSION = 0x00
@@ -294,6 +306,17 @@ RECORD_FIELDS = {
 
 _RECORD_NAME_TO_TYPE = {name: t for t, (name, _k) in RECORD_FIELDS.items()}
 
+#: Contract field name -> this format's own field name, for `reveal`. The
+#: helper's vocabulary is deliberately format-neutral (docs/CONTRACT.md), so
+#: the translation belongs on this side of the boundary; the alternative is a
+#: table of per-format special cases in `secrets-admin`, which is precisely the
+#: knowledge a backend exists to hold. Only names the helper actually publishes
+#: appear here — this is not a general alias space.
+_REVEAL_ALIASES = {
+    "totp": "two-factor-key",
+    "totp-seed": "two-factor-key",
+}
+
 #: Fields `entries()` must never carry — invariant 1 of the Backend ABC. This
 #: is not "the password field": password history holds every PREVIOUS password
 #: in cleartext, the two-factor key is a TOTP seed, and the credit-card and
@@ -328,11 +351,23 @@ _PROVIDER_FORCED = None     # set by set_twofish_provider() for the test suite
 class _BotanTwofish:
     """Adapter over `botan3.BlockCipher("Twofish")` — raw ECB blocks only.
 
-    Botan's `SymmetricCipher` would offer "Twofish/CBC", but its CBC comes with
-    a padding scheme and Password Safe v3 has none: fields are block-aligned by
-    the format itself, with random fill, and a library that quietly appended
-    PKCS#7 would corrupt every file we wrote. So both providers expose the same
-    thing — one block in, one block out — and this module drives CBC itself.
+    `BlockCipher` and not `SymmetricCipher`, and the reason is measured rather
+    than stylistic (docs/HOST-FACTS.md): `SymmetricCipher("Twofish/CBC/
+    NoPadding")` raises "botan_cipher_init failed: -40 (Not implemented)" on
+    Botan 3.10, and so does "Twofish/ECB/NoPadding" — Botan's cipher-mode FFI
+    has no Twofish at all. There is no Botan CBC mode for this cipher to reach
+    for. `BlockCipher` does have Twofish and matches the official ECB vectors.
+
+    That suits this format anyway: `BlockCipher` is a raw block primitive with
+    no mode and no padding, which is exactly what Password Safe v3 needs —
+    fields are block-aligned by the format itself with random fill, so a
+    library that quietly appended PKCS#7 would corrupt every file we wrote.
+    Both providers therefore expose the same thing, one block in and one block
+    out, and this module composes CBC itself.
+
+    `bytes()` around every result is load-bearing: botan3 returns a
+    `ctypes.c_char_Array_16`, and ITERATING one yields 1-byte `bytes` objects
+    rather than ints, which turns the XOR in `_cbc_decrypt` into a TypeError.
     """
 
     __slots__ = ("_c",)
@@ -799,6 +834,110 @@ def _time_field(when=None):
     """A 4-byte little-endian time_t, the shape every current writer uses."""
     return int(when if when is not None else time.time()).to_bytes(
         4, "little", signed=False)
+
+
+# ===========================================================================
+# Password History  (§3.3 field 0x0f, note [12])
+# ===========================================================================
+#
+# This is the only per-entry history Password Safe v3 has, and it is a STRING
+# field, not a structure: the whole list is packed into one text value.
+#
+#     "fmmnnTLPTLP...TLP"
+#       f   {0,1}  history off / on
+#       mm  2 hex  maximum size of the list (so 255 is the ceiling)
+#       nn  2 hex  current number of entries
+#       T   8 hex  time_t the password was set (%08x)
+#       L   4 hex  password length **in characters**, not bytes
+#       P          the password itself
+#
+# "The list is sorted by T, with the oldest entry first. Newer entries are
+# appended to the end of the list."
+#
+# Two properties of this format decide how the code below is written:
+#
+#   1. **L counts characters.** The field arrives as UTF-8 bytes; a length
+#      taken over the encoded bytes desynchronises the parser on the first
+#      non-ASCII password and then reads the rest of the list as garbage — or,
+#      worse, as a plausible-looking shorter list. Everything here works on the
+#      DECODED string.
+#   2. **It is attacker-shaped.** The field's own bytes were verified by the
+#      file HMAC before this code sees them (I6), so this is not a decryption
+#      oracle — but a legitimately-authenticated file can still be malformed,
+#      and every length below is bounds-checked before it is used as a slice.
+#      `Invalid` is the answer, never a partial list: "recover what you can"
+#      from a password history means showing an operator a password that was
+#      never in the file.
+
+#: 2 hex digits, so the format's own ceiling. Not a policy of ours.
+PWH_MAX_ENTRIES = 255
+#: 4 hex digits for the length of one password.
+PWH_MAX_PASSWORD = 0xFFFF
+
+
+def parse_password_history(text):
+    """`"1050300000000..."` -> `(enabled, max_size, [(when, password), ...])`.
+
+    Raises `Invalid` for anything that does not parse exactly. An absent field
+    is the caller's business — the spec's preferred representation of "no
+    history" is no field at all, and `"00000"` is the other legal spelling.
+    """
+    if text is None:
+        return (False, 0, [])
+    if len(text) < 5:
+        raise Invalid("this entry's password history is malformed")
+    if text[0] not in ("0", "1"):
+        raise Invalid("this entry's password history has an invalid flag")
+    try:
+        enabled = text[0] == "1"
+        max_size = int(text[1:3], 16)
+        count = int(text[3:5], 16)
+    except ValueError:
+        raise Invalid("this entry's password history is malformed")
+
+    items = []
+    pos = 5
+    for _ in range(count):
+        # 8 hex time + 4 hex length is the smallest a record can be.
+        if pos + 12 > len(text):
+            raise Invalid("this entry's password history is truncated")
+        try:
+            when = int(text[pos:pos + 8], 16)
+            length = int(text[pos + 8:pos + 12], 16)
+        except ValueError:
+            raise Invalid("this entry's password history is malformed")
+        pos += 12
+        if length > PWH_MAX_PASSWORD or pos + length > len(text):
+            raise Invalid("this entry's password history is truncated")
+        items.append((when, text[pos:pos + length]))
+        pos += length
+    # Trailing bytes are not "extra data we can ignore": either nn undercounts
+    # the list (so we would silently drop history) or the field is corrupt.
+    if pos != len(text):
+        raise Invalid("this entry's password history has trailing data")
+    return (enabled, max_size, items)
+
+
+def build_password_history(enabled, max_size, items):
+    """The inverse of `parse_password_history`. Returns the field's text.
+
+    `max_size` and the entry count are both 2 hex digits, so both are clamped
+    to 255 here rather than at the call site — a wider value would be written
+    as more than two digits and every other implementation would then read the
+    overflow as the start of a timestamp.
+    """
+    max_size = max(0, min(int(max_size), PWH_MAX_ENTRIES))
+    items = list(items)[-PWH_MAX_ENTRIES:]
+    out = ["%d%02x%02x" % (1 if enabled else 0, max_size, len(items))]
+    for when, password in items:
+        if len(password) > PWH_MAX_PASSWORD:
+            raise Invalid("a password is too long to record in the history")
+        # Lowercase %08x/%04x, matching pwsafe's own ostream formatting. A
+        # reader that upper-cases is fine either way, but there is no reason to
+        # be the implementation that finds out.
+        out.append("%08x%04x%s" % (int(when) & 0xFFFFFFFF, len(password),
+                                   password))
+    return "".join(out)
 
 
 class Pws3Db:
@@ -1400,15 +1539,33 @@ class Psafe3Backend(Backend):
             "warnings": warnings,
         }
 
-    def unlock(self, password, keyfile=None, session=None):
+    def unlock(self, password, keyfile=None, session=None, *,
+               yubikey_response=None):
         """Derive, verify, parse — in that order, and nothing escapes early.
 
-        `keyfile` is refused rather than ignored: Password Safe v3 has no key
-        file, and accepting one silently would let an operator believe a second
-        factor was in play when it was not.
+        `keyfile` and `yubikey_response` are both REFUSED rather than ignored,
+        for the same reason: accepting a second factor and then not using it
+        leaves an operator believing they have protection they do not have.
+
+        On the hardware-token refusal specifically, because the reason is not
+        "Password Safe has no YubiKey support" — it does. formatV3.txt §3.2
+        field 0x12 ("Yubico", 20 bytes, note [18]) stores *the YubiKey's secret
+        key*, "saved so that it can be used to initialize additional YubiKeys".
+        That is a provisioning aid, not a challenge-response construction: the
+        format does not specify how a token's answer combines with the
+        passphrase to open the file, because in Password Safe that combination
+        is application behaviour rather than file format. Guessing it would
+        produce a stretched key no real Password Safe agrees with, and the
+        symptom would be `bad-credential` on a correct passphrase.
         """
         if keyfile is not None and len(keyfile) > 0:
             raise Unsupported("Password Safe v3 has no key-file support")
+        if yubikey_response is not None:
+            raise Unsupported(
+                "Password Safe v3 does not specify how a hardware token's "
+                "response combines with the passphrase; its 0x12 header field "
+                "stores a YubiKey secret for provisioning, not a "
+                "challenge-response key derivation")
         if password is None:
             raise Invalid("this format requires a passphrase")
 
@@ -1580,11 +1737,28 @@ class Psafe3Backend(Backend):
 
         Refuses a field name it does not know rather than guessing a type byte:
         a typo must not silently return the wrong secret.
+
+        Two names from the helper's published vocabulary need translating here,
+        because that vocabulary was written for a format with named fields:
+
+          * `totp` is the seed. formatV3.txt calls it Two Factor Key (0x1b),
+            and `reveal` renders it as unpadded base32 — the form a phone's
+            authenticator app will accept.
+          * `custom:<name>` cannot be answered at all. A PWS3 record is a list
+            of TYPED fields and a type appears at most once, so there is no
+            name-keyed custom string space to look a name up in. 0xdf
+            ("custom-text-field") is one such type, not a dictionary. Refusing
+            with `unsupported` and naming the reason is the honest answer; a
+            not-found would read as "this entry happens not to have it".
         """
         self.require_unlocked()
         idx = self._require_record(uuid)
         record = self._db.records[idx]
-        ftype = _RECORD_NAME_TO_TYPE.get(field)
+        if isinstance(field, str) and field.startswith("custom:"):
+            raise Unsupported(
+                "Password Safe v3 records carry typed fields, not named "
+                "custom fields; there is nothing to look this name up in")
+        ftype = _RECORD_NAME_TO_TYPE.get(_REVEAL_ALIASES.get(field, field))
         if ftype is None:
             raise NotFound("no such field")
         raw = Pws3Db.field_get(record, ftype)
@@ -1657,6 +1831,62 @@ class Psafe3Backend(Backend):
         return {"name": have, "size": len(content),
                 "b64": base64.b64encode(content).decode("ascii")}
 
+    @staticmethod
+    def _attachment_name(record):
+        """The name `attach_get`/`attach_rm` address, or `""` if there is none.
+
+        §3.3 note [30]: "If an entry contains an attachment the field Att
+        MediaType must be present and non-empty" — so MediaType, not FileName,
+        is what decides whether an attachment exists at all. FileName is the
+        preferred display name because it carries the extension the note says
+        applications need; Att Title is the fallback.
+        """
+        if not Pws3Db.field_get(record, REC_ATT_MEDIATYPE):
+            return ""
+        fname = Pws3Db.field_get(record, REC_ATT_FILENAME) or b""
+        title = Pws3Db.field_get(record, REC_ATT_TITLE) or b""
+        return (fname.decode("utf-8", "replace")
+                or title.decode("utf-8", "replace"))
+
+    def history(self, uuid):
+        """The entry's password history, metadata only. **Never a password.**
+
+        This format has no per-entry version history in the KDBX sense: there
+        is no archived copy of the whole record anywhere in a `.psafe3` file.
+        What it has is field 0x0f, a list of *(time, password)* pairs — and
+        that is what this reports, rather than an empty list. An empty list
+        would say "this entry has no history", which is a different and untrue
+        statement about a record that has ten old passwords in it.
+
+        The consequence for the agreed shape, stated rather than papered over:
+        `title`, `username` and `url` are **always `""`** and `notes_len` is
+        always 0, because the format stores none of them per history item.
+        Filling them in from the entry's CURRENT values would render a history
+        row that looks like a snapshot and is not one — the UI would show a
+        title that may have changed since, next to a password that definitely
+        did. A caller that wants the entry's metadata already has it from
+        `entries()`.
+
+        Oldest first, which is both the agreed order and the format's own:
+        "The list is sorted by T, with the oldest entry first."
+        """
+        self.require_unlocked()
+        idx = self._require_record(uuid)
+        raw = Pws3Db.field_get(self._db.records[idx], REC_PASSWORD_HISTORY)
+        if raw is None:
+            return []
+        _enabled, _max_size, items = parse_password_history(
+            raw.decode("utf-8", "replace"))
+        return [{
+            "index": i,
+            "when": _render_time(_time_field(when)),
+            "title": "",
+            "username": "",
+            "url": "",
+            "has_password": bool(password),
+            "notes_len": 0,
+        } for i, (when, password) in enumerate(items)]
+
     # -- mutation: in memory only ------------------------------------------
 
     def _require_record(self, uuid):
@@ -1713,8 +1943,64 @@ class Psafe3Backend(Backend):
         changed = self._apply_changes(idx, changes or {})
         return {"uuid": self._db.record_id(idx), "changed": changed}
 
+    @staticmethod
+    def _push_password_history(record, old_password, when=None):
+        """Archive `old_password` into field 0x0f, obeying the record's policy.
+
+        Password Safe records the history POLICY in the field itself — an
+        on/off flag and a maximum size — so this honours the file rather than
+        imposing anything:
+
+          * **no 0x0f field at all** -> nothing is recorded and none is
+            created. Note [12] calls the absent field the *preferred*
+            representation of "keep no history"; manufacturing one would turn
+            a deliberate setting off and start accumulating old passwords in
+            cleartext in a database whose owner had switched that off.
+          * **flag 0** -> history is disabled. The existing list is left
+            exactly as it is, because note [12] says a disabled-but-populated
+            list ("0aabb, where bb <= aa") is a legal state that the format
+            expects to survive.
+          * **flag 1** -> append, then trim from the FRONT to `max_size`,
+            which is where the oldest entries live.
+
+        An empty old password is not recorded: there is nothing to restore to
+        and a zero-length entry in the list would occupy one of the at most 255
+        slots the format allows.
+        """
+        raw = Pws3Db.field_get(record, REC_PASSWORD_HISTORY)
+        if raw is None or not old_password:
+            return False
+        enabled, max_size, items = parse_password_history(
+            raw.decode("utf-8", "replace"))
+        if not enabled:
+            return False
+        items.append((int(when if when is not None else time.time()),
+                      old_password))
+        if max_size > 0:
+            items = items[-max_size:]
+        Pws3Db.field_set(
+            record, REC_PASSWORD_HISTORY,
+            build_password_history(enabled, max_size, items).encode("utf-8"))
+        return True
+
     def _apply_changes(self, idx, changes):
         record = self._db.records[idx]
+        # Captured BEFORE anything is written: once the new password is in the
+        # field there is nothing left to archive, and a password change that
+        # silently drops the previous value is the data loss the history field
+        # exists to prevent. Real Password Safe does this on every change.
+        old_password = None
+        old_password_when = None
+        if "password" in changes:
+            raw = Pws3Db.field_get(record, REC_PASSWORD)
+            old_password = raw.decode("utf-8", "replace") if raw else ""
+            # The timestamp that belongs on the ARCHIVED password is when THAT
+            # password was set — the current Password Modification Time — and
+            # it has to be read now, because the block below overwrites it with
+            # the time of this change.
+            stamp = Pws3Db.field_get(record, REC_PASSWORD_MOD_TIME)
+            if stamp and len(stamp) >= 4:
+                old_password_when = int.from_bytes(stamp[:4], "little")
         changed = []
         for name, value in changes.items():
             ftype = _RECORD_NAME_TO_TYPE.get(name)
@@ -1736,6 +2022,8 @@ class Psafe3Backend(Backend):
             Pws3Db.field_set(record, REC_LAST_MOD_TIME, now)
             if "password" in changed:
                 Pws3Db.field_set(record, REC_PASSWORD_MOD_TIME, now)
+                self._push_password_history(record, old_password,
+                                            old_password_when)
         return changed
 
     @staticmethod
@@ -1915,6 +2203,164 @@ class Psafe3Backend(Backend):
         return g is not None and self._path_covers(
             path, g.decode("utf-8", "replace"))
 
+    def history_restore(self, uuid, index):
+        """Make one archived password current again. In memory only.
+
+        The current password is pushed onto the history first — subject to the
+        record's own policy, see `_push_password_history` — so a restore is
+        itself undoable wherever the file allows history at all. Where the file
+        has history switched off, the restore still happens and the previous
+        password is NOT recorded, because recording it would be this program
+        overriding a setting the operator chose in another application.
+
+        `index` addresses `history()`'s list, oldest first. Negative indices
+        are `NotFound`, not Python end-relative lookups: `history()` publishes
+        0..n-1, so `-1` is a caller that got its arithmetic wrong, and quietly
+        restoring the newest archived password instead of refusing would put a
+        credential the operator did not choose into the live field.
+        """
+        self.require_writable()
+        idx = self._require_record(uuid)
+        record = self._db.records[idx]
+        self._require_unprotected(record)
+
+        raw = Pws3Db.field_get(record, REC_PASSWORD_HISTORY)
+        if raw is None:
+            raise NotFound("this entry has no password history")
+        _enabled, _max_size, items = parse_password_history(
+            raw.decode("utf-8", "replace"))
+        try:
+            index = int(index)
+        except (TypeError, ValueError):
+            raise NotFound("no such history version")
+        if index < 0 or index >= len(items):
+            raise NotFound("no such history version")
+        # Captured BEFORE the archive step: pushing the current password can
+        # trim the list from the front, which would renumber every index.
+        target = items[index][1]
+
+        current = Pws3Db.field_get(record, REC_PASSWORD)
+        stamp = Pws3Db.field_get(record, REC_PASSWORD_MOD_TIME)
+        self._push_password_history(
+            record, current.decode("utf-8", "replace") if current else "",
+            int.from_bytes(stamp[:4], "little")
+            if stamp and len(stamp) >= 4 else None)
+
+        now = _time_field()
+        Pws3Db.field_set(record, REC_PASSWORD, target.encode("utf-8"))
+        Pws3Db.field_set(record, REC_PASSWORD_MOD_TIME, now)
+        Pws3Db.field_set(record, REC_LAST_MOD_TIME, now)
+        return {"uuid": self._db.record_id(idx), "restored_from": index}
+
+    def attach_add(self, uuid, name, data, *, replace=False):
+        """Attach BYTES to an entry — §3.3 fields 0x25..0x29, note [30].
+
+        **This is the format's own attachment mechanism, not a custom field.**
+        Worth stating plainly because the fields are recent and easy to miss:
+        note [30] defines Att Title / MediaType / FileName / Modification Time
+        / Content, and says "if an entry contains an attachment the field Att
+        MediaType must be present and non-empty". `attach_get` already reads
+        exactly these; this is the write half.
+
+        Two things the format genuinely cannot do, both refused with the reason
+        named rather than worked around:
+
+          * **One attachment per record.** A record is a list of fields and a
+            field type appears at most once in it, so there is nowhere to put a
+            second Att Content. Adding one under a custom text field would
+            invent a convention no other implementation reads. A second name is
+            `Unsupported`; `replace=True` replaces the one that is there.
+          * **Format version 0x030F or later.** Note [30]: the attachment
+            fields "were introduced in version 0x030F (PasswordSafe V3.68)".
+            Writing them into a database that declares an older version means
+            writing fields the file's own version says do not exist. We do not
+            silently raise the declared version to make room — that is a claim
+            about the file, and it is the operator's to make (see
+            DEFAULT_NEW_VERSION).
+
+        The media type is derived from the name's extension, defaulting to
+        `application/octet-stream`. The format requires a non-empty MediaType
+        and Python's `mimetypes` will not always produce one, so the default is
+        the RFC 2046 catch-all rather than a guess.
+        """
+        self.require_writable()
+        idx = self._require_record(uuid)
+        record = self._db.records[idx]
+        self._require_unprotected(record)
+
+        version = self._db.version()
+        if version and version < ATTACHMENT_MIN_VERSION:
+            raise Unsupported(
+                "this database declares format 0x%04x; attachments need "
+                "0x%04x (PasswordSafe V3.68) or later"
+                % (version, ATTACHMENT_MIN_VERSION))
+        if not isinstance(name, str) or not name:
+            raise Invalid("an attachment needs a name")
+        if isinstance(data, (bytearray, memoryview)):
+            data = bytes(data)
+        if not isinstance(data, bytes):
+            raise Invalid("the attachment content must be bytes")
+        if len(data) > Limits.MAX_ATTACHMENT_BYTES:
+            raise Invalid("the attachment is larger than the %d byte limit"
+                          % Limits.MAX_ATTACHMENT_BYTES)
+
+        existing = self._attachment_name(record)
+        if existing and not replace:
+            # TWO DIFFERENT REFUSALS, and telling them apart is the point.
+            # Re-adding the SAME name is a `conflict`: the format can hold an
+            # attachment by that name — it already does — and `replace=True`
+            # is the answer. That is also what KDBX answers for the identical
+            # request, and two backends that give one request two different
+            # error codes is precisely the drift `conformance.py` exists to
+            # catch. Only a SECOND, DIFFERENTLY NAMED attachment is
+            # `unsupported`, because a record is a list of fields and a field
+            # type appears at most once, so there is genuinely nowhere to put
+            # it. "You cannot do this" and "you have already done this" are
+            # different sentences and an operator acts on them differently.
+            if existing == name:
+                raise Conflict(
+                    "this entry already has an attachment called %s"
+                    % name[:64])
+            raise Unsupported(
+                "Password Safe v3 stores at most one attachment per entry and "
+                "this entry already has %s; replace it or remove it first"
+                % existing[:64])
+
+        import mimetypes
+        media = mimetypes.guess_type(name)[0] or "application/octet-stream"
+        now = _time_field()
+        Pws3Db.field_set(record, REC_ATT_TITLE, name.encode("utf-8"))
+        Pws3Db.field_set(record, REC_ATT_FILENAME, name.encode("utf-8"))
+        Pws3Db.field_set(record, REC_ATT_MEDIATYPE, media.encode("utf-8"))
+        Pws3Db.field_set(record, REC_ATT_MOD_TIME, now)
+        Pws3Db.field_set(record, REC_ATT_CONTENT, data)
+        Pws3Db.field_set(record, REC_LAST_MOD_TIME, now)
+        return {"ok": True, "name": name, "size": len(data)}
+
+    def attach_rm(self, uuid, name):
+        """Remove the entry's attachment — all five 0x25..0x29 fields.
+
+        All five, and in particular Att MediaType: note [30] makes MediaType
+        the field that says an attachment exists, so leaving it behind would
+        leave a record that claims a zero-sized attachment ("absence of [Att
+        Content] implies a zero-sized attachment") rather than none.
+        """
+        self.require_writable()
+        idx = self._require_record(uuid)
+        record = self._db.records[idx]
+        self._require_unprotected(record)
+
+        have = self._attachment_name(record)
+        if not have:
+            raise NotFound("this entry has no attachment")
+        if name and name != have:
+            raise NotFound("this entry has no such attachment")
+        for ftype in (REC_ATT_TITLE, REC_ATT_MEDIATYPE, REC_ATT_FILENAME,
+                      REC_ATT_MOD_TIME, REC_ATT_CONTENT):
+            Pws3Db.field_del(record, ftype)
+        Pws3Db.field_set(record, REC_LAST_MOD_TIME, _time_field())
+        return {"ok": True}
+
     # -- persistence -------------------------------------------------------
 
     def _ensure_lossless(self):
@@ -1989,6 +2435,258 @@ class Psafe3Backend(Backend):
         self.fingerprint = report["fingerprint"]
         return {"ok": True, "backup": report["backup"],
                 "bytes": report["bytes"], "conflict": False}
+
+    def save_as(self, target_path, *, override_stale=False):
+        """Write this database to a NEW path. The original is not touched.
+
+        Enforced by construction rather than by care, exactly as in the KDBX
+        backend: `validate_new_path` has just proved the destination does not
+        exist, so `atomic_replace` with `expect_fingerprint=None` never opens
+        the original, never re-fingerprints it and finds nothing to back up;
+        the `.plk` taken is the TARGET's, so the desktop client is not blocked
+        on the original for the duration of a copy; and `self.fingerprint` is
+        left describing the original, so a later `save()` still re-checks
+        against the right file (I13).
+
+        The copy carries the SAME credential — `serialize` uses the database's
+        `StretchedKey`, i.e. the same salt and iteration count — so it opens
+        with the passphrase the original opened with. K, L and the IV are drawn
+        fresh, as they are on every serialise, so the two files share no
+        keystream.
+
+        `require_writable()` is deliberately not called; see the KDBX backend's
+        `save_as` for why the registry's `mode: "ro"` is a statement about that
+        file rather than about the operator.
+        """
+        self.require_unlocked()
+        self._ensure_lossless()
+        validate_new_path(target_path)
+        data = serialize(self._db)
+        with LockFile(target_path, fmt="psafe3",
+                      override_stale=override_stale):
+            report = atomic_replace(target_path, data,
+                                    expect_fingerprint=None)
+        return {"path": target_path, "bytes": report["bytes"]}
+
+    # -- plaintext export  (I21) ------------------------------------------
+
+    def export_plain(self, *, fmt):
+        """**The single most dangerous method in this codebase.** See the ABC.
+
+        One call returns every password, note, TOTP seed, credit-card field and
+        passkey private key in the safe, in the clear, plus every archived
+        password in every entry's history — which `reveal()` cannot reach at
+        all. It exists because credentials an operator cannot get out are
+        credentials they will not trust the tool with; it is gated because it
+        is the shape of every exfiltration incident there has ever been (I21).
+
+        Two formats, and one deliberate refusal:
+
+          csv   a stable core of columns, plus any other KNOWN field that some
+                record actually carries, in field-type order. Unknown field
+                types are named (not dropped) in an `unknown-fields` column so
+                a migrator can see that something was left behind.
+          json  every field of every record, rendered per its declared type,
+                with the raw bytes of unknown types in base64 so nothing is
+                lost at all.
+          xml   `Unsupported`. Password Safe's GUI does have an XML export, but
+                it is an application feature governed by its own schema
+                (`pwsafe.xsd`) — it is not part of formatV3.txt, and that
+                schema is not available on this host. Emitting an
+                approximation would produce a file that CLAIMS to be Password
+                Safe XML and has never been read by Password Safe: precisely
+                the compliance-by-assertion I19 exists to stop.
+
+        Attachment CONTENT is excluded and the attachment's name, media type
+        and size are listed — an export is for migrating credentials, and
+        `attach_get` is the audited way to move one file at a time.
+        """
+        self.require_unlocked()
+        if fmt == "csv":
+            return self._export_csv()
+        if fmt == "json":
+            return self._export_json()
+        if fmt == "xml":
+            raise Unsupported(
+                "Password Safe v3's XML export is a GUI feature with its own "
+                "schema, not part of the file format; this backend will not "
+                "emit a file claiming to be it")
+        raise Unsupported("%s is not an export format this backend writes"
+                          % str(fmt)[:16])
+
+    #: Always present, in this order, whether or not any record uses them. A
+    #: stable prefix is what lets a migrator write one column mapping and reuse
+    #: it against every database. These are §3.3 field names and are read
+    #: straight out of the record by `_export_value`.
+    _CSV_CORE_FIELDS = ("group", "title", "username", "password", "url",
+                        "email", "notes", "create-time", "password-mod-time",
+                        "last-mod-time", "password-expiry-time",
+                        "password-history", "two-factor-key")
+    #: Also always present, but DERIVED rather than read from a single field:
+    #: the three attachment columns fold five §3.3 fields into a name, a media
+    #: type and a size (the content itself is excluded), and `unknown-fields`
+    #: names the type bytes this export could not label. Kept as its own tuple
+    #: so that adding a core column cannot silently shift the boundary between
+    #: "look this up by name" and "compute it".
+    _CSV_CORE_DERIVED = ("attachment", "attachment-mediatype",
+                         "attachment-bytes", "unknown-fields")
+    #: The five attachment fields never become extra columns: the content is
+    #: excluded outright and the other four are folded into the three
+    #: `attachment*` columns above.
+    _CSV_ATTACHMENT = frozenset(("attachment-content", "attachment-title",
+                                 "attachment-filename", "attachment-mediatype",
+                                 "attachment-mod-time"))
+
+    def _export_csv(self):
+        if len(self._db.records) > Limits.MAX_ENTRIES:
+            raise Invalid("this database holds more than %d entries"
+                          % Limits.MAX_ENTRIES)
+        # Which extra known fields any record actually carries. Emitting all 48
+        # of §3.3 would give a migrator a wall of empty columns; emitting none
+        # would silently drop credit-card numbers and passkey material. The set
+        # is derived from the data and the order is the field-type order, so
+        # the result is deterministic for a given database.
+        skip = self._CSV_ATTACHMENT.union(self._CSV_CORE_FIELDS)
+        present = set()
+        for record in self._db.records:
+            for f in record:
+                name = RECORD_FIELDS.get(f.type, (None,))[0]
+                if name and name not in skip:
+                    present.add(f.type)
+        extra = [RECORD_FIELDS[t][0] for t in sorted(present)]
+
+        buf = io.StringIO()
+        # QUOTE_ALL and CRLF: RFC 4180, and the only setting under which a
+        # password containing a comma, a quote or a newline reads back as the
+        # value we wrote.
+        writer = csv.writer(buf, quoting=csv.QUOTE_ALL, lineterminator="\r\n")
+        writer.writerow(list(self._CSV_CORE_FIELDS)
+                        + list(self._CSV_CORE_DERIVED) + extra)
+        for record in self._db.records:
+            row = [self._export_value(record, name)
+                   for name in self._CSV_CORE_FIELDS]
+            content = Pws3Db.field_get(record, REC_ATT_CONTENT) or b""
+            media = Pws3Db.field_get(record, REC_ATT_MEDIATYPE) or b""
+            row += [
+                self._attachment_name(record),
+                media.decode("utf-8", "replace"),
+                str(len(content)) if media else "",
+                " ".join("0x%02x" % f.type for f in record
+                         if f.type not in RECORD_FIELDS),
+            ]
+            row += [self._export_value(record, name) for name in extra]
+            writer.writerow(row)
+        return buf.getvalue().encode("utf-8")
+
+    def _export_value(self, record, name):
+        """One named field, rendered for a text cell. `""` when absent."""
+        ftype = _RECORD_NAME_TO_TYPE.get(name)
+        if ftype is None:
+            return ""
+        raw = Pws3Db.field_get(record, ftype)
+        if raw is None:
+            return ""
+        if name == "two-factor-key":
+            # Base32, unpadded — what every authenticator and QR generator
+            # expects, and what `reveal` already hands back for this field.
+            return base64.b32encode(raw).decode("ascii").rstrip("=")
+        return _render(RECORD_FIELDS[ftype][1], raw)
+
+    def _export_json(self):
+        entries = []
+        for i, record in enumerate(self._db.records):
+            known = {}
+            unknown = []
+            for f in record:
+                if f.type in RECORD_FIELDS:
+                    name, kind = RECORD_FIELDS[f.type]
+                    if name == "attachment-content":
+                        continue                # bytes excluded; see the ABC
+                    if name == "two-factor-key":
+                        known[name] = base64.b32encode(
+                            f.data).decode("ascii").rstrip("=")
+                    else:
+                        known[name] = _render(kind, f.data)
+                else:
+                    # Carried, not dropped. §4.1 says an unknown field must
+                    # survive a save, and an export that silently omitted it
+                    # would be the one place the guarantee stopped holding.
+                    unknown.append({
+                        "type": "0x%02x" % f.type,
+                        "bytes": len(f.data),
+                        "b64": base64.b64encode(f.data).decode("ascii"),
+                    })
+            content = Pws3Db.field_get(record, REC_ATT_CONTENT) or b""
+            media = Pws3Db.field_get(record, REC_ATT_MEDIATYPE) or b""
+            row = {
+                "uuid": self._db.record_id(i),
+                "fields": known,
+                "unknown_fields": unknown,
+                "attachment": ({"name": self._attachment_name(record),
+                                "mediatype": media.decode("utf-8", "replace"),
+                                "size": len(content)} if media else None),
+                "password_history": self._export_history_json(record),
+            }
+            entries.append(row)
+
+        header = {}
+        header_unknown = []
+        for f in self._db.header:
+            if f.type in HEADER_FIELDS:
+                name, kind = HEADER_FIELDS[f.type]
+                # Empty Groups is the one repeatable header field (§3.2 [16]),
+                # so a dict keyed by name would keep only the last one.
+                if f.type == HDR_EMPTY_GROUP:
+                    header.setdefault("empty-groups", []).append(
+                        _render(kind, f.data))
+                else:
+                    header[name] = _render(kind, f.data)
+            else:
+                header_unknown.append({
+                    "type": "0x%02x" % f.type,
+                    "bytes": len(f.data),
+                    "b64": base64.b64encode(f.data).decode("ascii"),
+                })
+
+        document = {
+            "format": "psafe3",
+            "version": self._db.version_string(),
+            "generator": "cockpit-secrets %s" % VERSION,
+            "exported": datetime.now(timezone.utc)
+                        .isoformat(timespec="seconds").replace("+00:00", "Z"),
+            "header": header,
+            "header_unknown": header_unknown,
+            "entries": entries,
+        }
+        return json.dumps(document, ensure_ascii=False,
+                          indent=1).encode("utf-8")
+
+    @staticmethod
+    def _export_history_json(record):
+        """The password history WITH its passwords — this is a plain export.
+
+        `history()` refuses to return these and this method returns them, and
+        the difference is the whole point of the I21 gate: browsing history is
+        an everyday read, and taking every password an entry has ever had out
+        of the safe in one object is not.
+        """
+        raw = Pws3Db.field_get(record, REC_PASSWORD_HISTORY)
+        if raw is None:
+            return None
+        try:
+            enabled, max_size, items = parse_password_history(
+                raw.decode("utf-8", "replace"))
+        except Invalid:
+            # One malformed history must not fail an export of a thousand
+            # entries. Say so in the output rather than dropping the field.
+            return {"malformed": True,
+                    "raw": raw.decode("utf-8", "replace")}
+        return {
+            "enabled": enabled,
+            "max_size": max_size,
+            "entries": [{"when": _render_time(_time_field(when)),
+                         "password": password} for when, password in items],
+        }
 
     def lock(self):
         """Drop the database and every key derived from it. Idempotent."""

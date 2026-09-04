@@ -147,13 +147,39 @@ A copied password stays in the clipboard indefinitely and any focused page can r
 visible countdown and automatic clear (default 15 s), and clear on page hide/unload. Document
 honestly that the clipboard is a shared OS resource and clearing is best-effort. Owner: Task 5.
 
-### I18 · An unlock agent is a permanently unlocked safe · Sev H · OPEN→(design gates it)
+### I18 · An unlock agent is a permanently unlocked safe · Sev H · MITIGATED (two residuals named)
 "Do not prompt every time" is exactly the property we are trying not to have. **Mitigation:**
 the agent is **off by default** and must be enabled per-safe in the registry. When on: an
 `AF_UNIX` socket in a 0700 per-user run dir, peer identity from `SO_PEERCRED`, a handle bound
 to the uid that created it, a **hard** idle timeout (default 300 s) and absolute lifetime
 (default 3600 s), automatic lock on screen-lock/logout, and a visible "unlocked, N s left"
 banner. Prompting stays the default for every safe that does not opt out. Owner: Task 7.
+
+**Status after the second build.** The agent ships, and `tests/integration/agent_cycle.py`
+drives the real helper against the real daemon: agent off is proved to create no socket and
+leave no state; agent on is proved to take a ticket, be visible to a SECOND helper process, be
+revoked by `lock` with a bare safe id, and expire on its own deadline.
+
+The mitigation went further than the design asked in one way and stops short in two others,
+and all three are deliberate:
+
+* **The agent holds a TICKET, not key material.** `secrets-admin` sends no `material` and the
+  daemon's `put` makes it optional. So the agent cannot hand a later helper an unlocked safe,
+  and the passphrase is still prompted on EVERY unlock — the agent buys visibility and
+  revocation, not "do not ask me again". The material path exists and is tested because this
+  hazard sanctions it as a per-safe opt-in, but nothing in the tree uses it and the helper
+  strips a `material` key out of any reply at the door. docs/CONTRACT.md, "What the agent
+  holds", is the authority.
+* **RESIDUAL — the lock detection is a 10 s poll**, not a subscription to logind's `Lock`
+  signal, so there is up to one poll interval between the screen locking and the ticket being
+  dropped. Suspend is handled two other ways that are not polls: the deadlines run on
+  `CLOCK_BOOTTIME` so they count suspended time, and a tick gap larger than tick+30 s drops
+  everything.
+* **RESIDUAL — the admin class separates operators by INSTANCE, not by peercred.** For an
+  `access:"admin"` safe the helper is root, so `SO_PEERCRED` reports uid 0 for every operator.
+  The separation is one agent per operator behind a 0700 run dir (`secrets-agent@<uid>`), which
+  `install.sh` installs and deliberately does not enable. The correct fix is for the root
+  helper to fork and setuid to the operator before connecting; that is not implemented.
 
 ### I19 · "Compliant" is a claim, not a test result · Sev H · OPEN→(design closes)
 A reader and a writer that share a bug round-trip perfectly and interoperate with nothing.
@@ -176,6 +202,24 @@ enabled in the registry, always written `0600` to an operator-configured directo
 client-supplied path), always audited by name, and always preceded by an explicit confirm
 naming what is about to be written in the clear. Attachment downloads stream through the
 Cockpit channel to the browser rather than landing on the server's disk. Owner: Task 6, Task 7.
+
+**Status after the second build: MITIGATED, and proved as a pair.** `export` is refused for a
+user-class safe even when the caller owns the file, refused when `export_allowed` is false,
+refused without the per-safe confirm token `export-plaintext:<id>`, refused for a confirm
+naming a DIFFERENT safe, and refused for an unknown `fmt` — and the SAME request then succeeds
+inside `unshare --map-root-user`, where `os.geteuid()` really is 0. A refusal on its own proves
+nothing; the pair is the evidence. Measured in `tests/integration/newverbs.py`: the file lands
+0600 in a 0700 directory under `export_dir`, named `<safe id>-<UTC stamp>.<ext>` minted
+helper-side, the content is absent from the response, and the audit line carries the file name
+and the row count and no value. `validate.sh` additionally pins the one call site that creates
+an export to `export_dir_for(entry)`, so a destination from the request cannot reappear as a
+one-line change.
+
+The sibling hazard — a page that phones out about the passwords it holds — is closed the same
+way: `breach-check` reads an operator-supplied local corpus and there is no online fallback.
+`validate.sh` bans every network-capable name from the helper, the backends and the agent, and
+the verb is measured answering correctly inside a network namespace whose only interface is a
+DOWN loopback, with a control proving that namespace really is deaf.
 
 ### I22 · Silent format/feature loss on save · Sev M · OPEN→(design closes)
 Reading a KDBX4.1 database with a library that does not model every field and writing it back

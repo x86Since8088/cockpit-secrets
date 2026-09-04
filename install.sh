@@ -28,8 +28,10 @@
 #   /etc/cockpit-secrets/safes/                  0700 root:root   admin-class safe files
 #   /var/log/cockpit-secrets/                    0700 root:root   audit.log
 #   /var/lib/cockpit-secrets/state/              0700 root:root   lockout counters (I16)
+#   /var/lib/cockpit-secrets/exports/            0700 root:root   export destination (I21)
 #   /usr/local/lib/cockpit-secrets/agent/        --with-agent only
 #   /usr/local/lib/systemd/user/secrets-agent.*  --with-agent only
+#   /usr/local/lib/systemd/system/secrets-agent@.*  --with-agent only, NOT enabled
 #
 # What it never does:
 #
@@ -79,7 +81,9 @@ SAFESD="$ETCDIR/safes.d"
 SAFESDIR="$ETCDIR/safes"
 LOGDIR="$DESTDIR/var/log/cockpit-secrets"
 STATEDIR="$DESTDIR/var/lib/cockpit-secrets/state"
+EXPORTDIR="$DESTDIR/var/lib/cockpit-secrets/exports"
 USERUNITDIR="$DESTDIR/usr/local/lib/systemd/user"
+SYSUNITDIR="$DESTDIR/usr/local/lib/systemd/system"
 
 # The Cockpit package payload, flat, mirrored by the stale-file sweep below.
 PLUGIN=(manifest.json index.html secrets.js secrets.css)
@@ -308,18 +312,28 @@ fi
 
 # --- the agent, only if it was asked for -----------------------------------
 AGENT_UNITS=()
+AGENT_SYS_UNITS=()
 AGENT_PY=()
 AGENT_BIN=""
 if ((WITH_AGENT)); then
     [[ -d "$SRC/agent" ]] || die "--with-agent was given but $SRC/agent does not exist (the optional agent may have been dropped - see docs/KNOWN_ISSUES.md I18). Nothing was changed."
     shopt -s nullglob
+    # TWO GLOBS, TWO DESTINATIONS, and the separation is deliberate. The USER
+    # units live directly under agent/systemd/; the SYSTEM template lives one
+    # level down in agent/systemd/system/. A single recursive glob would drop
+    # `secrets-agent@.service` into the user unit directory, where systemd
+    # would read `User=%i` and `SocketUser=%i` in a per-user manager that
+    # cannot honour either — silently wrong, and wrong about identity, which
+    # is the one thing this agent exists to get right.
     AGENT_UNITS=("$SRC"/agent/systemd/*.socket "$SRC"/agent/systemd/*.service \
                  "$SRC"/agent/*.socket "$SRC"/agent/*.service)
+    AGENT_SYS_UNITS=("$SRC"/agent/systemd/system/*.socket \
+                     "$SRC"/agent/systemd/system/*.service)
     AGENT_PY=("$SRC"/agent/*.py)
     shopt -u nullglob
     [[ -f "$SRC/agent/secrets-agent" ]] && AGENT_BIN="$SRC/agent/secrets-agent"
     ((${#AGENT_UNITS[@]})) || die "--with-agent was given but no .socket/.service unit was found under $SRC/agent. Nothing was changed."
-    note "agent payload: ${#AGENT_UNITS[@]} unit(s), ${#AGENT_PY[@]} module(s)${AGENT_BIN:+, 1 executable}"
+    note "agent payload: ${#AGENT_UNITS[@]} user unit(s), ${#AGENT_SYS_UNITS[@]} system template(s), ${#AGENT_PY[@]} module(s)${AGENT_BIN:+, 1 executable}"
 fi
 
 echo
@@ -452,6 +466,13 @@ ensure_dir "$SAFESDIR"  0700 "it holds admin-class safe files."
 ensure_dir "$LOGDIR"    0700 "it holds the audit log."
 ensure_dir "$DESTDIR/var/lib/cockpit-secrets" 0700 "it holds unlock-failure state."
 ensure_dir "$STATEDIR"  0700 "it holds the per-(uid, safe) lockout counters (I16)."
+# The default export destination (I21). The helper creates it 0700 on first use
+# anyway, so this is not load-bearing — but an operator who can SEE the
+# directory the moment the package is installed can reason about it before an
+# export lands in it, and a directory that appears the first time somebody dumps
+# a safe in the clear is a directory nobody has ever looked at. Empty and 0700
+# until `export_allowed` is turned on for some safe, which is off by default.
+ensure_dir "$EXPORTDIR"  0700 "an export is an ENTIRE SAFE IN PLAINTEXT (I21)."
 
 # Seed the examples, and ONLY where nothing is there already.
 #
@@ -502,10 +523,23 @@ if ((WITH_AGENT)); then
         put 0644 "$u" "$USERUNITDIR/$(basename -- "$u")"
     done
 
+    # The SYSTEM template, for the admin access class. Installed, never
+    # enabled: `secrets-agent@<uid>.socket` is one agent per operator behind a
+    # 0700 run dir, and deciding that an administrator's safes may stay open is
+    # not an installer's decision to make (I18). agent/README.md has the
+    # enable line and the argument against running it at all.
+    if ((${#AGENT_SYS_UNITS[@]})); then
+        ensure_dir "$SYSUNITDIR" 0755 "systemd reads system units from here."
+        for u in "${AGENT_SYS_UNITS[@]}"; do
+            put 0644 "$u" "$SYSUNITDIR/$(basename -- "$u")"
+        done
+        note "installed ${#AGENT_SYS_UNITS[@]} system template(s), NOT enabled: see agent/README.md"
+    fi
+
     # Every ExecStart= in the units we just installed must point at something
     # that exists, or the operator finds out at first use instead of now.
     shopt -s nullglob
-    for u in "$USERUNITDIR"/secrets-agent.*; do
+    for u in "$USERUNITDIR"/secrets-agent.* "$SYSUNITDIR"/secrets-agent@.*; do
         while read -r bin; do
             [[ -n $bin ]] || continue
             [[ -e "$DESTDIR$bin" ]] || warn "$(basename -- "$u") runs $bin, which is not installed"

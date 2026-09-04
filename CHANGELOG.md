@@ -12,6 +12,91 @@ Two conventions worth knowing before reading an entry:
   unlock agent above all). **`secrets-admin health` is the authority on what a
   given installation actually has** — not this file.
 
+## 0.2.0 — 2026-09-04
+
+The second wave: ten more verbs, the optional unlock agent, and the integration
+pass that made five parallel branches into one program. Everything in 0.1.0
+still works; nothing in the original verb table changed shape.
+
+### Added
+
+- **Ten verbs**: `export`, `save-as`, `backups`, `restore-backup`, `history`,
+  `history-restore`, `attach-add`, `attach-rm`, `strength`, `breach-check`.
+  Every one is implemented on BOTH formats or refuses with the format's own
+  reason named — `export` to Password Safe XML is `unsupported` because that is
+  a GUI feature with a schema this project does not have, not a gap.
+- **The unlock agent** (`agent/`, opt-in per safe, off by default, I18). It
+  holds a **ticket, not key material**: a uid-bound record that a safe was
+  unlocked, with a hard idle and a hard absolute deadline. The passphrase is
+  therefore still prompted on every unlock — what the agent buys is that an
+  unlocked safe is **visible** (`health.agent`, no handle and no passphrase
+  needed) and **revocable** (`lock` with a bare safe id, across processes).
+- **`export_dir` and `breach_corpus`** registry fields, both absolute,
+  helper-side, and validated by `schema/safe-registry.schema.json`.
+- **A Twofish KDBX 4.0 fixture** and the KDBX self-check that reads it.
+- **Two integration suites** — `tests/integration/newverbs.py` (220 checks) and
+  `tests/integration/agent_cycle.py` (45 checks) — plus the headless browser
+  driver, all now stages of `run_tests.sh`.
+- **Four standing bans** in `validate.sh`: an export may only be written to
+  `export_dir_for(entry)`; no network-capable name anywhere in the helper,
+  backends or agent; no verb may declare a filesystem path as a request field;
+  no source file may contain a NUL byte. Each was verified to FAIL when
+  deliberately violated.
+
+### Fixed
+
+- **`reveal` could not reach a custom field, on either format.** The contract
+  spells one `custom:<name>`, and KDBX looked up a string field with that
+  literal name. Every custom-field reveal in the program answered `not-found`,
+  and the page was building buttons that sent exactly that. `totp` — published
+  in the schema's own field menu — reached neither backend's name for the seed.
+  Both fixed in the backends, where the mapping from a contract name to a
+  storage key belongs. `custom:Password` is deliberately NOT a shortcut to the
+  master password.
+- **Entry history was ordered backwards in the UI.** The schema said index 0 was
+  the most recently archived version; the data says it is the oldest, and the
+  timestamps prove it. The page correctly believed the schema and sorted
+  descending, so history displayed newest-first under an "oldest recorded
+  version" label and attributed every change to the wrong version. Corrected in
+  the descriptor, the sort and the browser fixture together.
+- **`lock` reported `agent_dropped: true` when nothing was dropped.** The agent
+  answers a drop for a safe it is not holding with `{"ok":true,"dropped":0}` — a
+  satisfied request that revoked nothing. A Lock button that cannot lie is no
+  use if its receipt can.
+- **A duplicate attachment name was `conflict` on KDBX and `unsupported` on
+  PWS3.** One operator mistake, two error codes, and only one of them named the
+  fix. PWS3 now distinguishes "you already have one called that" (conflict, use
+  `replace`) from "this format holds only one per record" (unsupported).
+- **`breach-check` declared three response keys it correctly does not return**
+  when no corpus is configured. Caught by conformance.py comparing the
+  declaration against a real call.
+- **`backend_health` reported a backend "available" when its module merely
+  imported** — so a class that was abstract-incomplete read as working while
+  every one of its verbs answered `internal`. It now also requires the class to
+  be instantiable and names what is missing.
+- **The agent daemon and the helper's agent client did not interoperate.** The
+  daemon required `material` the helper does not send, indexed `drop` only by
+  handle, and rejected the helper's own handle alphabet. `material` is now
+  optional, `drop` accepts a safe id, and the token class is base64url — a
+  superset of the hex it accepted before, so nothing was lost.
+- **The integration harness rooted every run at one fixed path**, so two suites
+  running at once deleted each other's registry mid-run. The root is now
+  per-pid, overridable with `COCKPIT_SECRETS_TEST_ROOT`.
+- **`secrets-admin` imported `backends.base._backup_dir_for`** — reaching past
+  the package boundary for the single most important piece of agreement in the
+  program. It is now public and re-exported, along with `validate_new_path`.
+- **`install.sh`** now creates `/var/lib/cockpit-secrets/exports` 0700 and
+  installs the agent's SYSTEM template to the system unit directory instead of
+  letting a glob drop it into the per-user one, where `User=%i` cannot work.
+- **`docs/HOST-FACTS.md` said `pwsafe --help` exits 0**; it exits **255** and
+  writes to stderr. Measured twice, with and without a display.
+
+### Known limitations unchanged
+
+No YubiKey has ever answered a challenge; no registry owned by real root has
+been tested; no `.psafe3` written by the real Password Safe GUI exists here.
+`run_tests.sh` prints all four in its own summary.
+
 ## 0.1.0 — 2026-09-04
 
 First release: unlock and fully manage KeePass (`.kdbx`) and Password Safe v3
