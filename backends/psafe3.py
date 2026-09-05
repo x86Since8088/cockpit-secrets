@@ -141,6 +141,21 @@ MAX_FIELDS_PER_RECORD = 4096
 #: not add.
 DEFAULT_NEW_VERSION = 0x030D
 
+#: `create_new` options, exhaustively. Anything else is `invalid` rather than
+#: ignored — the registry loader's `additionalProperties: false` rule applied
+#: to a request body, and for the registry's reason: a misspelt key that is
+#: silently dropped gives the operator a database that is not the one they
+#: asked for, and the half that survives is always the default. There is no
+#: cipher or KDF choice here because the format has none: §2 specifies Twofish
+#: and iterated SHA-256, and offering an alternative would produce a file no
+#: real Password Safe opens.
+_NEW_PWS3_OPTIONS = frozenset({"iterations", "name"})
+
+#: Longest database name `create_new` will write into header field 0x09. A
+#: name is a label, not a field, and 256 bytes is already past anything a UI
+#: can render.
+_MAX_DB_NAME_BYTES = 256
+
 #: Format version that introduced the attachment fields 0x25..0x29 — §3.3 note
 #: [30], "These parameters were introduced in version 0x030F (PasswordSafe
 #: V3.68)". `attach_add` refuses below this rather than bumping the file's
@@ -1292,6 +1307,35 @@ def _decode_plaintext(plain, mac_key, env, key, *, own_output=False):
     return db
 
 
+def _refuse_repeated_record_fields(db):
+    """Refuse a record carrying two of the same DEFINED field type.
+
+    The same rule `Pws3Db._one` enforces, applied to the whole database at open
+    time so the operator learns now rather than at the first `reveal` of the one
+    field that happens to be doubled. `_one` is the enforcement point no code
+    path can be added around; this is the one that gives a useful answer.
+
+    Only types the format DEFINES are scanned: an unknown repeated type is a
+    field we do not read, and refusing it would invent a rule about data we
+    deliberately preserve byte-for-byte (I22, §4.1).
+
+    Module-level because it has two callers that must not be allowed to
+    disagree — `_open_bytes`, which serves both `unlock` and the import gate.
+    A candidate that passed this check and then failed it at unlock would be an
+    import that reported success and produced a safe that never opens.
+    """
+    for record in db.records:
+        seen = set()
+        for f in record:
+            if f.type in RECORD_FIELDS:
+                if f.type in seen:
+                    raise Invalid(
+                        "a record in this database carries more than one "
+                        "0x%02x field; refusing to guess which one is meant"
+                        % f.type)
+                seen.add(f.type)
+
+
 def parse_bytes(data, password):
     """Open a `.psafe3` image. `password` may be a `Secret`, bytes or str.
 
@@ -1855,34 +1899,52 @@ class Psafe3Backend(Backend):
             # (I13). Re-stat'ing the path later would race a desktop client.
             fingerprint = sf.fingerprint()
 
+        warnings = self._open_bytes(data, password)
+
+        self.fingerprint = fingerprint
+        self.warnings = list(self.warnings) + warnings
+        self._provider = twofish_provider()
+        self.handle = _sysrandom.token_hex(16)      # 128 bits, per CONTRACT.md
+        self.unlocked = True
+
+        return {
+            "handle": self.handle,
+            # 0 means "no timed expiry": in the default configuration this
+            # handle dies with the helper process, which is what makes
+            # "prompt every time" true by construction rather than by policy.
+            "expires_in": int(
+                (self.entry.get("agent") or {}).get("idle_seconds", 0)
+                if (self.entry.get("agent") or {}).get("enabled") else 0),
+            "entries_total": len(self._db.records),
+            "groups_total": len(self._group_paths()),
+            "warnings": list(self.warnings),
+        }
+
+    def _open_bytes(self, data, password):
+        """THE READER. Envelope -> clamp -> stretch -> decode -> refusals.
+        Returns the warnings; the caller owns the fingerprint and the handle.
+
+        Split out of `unlock()` so `open_candidate()` — the import gate — can
+        be the SAME code rather than a second parse path that agrees with it
+        today. A validator that accepted a file this reader would later refuse
+        would report a successful import and fail at the first unlock, after
+        the operator had deleted the copy they uploaded from; that is I24/I41's
+        lesson one layer up. There is exactly one function that turns PWS3
+        bytes into an open database, and this is it.
+
+        The write-floor re-stretch at the bottom is gated on `self.readonly`
+        and therefore does not run for a candidate, whose transient instance is
+        `mode: "ro"`. That falls out of the existing rule rather than needing a
+        flag: a database nothing will ever save does not need a write
+        credential, and deriving one would be a second KDF run for nothing.
+        """
         env = _split_prefix(data)
         Limits.check_pws3_iter(env["iterations"])          # BEFORE the KDF (I7)
         key = StretchedKey.derive(password, env["salt"], env["iterations"])
         db = None
         try:
             db = _decode(env, key)
-        except Exception:
-            key.zero()
-            raise
-
-        # Refuse a repeated record field type HERE as well as in `_one`, so the
-        # operator learns at open time rather than at the first `reveal` of the
-        # one field that happens to be doubled. `_one` is the enforcement point
-        # no path can be added around; this is the one that gives a useful
-        # answer. Only types the format defines are scanned: an unknown
-        # repeated type is a field we do not read, and refusing it would invent
-        # a rule about data we deliberately preserve unchanged (I22).
-        try:
-            for record in db.records:
-                seen = set()
-                for f in record:
-                    if f.type in RECORD_FIELDS:
-                        if f.type in seen:
-                            raise Invalid(
-                                "a record in this database carries more than "
-                                "one 0x%02x field; refusing to guess which one "
-                                "is meant" % f.type)
-                        seen.add(f.type)
+            _refuse_repeated_record_fields(db)
         except Exception:
             key.zero()
             raise
@@ -1900,24 +1962,7 @@ class Psafe3Backend(Backend):
             db.credential = upgraded
 
         self._db = db
-        self.fingerprint = fingerprint
-        self.warnings = list(self.warnings) + db.warnings
-        self._provider = twofish_provider()
-        self.handle = _sysrandom.token_hex(16)      # 128 bits, per CONTRACT.md
-        self.unlocked = True
-
-        return {
-            "handle": self.handle,
-            # 0 means "no timed expiry": in the default configuration this
-            # handle dies with the helper process, which is what makes
-            # "prompt every time" true by construction rather than by policy.
-            "expires_in": int(
-                (self.entry.get("agent") or {}).get("idle_seconds", 0)
-                if (self.entry.get("agent") or {}).get("enabled") else 0),
-            "entries_total": len(db.records),
-            "groups_total": len(self._group_paths()),
-            "warnings": list(self.warnings),
-        }
+        return list(db.warnings)
 
     # -- groups ------------------------------------------------------------
 
@@ -2849,6 +2894,228 @@ class Psafe3Backend(Backend):
                            % "; ".join(lost[:5]))
         self._lossless_checked = True
 
+    # -- creation and import  (C1..C7) -------------------------------------
+
+    @classmethod
+    def header_facts(cls, data):
+        """`Backend.header_facts` for PWS3. **No credential, none needed.**
+
+        §2.1-2.4 is all this can honestly answer, and the honesty is the point:
+        the tag, the salt, the iteration count and the framing are the
+        UNENCRYPTED prefix, readable by anyone holding the file — and the
+        person who just uploaded it holds the file. Everything an operator
+        might want more of (the format sub-version 0x03xx, the database name,
+        the record count) lives in the ENCRYPTED header, §3.2, so this reports
+        "3" and says why rather than guessing. `probe()` makes the same
+        admission about a registered safe.
+
+        `Limits.check_pws3_iter` runs HERE and REFUSES out of range, which is
+        deliberately stricter than `probe()`, where an out-of-range file is
+        reported as a warning. The difference is what the caller does next: a
+        probe describes a safe the operator already has, and an out-of-range
+        one is a fact they need to see; this describes a file they are
+        deciding whether to import, and `ITER=0x7fffffff` must be refused
+        BEFORE they are asked for a passphrase they would then wait minutes to
+        be told was wrong (I7). It is also the same clamp `parse_bytes` applies
+        one step later, so refusing here never rejects a file the import could
+        otherwise have completed.
+        """
+        env = _split_prefix(data)
+        Limits.check_pws3_iter(env["iterations"])   # I7 — before any prompt
+        warnings = []
+        if env["iterations"] < Limits.PWS3_WRITE_MIN_ITER:
+            warnings.append(
+                "this database uses %d key-stretching iterations; the current "
+                "format floor is %d and a save will raise it"
+                % (env["iterations"], Limits.PWS3_WRITE_MIN_ITER))
+        warnings.append(
+            "the format sub-version and the database name are inside the "
+            "encrypted header, so nothing but the passphrase can reveal them")
+        return {
+            "format": "psafe3",
+            "version": "3",
+            "cipher": "twofish-cbc",
+            "kdf": "pws3-sha256",
+            "kdf_params": {"iterations": env["iterations"]},
+            "needs_password": True,
+            # §2 has no key-file or hardware-key concept at all. This is a fact
+            # about the format, not a policy of ours.
+            "needs_keyfile": False,
+            "warnings": warnings,
+        }
+
+    @classmethod
+    def open_candidate(cls, data, *, password, keyfile):
+        """`Backend.open_candidate` for PWS3: `_open_bytes`, and nothing else.
+
+        The transient instance has an EMPTY path and `mode: "ro"`. Both are
+        load-bearing rather than decorative: it was never opened from a file so
+        it has no fingerprint to re-check, `require_writable()` refuses it, and
+        the read-only flag is what stops `_open_bytes` spending a second KDF
+        run minting a write credential for a database nothing will ever save.
+
+        Routing through `_open_bytes` is what makes the error taxonomy come out
+        right without a line of new policy: `_split_prefix` refuses a file that
+        is not a PWS3 database with `Invalid` and the real reason, because it
+        runs before any key material exists and reports only what anyone
+        holding the file already knows; everything at or after the stretch — a
+        wrong passphrase, a failed `H(P')` check, a failed HMAC, and every
+        structural failure on decrypted-but-unauthenticated plaintext —
+        collapses to `BadCredential` with the one shared detail, because
+        `_decode` already flattens them (I6).
+        """
+        if keyfile is not None and len(keyfile) > 0:
+            raise Unsupported("Password Safe v3 has no key-file support")
+        if password is None or not len(password):
+            raise Invalid("this format requires a passphrase")
+        probe = cls({"id": "(candidate)", "label": "candidate",
+                     "format": "psafe3", "path": "", "mode": "ro"})
+        try:
+            warnings = probe._open_bytes(data, password)
+            return {
+                "format": "psafe3",
+                "version": probe._db.version_string(),
+                "cipher": "twofish-cbc",
+                "kdf": "pws3-sha256",
+                "entries": len(probe._db.records),
+                # `_group_paths` is where MAX_GROUPS and MAX_GROUP_DEPTH are
+                # enforced, so calling it is a refusal as well as a count — and
+                # it is the same call `unlock` makes for `groups_total`.
+                "groups": len(probe._group_paths()),
+                "warnings": warnings,
+            }
+        finally:
+            probe.lock()
+
+    @classmethod
+    def build_new(cls, *, credential, options):
+        """`Backend.build_new` for PWS3. Returns the bytes of an empty database.
+
+        **Touches no disk**, and unlike the KDBX side it needs no template:
+        a Password Safe v3 database IS its ordered list of typed fields (§2.9),
+        so an empty one is a header and no records, and this module already
+        owns the writer that turns that into a file. `serialize()` does the
+        parts that are easy to get subtly wrong — `H(P')` in the clear (§2.5),
+        K and L drawn independently and wrapped under P' as B1..B4 (§2.6-2.7),
+        a fresh CBC IV, the unencrypted `PWS3-EOFPWS3-EOF` block (§2.10) and
+        the HMAC-SHA256 over every field's data in file order (§2.11) — and it
+        does them in exactly one place, so a created file and a saved file are
+        the same bytes-shaped decision.
+
+        The header it seeds carries three fields and no more:
+
+          * **0x00 Version**, `DEFAULT_NEW_VERSION` (0x030D / V3.30), which is
+            what this module already stamps into a database it writes. It is
+            not bumped to 0x030F for the attachment fields: a version is a
+            claim about what a file contains, `attach_add` already refuses
+            below 0x030F and NAMES the version rather than raising it, and the
+            operator is the one entitled to make that claim.
+          * **0x01 UUID**, freshly random. §3.2 defines it and every real
+            implementation writes one; two safes created here sharing one would
+            be the same database to anything that merges.
+          * **0x09 Database Name**, only when the caller supplied one. A header
+            field that was never present is not added by default — that is
+            `_stamped_header`'s rule about the user and host fields, for the
+            same reason: metadata this program invents on the operator's behalf
+            is metadata they did not choose to record.
+
+        `_serialize_for_write` adds the "last saved" stamp and moves Version to
+        the front (§2.9.1), so the file also says which program created it.
+
+        NO RECORDS. Not a sample entry, not a default password: a template
+        credential in a password manager is a thing operators leave behind, and
+        one that looks real is a thing they later mistake for real.
+
+        Before returning it runs both guarantees the ABC requires: the I22
+        round-trip guard (a database that could not be SAVED must never be
+        CREATED, or the operator's first edit refuses) and `verify_own_output`
+        on the exact bytes (I24/I41). `Backend.create_new` then re-opens the
+        result from cold with the passphrase, which is the part neither of
+        these can prove.
+        """
+        opts = cls._new_options(options)
+        password = (credential or {}).get("password")
+        keyfile = (credential or {}).get("keyfile")
+        if keyfile is not None and len(keyfile) > 0:
+            raise Unsupported("Password Safe v3 has no key-file support")
+        if password is None or not len(password):
+            raise Invalid("this format requires a passphrase")
+
+        # A fresh salt per database (§2.2, "generated at file creation time")
+        # and the WRITE floor, which `for_write=True` makes non-negotiable: a
+        # request cannot talk this program into creating a file weaker than the
+        # reference implementation would.
+        credential_key = StretchedKey.derive(
+            password, _sysrandom.token_bytes(SALT_LEN), opts["iterations"],
+            for_write=True)
+
+        holder = cls({"id": "(new)", "label": "new safe", "format": "psafe3",
+                      "path": "", "mode": "rw"})
+        try:
+            header = [
+                Field(HDR_VERSION,
+                      DEFAULT_NEW_VERSION.to_bytes(2, "little")),
+                Field(HDR_UUID, _sysrandom.token_bytes(16)),
+            ]
+            if opts["name"]:
+                header.append(Field(HDR_DB_NAME,
+                                    opts["name"].encode("utf-8")))
+            holder._db = Pws3Db(header, [], credential=credential_key)
+            holder.unlocked = True
+            holder._ensure_lossless()                    # I22, before it exists
+            data, expect = holder._serialize_for_write()
+            holder.verify_own_output(data, expect)       # I24/I41, these bytes
+            return data
+        finally:
+            # Zeroes P' on every path, refusals included. `lock()` and not a
+            # bare `self._db = None`: dropping the reference is not wiping it.
+            holder.lock()
+
+    @staticmethod
+    def _new_options(options):
+        """Validate and default `create_new`'s PWS3 options. Raises `Invalid`.
+
+        Fails closed on an unknown key, for the registry loader's reason: a
+        misspelt option that is quietly ignored gives the operator a database
+        that is not the one they asked for, and the half that survives a
+        half-applied request is always the default.
+        """
+        options = dict(options or {})
+        unknown = sorted(set(options) - _NEW_PWS3_OPTIONS)
+        if unknown:
+            # Echo the key only when it is plainly a key: an operator who
+            # mistyped is helped by seeing it back, and an attacker who put a
+            # control sequence in a JSON key must not have it reflected into a
+            # log line or a banner (I15).
+            shown = str(unknown[0])
+            if not shown.isascii() or not shown.isprintable() or len(shown) > 32:
+                shown = "an unrecognised key"
+            raise Invalid("unknown option %r for a new Password Safe database"
+                          % shown)
+
+        iterations = options.get("iterations")
+        if iterations is None:
+            iterations = Limits.PWS3_DEFAULT_ITER
+        elif not isinstance(iterations, int) or isinstance(iterations, bool):
+            raise Invalid("iterations must be an integer")
+        # `for_write=True` applies the 262144 floor as well as the ceiling: the
+        # read range starts at 2048 and creating a file down there would be a
+        # guessing accelerator we chose to build.
+        Limits.check_pws3_iter(iterations, for_write=True)
+
+        name = options.get("name")
+        if name is not None:
+            if not isinstance(name, str):
+                raise Invalid("name must be a string")
+            if len(name.encode("utf-8", "surrogatepass")) > _MAX_DB_NAME_BYTES:
+                raise Invalid("name is longer than %d bytes"
+                              % _MAX_DB_NAME_BYTES)
+            if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in name):
+                # A control character in a database's own name is invisible in
+                # every UI that shows it, which makes it a display spoof.
+                raise Invalid("name contains a control character")
+        return {"iterations": iterations, "name": name or ""}
+
     # -- the pre-write reader check  (I24, I41) ----------------------------
 
     def read_back(self, data):
@@ -3464,6 +3731,81 @@ def _selfcheck():                                       # noqa: C901
            time.monotonic() - started < 0.5)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+    # -------------------------------- create_new / validate_candidate ------
+    #
+    # The FOREIGN oracle for these is `tests/oracle/pws3_oracle read` against a
+    # database this created, and a self-check cannot be it (I19). What this
+    # section proves is the half a self-check CAN prove: the refusals refuse,
+    # the header the format requires is present, and a created database comes
+    # back through our own reader.
+    print("== create_new / validate_candidate (C1, C5, C7, I7) ==")
+    new_pass = "selfcheck-create-pass-not-a-real-secret"
+    made = Psafe3Backend.create_new(credential=new_pass)
+    env = _split_prefix(made)
+    ok("create_new stretches at the format's current floor",
+       env["iterations"] == Limits.PWS3_DEFAULT_ITER
+       and env["iterations"] >= Limits.PWS3_WRITE_MIN_ITER)
+    ok("...and the file carries the unencrypted EOF block (§2.10)",
+       made[-(len(EOF_BLOCK) + MAC_LEN):-MAC_LEN] == EOF_BLOCK)
+    summary = Psafe3Backend.validate_candidate(made, credential=new_pass)
+    ok("...and it opens with the credential it was created with",
+       summary["entries"] == 0 and summary["groups"] == 0)
+    made_db = parse_bytes(made, new_pass)
+    try:
+        ok("...declaring the version this module stamps (§2.9.1)",
+           made_db.version() == DEFAULT_NEW_VERSION)
+        ok("...with the Version field FIRST",
+           made_db.header and made_db.header[0].type == HDR_VERSION)
+        ok("...and a database UUID (§3.2 field 0x01)",
+           len(made_db.header_get(HDR_UUID) or b"") == 16)
+        ok("...and no records at all",
+           not made_db.records)
+    finally:
+        made_db.zero()
+    facts = Psafe3Backend.inspect_bytes(made)
+    ok("inspect_bytes reads the header with no credential",
+       facts["kdf_params"]["iterations"] == Limits.PWS3_DEFAULT_ITER)
+    made2 = Psafe3Backend.create_new(credential=new_pass)
+    ok("two creates share no salt",
+       _split_prefix(made2)["salt"] != env["salt"])
+    named = Psafe3Backend.create_new(credential=new_pass,
+                                     options={"name": "self-check safe"})
+    named_db = parse_bytes(named, new_pass)
+    try:
+        ok("a name is written to header field 0x09",
+           named_db.header_get(HDR_DB_NAME) == b"self-check safe")
+    finally:
+        named_db.zero()
+    ok("...and a database with no name has no 0x09 field at all",
+       parse_bytes(made, new_pass).header_get(HDR_DB_NAME) is None)
+    raises("a wrong passphrase on a candidate -> BadCredential", BadCredential,
+           lambda: Psafe3Backend.validate_candidate(made,
+                                                    credential=new_pass + "!"))
+    raises("bytes that are not a PWS3 database -> Invalid", Invalid,
+           lambda: Psafe3Backend.validate_candidate(b"not a database" * 32,
+                                                    credential=new_pass))
+    raises("...and inspect_bytes refuses them without a credential", Invalid,
+           lambda: Psafe3Backend.inspect_bytes(b"not a database" * 32))
+    raises("an unknown create option -> Invalid", Invalid,
+           lambda: Psafe3Backend.create_new(credential=new_pass,
+                                            options={"iters": 262144}))
+    raises("an iteration count below the write floor -> Invalid", Invalid,
+           lambda: Psafe3Backend.create_new(
+               credential=new_pass,
+               options={"iterations": Limits.PWS3_MIN_ITER}))
+    raises("an iteration count above the ceiling -> Invalid (I7)", Invalid,
+           lambda: Psafe3Backend.create_new(
+               credential=new_pass,
+               options={"iterations": Limits.PWS3_MAX_ITER + 1}))
+    raises("a key file -> Unsupported (the format has none)", Unsupported,
+           lambda: Psafe3Backend.create_new(
+               credential={"password": new_pass, "keyfile": b"\x00" * 32}))
+    raises("a control character in the name -> Invalid", Invalid,
+           lambda: Psafe3Backend.create_new(credential=new_pass,
+                                            options={"name": "a\x00b"}))
+    raises("an empty passphrase -> Invalid (C7)", Invalid,
+           lambda: Psafe3Backend.create_new(credential=""))
 
     print()
     if failures:

@@ -869,3 +869,189 @@ password**, and a live console log names this host's safes. The suite writes the
 | `09-escalated.png` | the admin-class safe open afterwards |
 | `10-zoom-200.png`, `10-keyboard-unlock.png` | the page at the 200%-equivalent viewport; the unlock done from the keyboard alone |
 | `live-ui-result.json`, `live-access-result.json` | per-item verdicts, machine-readable |
+
+---
+
+# 0.4.0 · The two new flows, and the foreign oracle on a safe this program made
+
+`tests/browser/live-registry.spec.js` is the suite; `./tests/browser/run-live.sh`
+runs it first, before `live-ui` and `live-access`, because it is the only spec
+that WRITES to the host — into the signed-in account's own home, never `/etc` —
+and it creates, uses and destroys everything it needs.
+
+## What it drives, and against what
+
+Real Cockpit 360 at `https://localhost:9090`, signed in as `cptestadm` with a
+password read from a 0600 file in a credentials directory (never argv, never the
+environment — the same rule the helper is held to). The INSTALLED package, the
+INSTALLED helper, the real bridge, the real Content-Security-Policy. Nothing is
+stubbed; `tests/browser/ui.spec.js` is the suite that stubs `cockpit.spawn`, and
+it proves a different thing.
+
+Five items:
+
+| Item | What it establishes |
+|---|---|
+| **R1** | a new safe is created from the page and then opened by the page |
+| **R2** | a committed fixture is uploaded, its header is shown BEFORE any passphrase, a wrong passphrase does not cost the transfer, and the adopted safe opens with the fixture's six entries |
+| **R3** | `safe-forget` removes the registry entry and leaves the file byte-identical |
+| **R4** | `safe-delete`'s token gate, and then the file is gone |
+| **R5** | the host is left as it was found |
+
+## Three defects in the SUITE, found by running it, worth recording
+
+None of these was a product defect, and all three are the kind of thing that
+makes a browser suite report green for work it did not do.
+
+1. **A string predicate is `eval`, and the real CSP forbids it.**
+   `frame.waitForFunction("...")` with a string body is refused by the page's
+   own policy (`default-src 'self'`, no `unsafe-eval`) — which is exactly what
+   `live-ui` item 1 exists to assert. The wait rejected, a `.catch(() => null)`
+   swallowed the reason, and three checks silently read a stale dialog for two
+   whole runs. Predicates are functions now, and a wait that gives up prints
+   why.
+
+2. **A predicate that was true before the button was clicked.** The first
+   version waited for the modal's TEXT to match
+   `created|invalid|refused|denied` — and the create form's own
+   `breaks_when_wrong` help text already contains those words, so the wait
+   returned instantly. `dialogSettled()` now watches the HEADING and the error
+   node, neither of which the form says about itself before it is submitted.
+
+3. **`input[type=checkbox]` is not "the confirmation boxes".** A `toggle` field
+   in the form renders as a checkbox too, so ticking them all switched on
+   `make_keyfile` and produced a safe that needed a key file the suite had
+   thrown away. Confirmation gates carry `id^="sec-confirm"`.
+
+A fourth, in the shared harness: `Recorder.item()` returned `state = null` for
+an item whose function threw, and the report printed `state || "PASS"`. An
+item that never finished is `INCOMPLETE` now, and it counts as a failure.
+
+## I19 on a safe this program CREATED — the check that matters most
+
+A safe only we can read is the I19 failure with a new name, so this is driven
+against the foreign oracle rather than against our own reader. It runs through
+`/srv/jobs` at a real euid 0, because a created safe is 0600 in somebody's home
+and the browser suite never uses sudo. Job `cs-oracle-created`, 2026-09-04,
+exit 0. The passphrase came from `/dev/urandom` into a shell variable and was
+piped on stdin — this job's log is group-readable and never saw it.
+
+```
+== create a KDBX 4.1 / AES-256 / Argon2id safe as root, admin class ==
+ helper: {"ok": true, "registry": "system", "bytes": 1173, "format": "kdbx",
+          "kdf": {"memory_kib": 65536, "time": 8, "parallelism": 2}}
+ -rw------- 1 root root 1173 .../etc/safes/oracle-new.kdbx
+
+== the foreign oracle: keepassxc-cli 2.7.10 ==
+ Name: Oracle check
+ Cipher: AES 256-bit
+ KDF: Argon2id (8 rounds, 65536 KB)
+ Number of groups: 1
+ Number of entries: 0
+ --- ls ---
+ [empty]
+ --- version bytes at offset 8 (expect 01 00 04 00 = KDBX 4.1) ---
+ 00000008: 0100 0400                                ....
+
+== a PWS3 created the same way, through the project's own oracle ==
+ helper: {"ok": true, "bytes": 344, "format": "psafe3",
+          "kdf": {"iterations": 262144}}
+ hmac_ok: True  iter: 262144  records: 0   version: 0x030d
+
+== round trip: unlock the CREATED kdbx, add an entry, save, read it foreign ==
+ add: True
+ ls: made-here
+ password: entry-pass-oracle
+```
+
+Four things that are worth saying explicitly about that output:
+
+* the **version bytes are `01 00 04 00`**, which is KDBX **4.1** — not the 4.0
+  of the pykeepass template the old code inherited;
+* the **database name is the operator's label**, so the name in the registry and
+  the name a desktop client shows are the same;
+* the safe is **empty** — one group, no entries. A template credential in a
+  password manager is a thing operators leave behind, and one that looks real is
+  a thing they later mistake for real;
+* and the **round trip closes**: an entry added through this program and saved
+  is read back by `keepassxc-cli show -a Password` with the value that was set.
+  That is a foreign reader accepting our writer, which is the only form of I19
+  evidence that counts.
+
+The admin-class half is in the same job: the create ran at a real euid 0, landed
+`0600 root:root`, and registered in the system registry. `/etc/cockpit-secrets`
+was left exactly as it was found — the job worked in a private `/root` tree and
+removed it.
+
+## The rest of the walkthrough, re-run against a registry seeded BY THESE VERBS
+
+`live-ui` items 2–7 and `live-access` items 8–9 need a registry with something in
+it: an admin-class safe for a non-admin to be refused, and a user-class safe the
+signed-in account can actually open. On a host whose registry ships empty they
+correctly report NOT-ATTEMPTED with the reason, which is what the first run of
+this suite after 0.4.0's install did.
+
+Seeding it is root work and belongs to the operator, not to the suite — so it
+was done through `/srv/jobs`, and it was done **with the verbs this release
+adds**, which makes it evidence rather than setup:
+
+```
+# job cs-seed-walkthrough, at a real euid 0
+ safe-create: {"ok": true, "registry": "system", "bytes": 1173, "format": "kdbx"}
+ -rw------- 1 root root 1173 /etc/cockpit-secrets/safes/lab-dc.kdbx
+ -rw-r--r-- 1 root root  508 /etc/cockpit-secrets/safes.d/lab-dc.json
+   "access": "admin",  "origin": "created",
+   "created_utc": "2026-09-05T00:21:31.022Z",
+   "path": "/etc/cockpit-secrets/safes/lab-dc.kdbx"
+ unlock: handle minted
+
+# job cs-seed-user, as cptestadm through `runuser`, NO escalation
+ identity: {"uid":1007,"euid":1007,"real_uid":1007,"real_user":"cptestadm",
+            "escalated":false,"class_available":"user"}
+ create user-kdbx  -> {"ok": true, "registry": "user", "bytes": 1173}
+ create user-pws   -> {"ok": true, "registry": "user", "bytes": 344}
+
+  lab-dc     kdbx    admin  registry=system origin=created usable=False manageable=False
+  lab-pws    psafe3  admin  registry=system origin=created usable=False manageable=False
+  user-kdbx  kdbx    user   registry=user   origin=created usable=True  manageable=True
+  user-pws   psafe3  user   registry=user   origin=created usable=True  manageable=True
+
+ /home/cptestadm/.config/cockpit-secrets/safes.d/:
+  -rw------- 1 cptestadm cptestadm 550 user-kdbx.json
+ /home/cptestadm/.local/share/cockpit-secrets/safes/:
+  -rw------- 1 cptestadm cptestadm 1589 user-kdbx.kdbx
+```
+
+Three things in that output are the release's whole point, and they were not
+possible before it:
+
+* **an administrator made a safe without hand-writing two files**, and the entry
+  it wrote records `origin: "created"` and when;
+* **an unprivileged user made two safes of their own, with no administrator at
+  all**, and the helper resolving their identity says `escalated: false`,
+  `class_available: "user"`;
+* the four safes list with the right class, the right registry and the right
+  `usable` — `lab-dc` is `usable: False` and `manageable: False` to that user,
+  because it is root's.
+
+Everything the seeded registry made runnable is destroyed again at the end of
+this document's "the host, afterwards" section, using `safe-delete` — which can
+only remove them **because this program minted their paths** (I47). A
+hand-registered safe would have had to be forgotten and removed by hand, which
+is the intended asymmetry.
+
+## Not attempted, and why
+
+* **The admin class from the BROWSER.** R1 asserts that the page names the admin
+  class as the default and says so before anything is typed, and it then chooses
+  the user class deliberately. Driving an admin-class create from the page would
+  write into `/etc/cockpit-secrets` from a test, and the escalation half of that
+  path is already covered by `live-access.spec.js` item 9 against a real bridge.
+* **A key-file create, end to end.** The generated key file is returned once and
+  stored nowhere, so a suite that wanted to use it afterwards would have to keep
+  it — which is the one thing the feature says it does not do. The page's
+  "save this now" step is asserted to exist by `ui.spec.js`; the download itself
+  has never been driven.
+* **A 128 MiB upload through the browser.** The fixture is 4,661 bytes. The
+  chunker's cap, its incremental enforcement and the memory cost of a 128 MiB
+  staging are measured against the helper directly (I54), not through a page.

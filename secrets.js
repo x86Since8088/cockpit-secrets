@@ -239,7 +239,38 @@
         "attachList":     ["attach-list", "attachments", "attach-ls"],
         "strength":       ["strength", "password-strength", "strength-check"],
         "breach":         ["breach", "breach-check", "pwned", "hibp"],
-        "yubikey":        ["yubikey-challenge", "yubikey", "challenge"]
+        "yubikey":        ["yubikey-challenge", "yubikey", "challenge"],
+        /* --- making a safe exist, and making it stop existing -------------
+         *
+         * The registry is this program's trust root: it is what says which
+         * files are safes, where they live and what access class each one has
+         * (I1, I4). These eight capabilities are the first ones that WRITE to
+         * it from a browser request, so every one of them is behind the same
+         * "does the helper publish this verb" gate as everything else here —
+         * a build of this page against a helper with no create verb has no
+         * New-safe button, in the safe list or anywhere else.
+         *
+         * Note what is NOT in any of these lists and never will be: a name for
+         * a verb that takes a path. The caller supplies an ID; the helper mints
+         * the filename from it and from the managed directory for the access
+         * class. There is no request field in this whole feature that is a
+         * path, a filename, a directory or a component of one (C1, I4). */
+        "safeCreate":     ["safe-create", "create-safe", "safe-new", "new-safe",
+                           "safe-add", "add-safe"],
+        "importBegin":    ["import-begin", "safe-import-begin", "import-start",
+                           "upload-begin", "safe-upload-begin"],
+        "importChunk":    ["import-chunk", "safe-import-chunk", "upload-chunk",
+                           "import-part"],
+        "importInspect":  ["import-inspect", "safe-import-inspect", "import-probe",
+                           "upload-inspect"],
+        "importCommit":   ["import-commit", "safe-import-commit", "import-finish",
+                           "upload-commit"],
+        "importAbort":    ["import-abort", "safe-import-abort", "import-cancel",
+                           "upload-abort"],
+        "safeForget":     ["safe-forget", "forget-safe", "registry-forget",
+                           "safe-unregister", "unregister-safe"],
+        "safeDelete":     ["safe-delete", "delete-safe", "safe-destroy",
+                           "destroy-safe", "safe-rm"]
     };
 
     /* The shape of ONE row of a repeating subform, used only when the schema
@@ -425,6 +456,16 @@
             if (extra.retry_after !== undefined) e.retry_after = extra.retry_after;
             if (extra.seconds_remaining !== undefined) e.seconds_remaining = extra.seconds_remaining;
             if (extra.locked_for !== undefined) e.locked_for = extra.locked_for;
+            /* How many attempts a staged import has left, and how long the
+             * staging survives without one. Both are COUNTS the helper owns —
+             * a page that invented either would be telling the operator a
+             * number it made up about somebody else's resource limit. Neither
+             * is a value; a count of failures is exactly the sort of thing I15
+             * permits in an error and a value is exactly what it does not. */
+            ["attempts_remaining", "attempts_left", "remaining_attempts",
+             "expires_in", "idle_seconds"].forEach(function (k) {
+                if (extra[k] !== undefined) e[k] = extra[k];
+            });
         }
         return e;
     }
@@ -821,6 +862,38 @@
         if (needsSession(name)) return "safe";
         return "global";
     }
+    /* Which name a verb actually uses for one of its request fields.
+     *
+     * Same rule as VERB_ALIASES one level down: the page does not DICTATE what
+     * the helper calls a field, it RECOGNISES the name out of an ordered list
+     * of the ones a reasonable helper might pick, by asking the verb's own
+     * `request` list. Everything in the create/import/forget feature goes
+     * through this, so a helper that calls its staging token `staging_id`
+     * instead of `token` works with no edit here.
+     *
+     * It returns null when the verb declares none of them, and every caller
+     * treats null as "do not send this key" rather than inventing one — a page
+     * that guessed a field name would be sending a request the helper never
+     * described, which is the design rule at the top of this file inverted. */
+    function requestFieldName(verbName, candidates, fallback) {
+        var names = argNames(verbName);
+        for (var i = 0; i < candidates.length; i++)
+            if (names.indexOf(candidates[i]) >= 0) return candidates[i];
+        return fallback === undefined ? null : fallback;
+    }
+    /* The mirror of the above for a RESPONSE: the first of these keys the
+     * helper actually sent, or undefined. Used for the staging token, the
+     * chunk size, the remaining-attempts figure and the staging expiry — all
+     * of which this page must READ rather than compute, because every one of
+     * them is a number only the helper knows. */
+    function pickKey(obj, candidates) {
+        if (!obj || typeof obj !== "object") return undefined;
+        for (var i = 0; i < candidates.length; i++)
+            if (obj[candidates[i]] !== undefined && obj[candidates[i]] !== null)
+                return obj[candidates[i]];
+        return undefined;
+    }
+
     /* Numbers the page needs: the helper's `constants` first, then a `ui`
      * block if some other build of it publishes one, then the fallback. */
     function uiNum(key, fallback) {
@@ -3061,10 +3134,29 @@
         if (esc) banner.appendChild(esc);
 
         if (!SAFES.length) {
-            host.appendChild(el("p", "sec-empty",
-                "The registry declares no safes. They are configured in " +
-                "/etc/cockpit-secrets/safes.d/*.json; `secrets-admin health` reports why an " +
-                "entry was dropped."));
+            /* THE EMPTY STATE HAS TO OFFER THE WAY OUT OF ITSELF.
+             *
+             * This is the first thing a new operator sees, and until there was
+             * a way to make a safe from the page it was a dead end with an
+             * instruction to go and hand-write two files as root. The controls
+             * that fix that belong HERE, above the explanation — an empty list
+             * that hides the button for filling it is the worst place to hide
+             * it. */
+            var empty = el("div", "sec-empty");
+            empty.appendChild(el("p", null,
+                "There are no safes yet. Make one, or register a safe file you already have."));
+            var acts = el("div", "sec-tools");
+            var offered = registryActions(acts);
+            if (offered) empty.appendChild(acts);
+            var where = registryDirs();
+            empty.appendChild(el("p", null,
+                "Safes are declared by the registry" +
+                (where.system ? " in " + where.system : "") +
+                "; `secrets-admin health` reports why an entry was dropped." +
+                (offered ? "" :
+                    " This helper publishes no verb for creating or importing one, so a " +
+                    "safe still has to be registered on the host.")));
+            host.appendChild(empty);
             return;
         }
 
@@ -3098,6 +3190,10 @@
         });
 
         var tools = el("div", "sec-tools");
+        /* Making a safe exist comes FIRST in this row, before the diagnostics.
+         * It is the action an operator arrives wanting; health and the audit
+         * log are what they reach for afterwards. */
+        registryActions(tools);
         if (hasVerb("health"))
             tools.appendChild(btn("Backend health", "", function () {
                 runAndShow("health", {}, false, "Backend health");
@@ -3131,6 +3227,21 @@
         /* What the registry already told us in the list row, before any probe:
          * whether a passphrase is still demanded and whether a key is
          * registered. Both are facts about the entry, not about the file. */
+        /* WHICH REGISTRY THIS ENTRY CAME FROM. The helper's own ui_rules ask
+         * for it, and the reason is the trust model: a system entry is
+         * root-owned policy and a user entry is one the caller wrote
+         * themselves, so "who says this file is a safe" is a different answer
+         * for the two and an operator should be able to see which. It is drawn
+         * only when the row says — an older helper that does not report it gets
+         * no badge rather than a guessed one. */
+        if (safe.registry) {
+            var rlabel = safe.registry, ropts =
+                (SCHEMA && SCHEMA.enums && SCHEMA.enums.registry_source) || [];
+            ropts.forEach(function (o) {
+                if (o && String(o.value) === String(safe.registry)) rlabel = o.label || rlabel;
+            });
+            badges.appendChild(badge(String(rlabel), ""));
+        }
         if (safe.password_required === false) badges.appendChild(badge("keyed", "warn"));
         if (safe.needs_keyfile) badges.appendChild(badge("key file", ""));
         if (safe.agent_enabled) badges.appendChild(badge("agent enabled", "warn"));
@@ -3205,6 +3316,15 @@
                   "the helper says while administrative access is off.";
             acts.appendChild(chk);
         }
+        /* Taking a safe off this page, and destroying it. LAST on the card and
+         * in that order, deliberately: Forget is the ordinary one and the
+         * reversible one, Delete is the only irreversible action in this whole
+         * program, and it is not going to sit next to Unlock. Both are behind
+         * "does the helper publish the verb" like everything else here. */
+        if (verbFor("safeForget"))
+            acts.appendChild(btn("Forget…", "", function () { forgetDialog(safe); }));
+        if (verbFor("safeDelete"))
+            acts.appendChild(btn("Delete…", "danger", function () { deleteDialog(safe); }));
         card.appendChild(acts);
         /* The helper's own sentence, whenever it sent one. For a safe this
          * caller genuinely cannot reach it is the refusal; for an admin-class
@@ -5058,6 +5178,20 @@
      *               helper attached. Both must be ticked; they are AND-ed,
      *               never replaced, so a page-side warning cannot swallow the
      *               helper's own
+     *   typeToConfirm {expect, label, help} — a text box whose contents must
+     *               equal `expect` before Run enables. AND-ed with every tick
+     *               box, never instead of one. It exists for exactly one class
+     *               of action: the ones where a mis-click destroys a file
+     *               (safe-delete). A tick box is one gesture and a wrong tick
+     *               is one gesture; typing an id is a gesture that cannot be
+     *               made by accident against the WRONG safe, which is the
+     *               failure this guards
+     *   adminFrom   a callback (req) -> bool deciding the escalation from the
+     *               REQUEST, for a verb whose class is not carried by a `safe`
+     *               field at all. `safe-create` is the case: its access class
+     *               is a value in its own request, and admin is the default
+     *               when it is absent (I1), so the escalation has to be read
+     *               from what was actually filled in
      *   runLabel    the primary button's text
      *   onResult    render the answer instead of the generic result view
      */
@@ -5102,7 +5236,13 @@
              * words, and a caller can demand one of its own. Run stays disabled
              * until EVERY one of them is ticked — the sentences are not
              * decoration, and a caller's warning never replaces the helper's. */
-            var confirmBoxes = [];
+            /* Every gate is a function answering "may Run be pressed yet".
+             * They are AND-ed and re-evaluated together, so adding a kind of
+             * gate cannot accidentally replace an existing one. */
+            var gates = [];
+            function regate() {
+                go.disabled = gates.some(function (g) { return !g(); });
+            }
             [spec.confirm, opts.confirm].forEach(function (sentence) {
                 if (!sentence) return;
                 var cid = "sec-confirm" + (++CTRL_SEQ);
@@ -5116,17 +5256,55 @@
                 var cw = el("div", "sec-alert warn");
                 cw.appendChild(cl);
                 box.appendChild(cw);
-                confirmBoxes.push(cb);
-                cb.addEventListener("change", function () {
-                    go.disabled = confirmBoxes.some(function (x) { return !x.checked; });
-                });
+                gates.push(function () { return cb.checked; });
+                cb.addEventListener("change", regate);
             });
+
+            /* Type-the-name gate. The comparison is EXACT — no trimming, no
+             * case folding — because the thing being typed is a registry id,
+             * the ids are lower-case by construction, and a gate that accepts
+             * “Lab-DC ” for “lab-dc” is a gate that accepts the operator not
+             * having read what they typed. */
+            if (opts.typeToConfirm && opts.typeToConfirm.expect) {
+                var want = String(opts.typeToConfirm.expect);
+                var tid = "sec-type" + (++CTRL_SEQ);
+                var tw = el("div", "sec-field");
+                var tl = el("label", null,
+                    opts.typeToConfirm.label || ("Type “" + want + "” to confirm"));
+                tl.setAttribute("for", tid);
+                if (opts.typeToConfirm.help)
+                    tl.appendChild(el("span", "hint", String(opts.typeToConfirm.help)));
+                tw.appendChild(tl);
+                var ti = el("input");
+                ti.type = "text";
+                ti.id = tid;
+                /* Same four attributes as a passphrase box, for a different
+                 * reason: an autofilled or autocorrected id would sail through
+                 * a gate whose entire purpose is deliberate typing. No `name`
+                 * anywhere on this page (I11). */
+                ti.setAttribute("autocomplete", "off");
+                ti.setAttribute("spellcheck", "false");
+                ti.setAttribute("autocapitalize", "none");
+                ti.setAttribute("autocorrect", "off");
+                tw.appendChild(ti);
+                var tmsg = el("div", "sec-countdown");
+                tmsg.setAttribute("aria-live", "polite");
+                tw.appendChild(tmsg);
+                box.appendChild(tw);
+                gates.push(function () { return ti.value === want; });
+                ti.addEventListener("input", function () {
+                    tmsg.textContent = ti.value === want
+                        ? "That is the id. The action below is now available."
+                        : (ti.value ? "That is not the id of the safe named above." : "");
+                    regate();
+                });
+            }
 
             var errHost = el("div");
             box.appendChild(errHost);
 
             var go = btn(opts.runLabel || "Run", spec.danger ? "danger" : "primary", submit);
-            if (confirmBoxes.length) go.disabled = true;
+            if (gates.length) go.disabled = true;
             actionRow(box, [go, btn("Cancel", "", function () { m.close(); })]);
 
             function submit() {
@@ -5170,11 +5348,20 @@
                  * safeForRequest(). opts.safe still wins when the caller named
                  * one, because export and restore are reached from the list
                  * with nothing open and know exactly which safe they mean. */
+                /* `adminFrom` is for a verb whose access class lives in the
+                 * request rather than in a registry row this page can look up
+                 * — creating a safe that does not exist yet. It is read at
+                 * SUBMIT time, from the request actually being sent, for the
+                 * same reason safeForRequest() is: a decision taken when the
+                 * dialog opened was taken before there was anything to decide
+                 * about. */
+                var admin = opts.adminFrom
+                    ? !!opts.adminFrom(req)
+                    : adminForVerb(name, safeForRequest(req, presets, opts));
                 var p = needsSession(name)
                     ? (SESSION ? SESSION.call(name, req)
                                : Promise.reject(mkErr("access-denied", "The safe is locked.")))
-                    : callOnce(name, req,
-                               adminForVerb(name, safeForRequest(req, presets, opts)), argv);
+                    : callOnce(name, req, admin, argv);
 
                 p.then(function (res) {
                     /* Drop every reference to whatever we just sent. */
@@ -6339,6 +6526,1482 @@
     }
 
     /* ================================================================== *
+     * MAKING A SAFE EXIST — create, import, forget, delete
+     *
+     * THIS IS THE MOST DANGEROUS SURFACE IN THE PAGE, and the reason is one
+     * sentence: the registry is this program's trust root. It is what says
+     * which files are safes, where they live, and what access class each one
+     * has (I1), and every other control here is downstream of it. These flows
+     * are the first ones that let a BROWSER REQUEST write into it.
+     *
+     * What the page is responsible for, and what it is deliberately not:
+     *
+     *   THE HELPER MINTS THE PATH. The operator supplies an ID. Nothing in
+     *   this whole section ever sends a path, a filename, a directory or a
+     *   component of one — there is no control for one, no preset carrying
+     *   one, and no response key read back as one except to DISPLAY where the
+     *   helper decided to put the file (I4, C1). Search this section for
+     *   `path`: every occurrence is a read of a helper's answer for display.
+     *
+     *   THE HELPER VALIDATES THE ID. The allow-list is published as the id
+     *   field's own `pattern`, so makeControl's generic validator enforces it
+     *   with no code here, and the helper enforces it again — which is the
+     *   one that counts. A page-side check is feedback at the moment of
+     *   typing, never a gate (I3).
+     *
+     *   ADMIN IS THE DEFAULT CLASS. The access control's default comes from
+     *   the schema, and the schema's default is `admin` (I1). This page reads
+     *   the chosen value to decide which of the two spawn shapes to use — and
+     *   an ABSENT value is treated as admin, never as user, everywhere it is
+     *   read here.
+     *
+     * ------------------------------------------------------------------
+     * WHY THE ENCRYPTED FILE GOES FIRST AND THE PASSPHRASE SECOND (C5)
+     *
+     * The upload wizard collects the file, stages it, reports what its header
+     * claims, and only THEN asks for the passphrase. That ordering is a
+     * requirement, and it is also the better design for two reasons that are
+     * worth writing down where the code lives:
+     *
+     *   1. A 128 MiB upload takes visible time. Collecting the passphrase in
+     *      the file-picker step would mean holding it in browser memory for
+     *      the whole transfer — which is precisely the window I11 and I14
+     *      exist to shrink. Prompting after the bytes are staged means the
+     *      passphrase exists for one request, exactly as it does for `unlock`.
+     *
+     *   2. The header of a KDBX or PWS3 file is NOT SECRET. Format, version,
+     *      cipher, KDF and its parameters are readable from the bytes by
+     *      anyone holding the file — and the person uploading it holds the
+     *      file. So the helper can report all of that with no credential at
+     *      all, and the operator can confirm they uploaded the file they meant
+     *      to BEFORE they type anything. The page labels that summary as what
+     *      it is: read from the header, and not authenticated.
+     * ================================================================== */
+
+    /* The one piece of import state that outlives a function: enough to abort
+     * a staging the page walked away from, and nothing else. NO file bytes, NO
+     * passphrase, NO key-file bytes — the token is a capability the helper
+     * minted, in memory, exactly like a session handle, and it is dropped the
+     * moment the import commits, aborts or fails. */
+    var IMPORT = null;              /* { token, admin, verb } or null */
+
+    /* Read a Blob as an ArrayBuffer. FileReader rather than Blob.arrayBuffer()
+     * so this works on the same browsers the rest of the page does; the bytes
+     * are the operator's own encrypted file, and they are dropped as soon as
+     * the chunk they belong to is on its way. */
+    function readBlob(blob) {
+        return new Promise(function (resolve, reject) {
+            var r = new FileReader();
+            r.onload = function () { resolve(r.result); };
+            r.onerror = function () {
+                reject(mkErr("internal", "The browser could not read that file."));
+            };
+            r.readAsArrayBuffer(blob);
+        });
+    }
+
+    /* SHA-256 of the whole file, computed IN THE PAGE and sent with
+     * import-begin so the helper can prove the bytes it reassembled are the
+     * bytes that were picked.
+     *
+     * `crypto.subtle` is a browser primitive, not WebAssembly and not an
+     * eval-family call, so it does not touch I9 — this page still adds no CSP
+     * relaxation of any kind. It is only available in a secure context;
+     * Cockpit is HTTPS, and where it is genuinely absent the import control is
+     * not offered at all rather than offered and then failing (see
+     * importSupported). */
+    function sha256Hex(buf) {
+        return window.crypto.subtle.digest("SHA-256", buf).then(function (d) {
+            var u = new Uint8Array(d), out = "", i;
+            for (i = 0; i < u.length; i++)
+                out += (u[i] < 16 ? "0" : "") + u[i].toString(16);
+            return out;
+        });
+    }
+
+    /* The four verbs the wizard needs, all present, plus the browser primitive
+     * it cannot do without. Anything missing means no Upload control — the
+     * page does not offer half a wizard. */
+    function importVerbs() {
+        var v = {
+            begin: verbFor("importBegin"),
+            chunk: verbFor("importChunk"),
+            inspect: verbFor("importInspect"),
+            commit: verbFor("importCommit"),
+            abort: verbFor("importAbort")
+        };
+        return v;
+    }
+    function importSupported() {
+        var v = importVerbs();
+        if (!v.begin || !v.chunk || !v.inspect || !v.commit) return false;
+        return !!(window.crypto && window.crypto.subtle && window.crypto.subtle.digest);
+    }
+
+    /* The largest safe the helper will accept, from its own constants. Used to
+     * refuse a file BEFORE a single byte is uploaded, which is the point of
+     * declaring the total size in import-begin. */
+    function maxSafeBytes() {
+        var c = (SCHEMA && SCHEMA.constants) || {};
+        var n = Number(c.max_safe_bytes || c.max_safe_size || 0);
+        return isFinite(n) && n > 0 ? n : 0;
+    }
+
+    /* How many raw bytes go in one chunk.
+     *
+     * The helper's own answer wins: import-begin may name it. Otherwise it is
+     * derived from max_request_bytes the same way the attachment control
+     * derives its cap — the chunk travels base64 inside one JSON request, and
+     * base64 costs a third, so the raw payload that fits is three quarters of
+     * what is left after the rest of the object. Neither number is this
+     * page's; both are the helper's. */
+    function importChunkBytes(beginRes) {
+        var said = Number(pickKey(beginRes,
+            ["chunk_bytes", "max_chunk_bytes", "chunk_size", "max_chunk"]));
+        if (isFinite(said) && said > 0) return Math.floor(said);
+        var c = (SCHEMA && SCHEMA.constants) || {};
+        var konst = Number(c.import_chunk_bytes || 0);
+        if (isFinite(konst) && konst > 0) return Math.floor(konst);
+        var reqCap = Number(c.max_request_bytes || 0);
+        if (reqCap > 65536) return Math.floor((reqCap - 8192) * 3 / 4);
+        return 196608;                      /* 192 KiB — a last resort */
+    }
+
+    /* ------------------------------------------------------------------ *
+     * Which registry an entry lands in, and what that means
+     *
+     * C4's per-user registry is the ONE trust-model change in this feature,
+     * and the operator has to be able to see which of the two they are about
+     * to write to before they write to it. The paths are printed only when the
+     * helper published them in its constants: a page that hard-coded
+     * /etc/cockpit-secrets/safes.d would keep naming it after the helper moved,
+     * and a confirm that names the wrong place is worse than one that names no
+     * place (the same rule exportTarget() follows for I21).
+     * ------------------------------------------------------------------ */
+    function registryDirs() {
+        var c = (SCHEMA && SCHEMA.constants) || {};
+        return {
+            system: c.registry_dir || c.safes_dir || c.system_registry_dir || null,
+            user: c.user_registry_dir || c.registry_dir_user ||
+                  c.user_safes_dir || c.per_user_registry_dir || null
+        };
+    }
+    /* An absent access value is ADMIN. Stated as a function so every caller in
+     * this section resolves it the same way and none of them can drift into
+     * treating "not set" as the permissive class (I1). */
+    function accessIsAdmin(value) {
+        return !(value === "user");
+    }
+    function registryNote(access) {
+        var admin = accessIsAdmin(access);
+        var dirs = registryDirs();
+        var box = el("div", "sec-alert " + (admin ? "warn" : "info"));
+        var p = el("p");
+        p.appendChild(el("strong", null, admin
+            ? "This will be an administrator safe."
+            : "This will be your own safe."));
+        p.appendChild(document.createTextNode(admin
+            ? " Root owns the file and the registry entry, every administrator on this host " +
+              "can open it with its passphrase, and creating it needs Cockpit's administrative " +
+              "access to be on in this session."
+            : " The file and its registry entry live under your own account, the helper runs " +
+              "as you with no escalation at all, and no administrator has to be involved."));
+        box.appendChild(p);
+        var dir = admin ? dirs.system : dirs.user;
+        if (dir) {
+            box.appendChild(el("p", null, admin
+                ? "Its registry entry is written by root into:"
+                : "Its registry entry is written into your own registry at:"));
+            box.appendChild(el("code", "sec-path", String(dir)));
+        }
+        box.appendChild(el("p", null,
+            "The file's name and location are chosen by the helper from the id below. " +
+            "This page never sends a path (I4)."));
+        if (admin && !adminAllowed())
+            box.appendChild(el("p", null,
+                "Administrative access is OFF in this Cockpit session, so this will be " +
+                "refused straight away. Turn it on with the “Limited access” control in the " +
+                "Cockpit header first."));
+        return box;
+    }
+
+    /* WHICH REGISTRY IT LANDED IN, from the helper's own answer.
+     *
+     * `registry` in a response is a registry SOURCE — the helper publishes the
+     * closed set as `enums.registry_source`, with a label and a help sentence
+     * for each — and NOT a path. Rendering "system" inside a <code> that says
+     * "the registry entry is here" would present a word as a filename, which is
+     * the sort of small lie that gets copied into a ticket. So the enum is
+     * asked first, and only a value the enum does not know is treated as a path
+     * the helper chose to name.
+     *
+     * The help text is the enum's own, verbatim: for the user registry it is
+     * the sentence that states C4's safety argument, and it is worth more on
+     * screen than anything this file could write about it. */
+    function registrySourceNode(value) {
+        var opts = (SCHEMA && SCHEMA.enums && SCHEMA.enums.registry_source) || [];
+        var i;
+        for (i = 0; i < opts.length; i++) {
+            var o = opts[i];
+            if (o && String(o.value) === String(value)) {
+                var box = el("div", "sec-alert info");
+                box.appendChild(el("p", null, "Registered in: " + String(o.label || o.value)));
+                if (o.help) box.appendChild(el("p", null, String(o.help)));
+                return box;
+            }
+        }
+        /* Not one of the helper's registry sources, so it is whatever the
+         * helper called it — shown as a path, unaltered. */
+        var code = el("code", "sec-path", String(value));
+        return code;
+    }
+
+    /* ------------------------------------------------------------------ *
+     * A key file the helper generated: shown ONCE, downloaded ONCE
+     *
+     * A generated key file is half of a composite key and there is no copy of
+     * it anywhere else — not on the host, not in the safe, not in this page
+     * after the dialog closes. Losing it loses the safe, permanently and with
+     * no recovery, which docs/THREAT-MODEL.md lists as explicitly out of scope
+     * for this program. So the warning is a wall of red, not a hint, and the
+     * bytes are dropped the moment the dialog goes away.
+     * ------------------------------------------------------------------ */
+    function keyfileHandoff(box, b64, name) {
+        var bytes = null;
+        try { bytes = b64ToBytes(b64); }
+        catch (e) {
+            box.appendChild(el("div", "sec-alert err",
+                "The helper reported a generated key file, but its reply is not valid " +
+                "base64, so there is nothing to hand you. Do not treat this safe as " +
+                "usable — ask the helper's audit log what happened."));
+            return;
+        }
+        var w = el("div", "sec-danger-block");
+        w.appendChild(function () {
+            var p = el("p");
+            p.appendChild(el("strong", null, "This is the only copy of this key file."));
+            return p;
+        }());
+        w.appendChild(el("p", null,
+            "It is not stored on this host, it is not inside the safe, and it is gone from " +
+            "this browser the moment you close this dialog. Download it now and put it " +
+            "somewhere you will still have it in a year."));
+        w.appendChild(el("p", null,
+            "Without it the safe does not open. There is no recovery, no reset and no " +
+            "escrow — losing the key material means losing the safe, by design."));
+        var line = el("div", "sec-countdown");
+        line.setAttribute("aria-live", "polite");
+        var dl = btn("Download the key file", "primary", function () {
+            if (!bytes) return;
+            /* Straight to the browser through a Blob, exactly like an
+             * attachment download: nothing is written on the server on the way
+             * and nothing is put in a storage area (I11, I21).
+             * application/octet-stream on purpose — the file's own idea of its
+             * type must not decide how this origin renders it. */
+            var blob = new Blob([bytes], { type: "application/octet-stream" });
+            var url = URL.createObjectURL(blob);
+            var a = el("a");
+            a.href = url;
+            a.download = String(name || "keyfile.keyx");
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            window.setTimeout(function () { URL.revokeObjectURL(url); }, 10000);
+            line.textContent = "Saved as " + a.download + ". Check that you actually have " +
+                "it before you close this dialog.";
+            announce("The key file was downloaded. It is the only copy.");
+        });
+        w.appendChild(dl);
+        w.appendChild(line);
+        box.appendChild(w);
+        /* Dropping the reference when the dialog closes. A JavaScript typed
+         * array CAN be zeroed, unlike a string, so this one actually scrubs
+         * rather than merely releasing — the honest caveat in this file's
+         * header is about strings, and it does not apply here. */
+        return function () {
+            if (bytes) { bytes.fill(0); bytes = null; }
+        };
+    }
+
+    /* ------------------------------------------------------------------ *
+     * 1 · CREATE A NEW SAFE
+     * ------------------------------------------------------------------ */
+    function newSafeDialog() {
+        var verb = verbFor("safeCreate");
+        if (!verb) return;
+        /* Which of this verb's request fields carry the decisions the page has
+         * to react to. Every one is resolved from the verb's own descriptor;
+         * a null simply means that control is not drawn and nothing keys off
+         * it, never that the page invents one. */
+        var accessField = requestFieldName(verb, ["access", "class", "access_class"]);
+        var keyfileField = requestFieldName(verb,
+            ["keyfile_b64", "keyfile", "key_file_b64", "keyfile_bytes"]);
+        var genField = requestFieldName(verb,
+            ["generate_keyfile", "new_keyfile", "make_keyfile", "keyfile_generate"]);
+        var pwField = secretArgName(verb, "password");
+
+        verbDialog(verb, {}, null, null, {
+            title: "Create a new safe",
+            runLabel: "Create the safe",
+            /* THE ESCALATION IS READ FROM THE REQUEST, at submit time. A new
+             * safe has no registry row to look the class up in — the class is
+             * a value in the form — and an absent value is admin (I1). */
+            adminFrom: function (req) {
+                return accessIsAdmin(accessField ? req[accessField] : undefined);
+            },
+            beforeForm: function (box) {
+                box.appendChild(el("p", "sec-modal-intro",
+                    "The helper makes the file, encrypts it with the passphrase you choose " +
+                    "here, and writes its registry entry. Nothing exists until all three " +
+                    "have happened."));
+            },
+            afterForm: function (form, box) {
+                /* Which registry this lands in, updated live as the access
+                 * control changes. It is above the action row rather than
+                 * inside the form, because it is a consequence of the form
+                 * rather than another question. */
+                var host = el("div");
+                box.appendChild(host);
+                /* The note is repainted whenever the access control changes, so
+                 * it gets a container of its OWN. Clearing `host` instead would
+                 * take the advisory below it with it — which it did, silently,
+                 * the first time the operator switched class. */
+                var noteHost = el("div");
+                var ac = accessField ? form.byName[accessField] : null;
+                /* And it goes DIRECTLY UNDER the control that decides it. This
+                 * form is long — id, label, format, class, passphrase, key
+                 * file, KDF costs — so a consequence parked at the bottom is a
+                 * consequence half a screen away from its cause, and an
+                 * operator switching to the user class would watch a paragraph
+                 * change somewhere they are not looking. */
+                if (ac && ac.node && ac.node.parentNode)
+                    ac.node.parentNode.insertBefore(noteHost, ac.node.nextSibling);
+                else host.appendChild(noteHost);
+                function paint() {
+                    clear(noteHost);
+                    noteHost.appendChild(registryNote(ac ? ac.get() : undefined));
+                }
+                paint();
+                if (ac) ac.onChange(paint);
+
+                /* An empty passphrase with no key file is refused by the
+                 * helper (C7). This is the same class of advisory as the
+                 * save-as name check: CLIENT-SIDE FEEDBACK so the operator
+                 * finds out while typing rather than at the moment of refusal.
+                 * The helper is the gate; if the two ever disagree, the helper
+                 * is right and this hint is the bug.
+                 *
+                 * It does NOT block, and the strength meter beside it does not
+                 * block either. Telling an operator their passphrase is weak is
+                 * this program's job; refusing the passphrase they chose is not
+                 * (C7). */
+                var pw = pwField ? form.byName[pwField] : null;
+                var kf = keyfileField ? form.byName[keyfileField] : null;
+                var gen = genField ? form.byName[genField] : null;
+                if (!pw) return;
+                var warn = el("div", "sec-alert warn");
+                warn.hidden = true;
+                warn.textContent =
+                    "With no passphrase and no key file there is nothing to encrypt this " +
+                    "safe with, and the helper refuses to create it. Type a passphrase, " +
+                    "supply a key file, or ask for one to be generated.";
+                host.appendChild(warn);
+                function recheck() {
+                    var hasPw = !!pw.get();
+                    var hasKf = !!(kf && kf.get()) || !!(gen && gen.get());
+                    warn.hidden = hasPw || hasKf;
+                }
+                pw.onChange(recheck);
+                if (kf) kf.onChange(recheck);
+                if (gen) gen.onChange(recheck);
+                recheck();
+            },
+            onResult: function (res) { newSafeResultDialog(res); }
+        });
+    }
+
+    /* The keys a registration result carries that this page renders itself,
+     * so the leftovers can go into the generic list without being printed
+     * twice — and so the KEY-FILE BYTES can never fall through into it. A
+     * generated key file rendered as a row of a key/value table would be the
+     * one credential on this page shown with no warning attached to it. */
+    var REG_RESULT_HANDLED = {
+        "ok": 1, "registry": 1, "safe": 1, "path": 1, "file": 1,
+        "registry_path": 1, "registry_file": 1,
+        "keyfile_b64": 1, "key_file_b64": 1, "keyfile_bytes": 1,
+        "keyfile_name": 1, "keyfile_filename": 1, "key_file_name": 1,
+        "keyfile_warning": 1, "strength": 1, "warnings": 1
+    };
+
+    /* Where the safe landed and what it is now, drawn the same way for a
+     * created safe and an adopted one. `safe` is the registry row exactly as
+     * `list` reports it, so the id comes out of it rather than out of a
+     * separate key this page hoped would be there. */
+    function registryResultBody(box, res) {
+        var row = res && res.safe;
+        var id = (row && typeof row === "object") ? row.id
+               : pickKey(res, ["id", "safe", "safe_id"]);
+        var reg = pickKey(res, ["registry", "registry_path", "registry_file"]);
+        if (reg) box.appendChild(registrySourceNode(reg));
+        /* A path only if the helper volunteered one. It was never sent by this
+         * page and there is no control anywhere here that could have set one
+         * (I4); it is displayed because an operator is entitled to know where
+         * their safe is. */
+        var path = pickKey(res, ["path", "file"]) ||
+                   (row && typeof row === "object" ? row.path : undefined);
+        if (path) {
+            box.appendChild(el("p", null, "The helper minted this path for the file:"));
+            box.appendChild(el("code", "sec-path", String(path)));
+        }
+        (Array.isArray(res && res.warnings) ? res.warnings : []).forEach(function (w) {
+            box.appendChild(el("div", "sec-alert warn", String(w)));
+        });
+        var rest = {};
+        Object.keys(res || {}).forEach(function (k) {
+            if (REG_RESULT_HANDLED[k]) return;
+            rest[k] = res[k];
+        });
+        if (rest.bytes !== undefined && rest.bytes !== null) {
+            rest["file size"] = fmtBytes(rest.bytes);
+            delete rest.bytes;
+        }
+        if (row && typeof row === "object") {
+            if (row.format !== undefined) rest.format = row.format;
+            if (row.access !== undefined) rest.access = row.access;
+        }
+        if (Object.keys(rest).length) box.appendChild(kvList(rest));
+        return id;
+    }
+
+    /* The strength verdict on a passphrase the operator has just CHOSEN.
+     * Reported, never enforced (C7): telling somebody their passphrase is weak
+     * is this program's job, refusing the one they picked is not. The numbers
+     * and the named weaknesses are the helper's; nothing is computed here. */
+    function strengthVerdictNode(st) {
+        if (!st || typeof st !== "object") return null;
+        var bits = st.effective_bits !== undefined ? st.effective_bits : st.entropy_bits;
+        var box = el("div", "sec-alert " +
+            (String(st.category || "").indexOf("weak") >= 0 ? "warn" : "info"));
+        box.appendChild(el("p", null,
+            "The passphrase you chose: " +
+            (st.category ? String(st.category) : "") +
+            (bits !== undefined ? " — about " + bits + " effective bits" : "") + "."));
+        var weak = Array.isArray(st.weaknesses) ? st.weaknesses : [];
+        if (weak.length) {
+            var ul = el("ul", "sec-weak");
+            weak.forEach(function (w) {
+                ul.appendChild(el("li", null, String((w && (w.label || w.id)) || w)));
+            });
+            box.appendChild(ul);
+        }
+        box.appendChild(el("p", null,
+            "The safe was created with it either way — this is a report, not a refusal. " +
+            "Changing it later means creating another safe and moving the entries across."));
+        return box;
+    }
+
+    function newSafeResultDialog(res) {
+        var kb = pickKey(res, ["keyfile_b64", "key_file_b64", "keyfile_bytes"]);
+        var kn = pickKey(res, ["keyfile_name", "keyfile_filename", "key_file_name"]);
+        var kw = pickKey(res, ["keyfile_warning"]);
+        var drop = null;
+        modal("The safe was created", function (box, m) {
+            var lead = el("p");
+            box.appendChild(lead);
+            var id = registryResultBody(box, res);
+            lead.textContent = "The helper created the file, encrypted it, and registered it" +
+                (id ? " as “" + String(id) + "”" : "") + ".";
+            var sv = strengthVerdictNode(res && res.strength);
+            if (sv) box.appendChild(sv);
+            if (kb) {
+                /* The helper's own sentence about the key file, first and
+                 * verbatim — it is written by the code that knows what it
+                 * generated — then the handover. */
+                if (kw) box.appendChild(el("div", "sec-alert warn", String(kw)));
+                drop = keyfileHandoff(box, kb, kn);
+            }
+            box.appendChild(el("p", "sec-subtle",
+                "The passphrase is not held anywhere. Opening this safe asks for it, the " +
+                "same as every other safe on this page."));
+            actionRow(box, [btn("Close", "primary", function () { m.close(); })]);
+        }, { onClose: function () {
+            if (drop) drop();
+            refreshAll();
+        } });
+        announce("The safe was created.");
+    }
+
+    /* ------------------------------------------------------------------ *
+     * 2 · UPLOAD AN EXISTING SAFE — file first, passphrase afterwards (C5)
+     * ------------------------------------------------------------------ */
+
+    /* Abort whatever staging this page is holding, best effort, and forget it.
+     * Called on cancel, on every failure path, and on leaving the page — an
+     * orphaned staging is the helper's to sweep on an idle timer, but leaving
+     * one behind when we know it is dead is just littering. */
+    function importAbortNow(why) {
+        var st = IMPORT;
+        IMPORT = null;
+        if (!st || !st.token) return;
+        var verb = verbFor("importAbort");
+        /* A helper with no abort verb sweeps its own staging on the idle timer
+         * instead. Nothing is retried and nothing is reported: this is
+         * housekeeping, and there is nothing an operator would do with the
+         * news that it could not be done early. */
+        if (!verb) return;
+        var field = requestFieldName(verb,
+            ["staging", "token", "staging_id", "staging_token", "import_id", "upload_id"],
+            "staging");
+        var req = {};
+        req[field] = st.token;
+        /* Deliberately unawaited and deliberately silent: this is cleanup, and
+         * a failure to clean up must never surface as an error on top of
+         * whatever the operator was actually doing. */
+        callOnce(verb, req, st.admin).catch(function () { /* the sweep gets it */ });
+        if (why) announce("The staged upload was discarded: " + why + ".");
+    }
+
+    function importDialog() {
+        var V = importVerbs();
+        if (!importSupported()) return;
+
+        /* The field names each verb actually uses, asked once.
+         *
+         * The candidate lists are deliberately SPECIFIC. An early draft had
+         * `id` and `import` among the staging-token spellings, which would
+         * have been a real hazard rather than untidiness: `id` is the field
+         * carrying the SAFE'S OWN ID on import-begin, so a helper that spelled
+         * both the same way would have had this page send a registry id where
+         * a staging token belongs, or the reverse. Nothing generic enough to
+         * mean two different things is in any of these lists. */
+        var TOKEN_NAMES = ["staging", "token", "staging_id", "staging_token",
+                           "import_id", "upload_id"];
+        var tokenIn = {
+            chunk: requestFieldName(V.chunk, TOKEN_NAMES, "staging"),
+            inspect: requestFieldName(V.inspect, TOKEN_NAMES, "staging"),
+            commit: requestFieldName(V.commit, TOKEN_NAMES, "staging")
+        };
+        var dataField = requestFieldName(V.chunk,
+            ["chunk_b64", "data_b64", "bytes_b64", "chunk_data"], "chunk_b64");
+        var offField = requestFieldName(V.chunk,
+            ["chunk_offset", "offset", "byte_offset"]);
+        var seqField = requestFieldName(V.chunk,
+            ["seq", "sequence", "chunk_index", "chunk_seq"]);
+        var sizeField = requestFieldName(V.begin,
+            ["total_bytes", "size", "bytes", "total", "length"]);
+        var hashField = requestFieldName(V.begin, ["sha256", "hash", "digest", "checksum"]);
+        var accessField = requestFieldName(V.begin, ["access", "class", "access_class"]);
+
+        /* The wizard's whole state. Function-scoped, dropped when the dialog
+         * closes, and NOT in a global, a data attribute or any storage area
+         * (I11). `file` is a browser handle to a file on the operator's own
+         * disk, not its contents: chunks are sliced off it one at a time and
+         * each slice is released as soon as it is on the wire. */
+        var W = {
+            file: null, token: null, admin: true, access: undefined,
+            total: 0, chunkBytes: 0, cancelled: false,
+            inspect: null, expiresAt: 0, expiryTimer: null, attempts: null
+        };
+
+        modal("Add an existing safe", function (box, m) {
+            var steps = el("ol", "sec-steps");
+            var STEP_LABELS = ["Choose the file", "Upload", "Check the header",
+                               "Unlock it once"];
+            var stepNodes = STEP_LABELS.map(function (t) {
+                var li = el("li", null, t);
+                steps.appendChild(li);
+                return li;
+            });
+            box.appendChild(steps);
+            function markStep(n) {
+                stepNodes.forEach(function (li, i) {
+                    li.className = i < n ? "done" : (i === n ? "now" : "");
+                    if (i === n) li.setAttribute("aria-current", "step");
+                    else li.removeAttribute("aria-current");
+                });
+            }
+
+            var host = el("div");
+            box.appendChild(host);
+            var errHost = el("div");
+            box.appendChild(errHost);
+            var actions = el("div", "sec-form-actions");
+            box.appendChild(actions);
+
+            /* Enter submits the step that is on screen, without a <form> to be
+             * submitted (I11). ONE listener for the whole wizard, re-pointed by
+             * each step: attaching a fresh one per step would give the operator
+             * two submits from one keypress the second time round a loop. */
+            var enterSubmit = null;
+            box.addEventListener("keydown", function (ev) {
+                if (ev.key !== "Enter" || !enterSubmit) return;
+                var t = ev.target;
+                if (!t || t.tagName !== "INPUT") return;
+                if (t.type === "button" || t.type === "checkbox" || t.type === "file") return;
+                ev.preventDefault();
+                enterSubmit();
+            });
+
+            function setActions(list) {
+                clear(actions);
+                list.forEach(function (b) { if (b) actions.appendChild(b); });
+            }
+            /* FOCUS FOLLOWS THE STEP, and it is not cosmetic.
+             *
+             * Each step replaces the panel AND the action row, so the button
+             * the operator just pressed is detached — which drops focus to the
+             * document, outside the dialog. A keyboard user is then stranded
+             * (nothing is focused to Tab from) and, worse, Escape stops
+             * closing the dialog, because the modal's key handler is bound to
+             * the backdrop and a keypress on <body> never reaches it. An
+             * upload wizard whose Escape does nothing is one that orphans a
+             * staging on this host. */
+            function focusStep() {
+                var n = host.querySelector(
+                    "input:not([type=hidden]), select, textarea, button, a[href]") ||
+                    actions.querySelector("button");
+                if (n && n.focus) { try { n.focus(); } catch (e) { /* detached */ } }
+            }
+            function fail(e) {
+                clear(errHost);
+                errHost.appendChild(errNode(e));
+            }
+            function cancelBtn(label) {
+                return btn(label || "Cancel", "", function () { m.close(); });
+            }
+
+            /* ---- step 1: the file, the id, the label, the class ---------
+             * NO CREDENTIAL. Not on this step, not on the next two. The
+             * passphrase box does not exist yet and this is the requirement,
+             * not a preference (C5). */
+            function step1() {
+                markStep(0);
+                clear(host); clear(errHost);
+                W.file = null;
+
+                host.appendChild(el("p", "sec-modal-intro",
+                    "Pick the encrypted safe file. It uploads first; the passphrase is asked " +
+                    "for afterwards, once you have seen what the file says it is."));
+
+                /* The file picker is drawn here rather than by the generic
+                 * file-bytes control on purpose, and the reason is memory: that
+                 * control reads the WHOLE file into one base64 string, which is
+                 * right for a 700 KiB attachment and wrong for a 128 MiB safe.
+                 * This one keeps the browser's File handle and slices it. */
+                var pickWrap = el("div", "sec-field");
+                var pickId = "sec-import-file";
+                var pickLabel = el("label", null, "The safe file");
+                pickLabel.setAttribute("for", pickId);
+                pickLabel.appendChild(el("span", "hint",
+                    "A KeePass (.kdbx) or Password Safe v3 (.psafe3) file. It is read from " +
+                    "your disk in pieces and uploaded encrypted, exactly as it is on disk — " +
+                    "nothing in this browser decrypts it."));
+                pickWrap.appendChild(pickLabel);
+                var pick = el("input");
+                pick.type = "file";
+                pick.id = pickId;
+                pickWrap.appendChild(pick);
+                var pickNote = el("div", "hint");
+                pickNote.setAttribute("aria-live", "polite");
+                pickWrap.appendChild(pickNote);
+                host.appendChild(pickWrap);
+
+                var cap = maxSafeBytes();
+                pick.addEventListener("change", function () {
+                    W.file = null;
+                    pickNote.textContent = "";
+                    var f = pick.files && pick.files[0];
+                    if (!f) return;
+                    /* The cap is the HELPER'S number and it is enforced before
+                     * a single byte moves — that is the entire point of
+                     * declaring the total size in import-begin (C5 step 1).
+                     * The helper enforces it again, incrementally, as chunks
+                     * arrive; this is the courtesy of not making somebody watch
+                     * a 200 MiB upload fail at the end. */
+                    if (cap && f.size > cap) {
+                        pickNote.textContent = "That file is " + fmtBytes(f.size) +
+                            " and the helper accepts at most " + fmtBytes(cap) +
+                            ". It has not been uploaded.";
+                        pick.value = "";
+                        return;
+                    }
+                    W.file = f;
+                    W.total = f.size;
+                    pickNote.textContent = f.name + " — " + fmtBytes(f.size) +
+                        ". Its SHA-256 is computed here and sent with the first request so " +
+                        "the helper can prove it reassembled the same bytes.";
+                });
+
+                /* Everything else on this step is the helper's own form. */
+                var specs = verbArgs(V.begin).filter(function (a) {
+                    var n = specName(a);
+                    /* The size and the digest are computed by this page from
+                     * the file itself, so they are not questions to ask. */
+                    return n && n !== sizeField && n !== hashField && !isSecretSpec(a);
+                });
+                var form = buildForm(specs);
+                host.appendChild(form.node);
+
+                var regHost = el("div");
+                var ac = accessField ? form.byName[accessField] : null;
+                /* Under the access control, for the reason given in
+                 * newSafeDialog(): the consequence belongs beside its cause. */
+                if (ac && ac.node && ac.node.parentNode)
+                    ac.node.parentNode.insertBefore(regHost, ac.node.nextSibling);
+                else host.appendChild(regHost);
+                function paintReg() {
+                    clear(regHost);
+                    regHost.appendChild(registryNote(ac ? ac.get() : undefined));
+                }
+                paintReg();
+                if (ac) ac.onChange(paintReg);
+
+                function start() {
+                    clear(errHost);
+                    var bad = form.validate();
+                    if (bad) { errHost.appendChild(el("div", "sec-alert err", bad)); return; }
+                    if (!W.file) {
+                        errHost.appendChild(el("div", "sec-alert err",
+                            "Choose the safe file to upload."));
+                        return;
+                    }
+                    go.disabled = true;
+                    W.access = ac ? ac.get() : undefined;
+                    W.admin = accessIsAdmin(W.access);
+                    var begin = form.values();
+                    begin[sizeField || "total_bytes"] = W.total;
+                    step2(begin);
+                }
+                var go = btn("Upload the file", "primary", start);
+                enterSubmit = start;
+                setActions([go, cancelBtn()]);
+                focusStep();
+            }
+
+            /* ---- step 2: hash, begin, and the chunked upload ------------ */
+            function step2(begin) {
+                markStep(1);
+                enterSubmit = null;
+                clear(host); clear(errHost);
+
+                host.appendChild(el("p", "sec-modal-intro",
+                    "Reading the file and uploading it. The passphrase is not asked for and " +
+                    "is not sent with any part of this (C5)."));
+
+                var bar = el("div", "sec-progress");
+                bar.setAttribute("role", "progressbar");
+                bar.setAttribute("aria-valuemin", "0");
+                bar.setAttribute("aria-valuemax", "100");
+                bar.setAttribute("aria-valuenow", "0");
+                bar.setAttribute("aria-label", "Upload progress");
+                var fill = el("span");
+                bar.appendChild(fill);
+                host.appendChild(bar);
+
+                var line = el("div", "sec-countdown");
+                host.appendChild(line);
+                /* The polite region gets ONE sentence per decile, not one per
+                 * chunk: a screen reader being told "3%… 4%… 5%…" a hundred
+                 * and seventy times is a hang with extra steps. The visible
+                 * text updates continuously; only the announcement is coarse. */
+                var say = el("div", "sec-visually-hidden");
+                say.setAttribute("role", "status");
+                say.setAttribute("aria-live", "polite");
+                host.appendChild(say);
+                var lastDecile = -1;
+
+                function paint(sent) {
+                    var pct = W.total ? Math.floor((sent / W.total) * 100) : 0;
+                    fill.style.width = Math.max(0, Math.min(100, pct)) + "%";
+                    bar.setAttribute("aria-valuenow", String(pct));
+                    line.textContent = fmtBytes(sent) + " of " + fmtBytes(W.total) +
+                        " — " + pct + "%";
+                    var dec = Math.floor(pct / 10);
+                    if (dec !== lastDecile) {
+                        lastDecile = dec;
+                        say.textContent = "Uploading, " + (dec * 10) + " percent.";
+                    }
+                }
+                paint(0);
+
+                var stop = btn("Cancel the upload", "", function () {
+                    W.cancelled = true;
+                    line.textContent = "Stopping…";
+                });
+                setActions([stop]);
+                focusStep();
+
+                line.textContent = "Reading the file and computing its SHA-256…";
+                readBlob(W.file).then(function (buf) {
+                    return sha256Hex(buf).then(function (hex) {
+                        /* The whole-file buffer is needed for exactly one
+                         * digest and is dropped here. Every later read is a
+                         * SLICE off the File handle, so the page never holds
+                         * more than one chunk at a time. */
+                        buf = null;
+                        return hex;
+                    });
+                }).then(function (hex) {
+                    if (W.cancelled) throw mkErr("invalid", "The upload was cancelled.");
+                    var req = {};
+                    Object.keys(begin).forEach(function (k) { req[k] = begin[k]; });
+                    if (hashField) req[hashField] = hex;
+                    line.textContent = "Declaring the upload to the helper…";
+                    return callOnce(V.begin, req, W.admin);
+                }).then(function (res) {
+                    W.token = pickKey(res,
+                        ["staging", "token", "staging_id", "staging_token",
+                         "import_id", "upload_id"]);
+                    if (!W.token)
+                        throw mkErr("internal",
+                            "The helper accepted the upload but named no staging token, so " +
+                            "there is no way to send it the bytes.");
+                    IMPORT = { token: W.token, admin: W.admin };
+                    W.chunkBytes = importChunkBytes(res);
+                    noteExpiry(res);
+                    return sendChunks(paint);
+                }).then(function () {
+                    return inspectWithRetry(paint);
+                }).then(function (res) {
+                    W.inspect = res || {};
+                    noteExpiry(res);
+                    step3();
+                }).catch(function (e) {
+                    /* EVERY failure path destroys the staging. A staged file
+                     * with no wizard attached to it is a file on this host that
+                     * nobody is going to commit and nobody is going to abort. */
+                    importAbortNow("");
+                    W.token = null;
+                    markStep(0);
+                    clear(host);
+                    fail(e);
+                    if (W.cancelled) {
+                        clear(errHost);
+                        errHost.appendChild(el("div", "sec-alert info",
+                            "The upload was cancelled and the partial staging was discarded."));
+                    }
+                    host.appendChild(el("p", null,
+                        "Nothing was written and no registry entry was made."));
+                    setActions([btn("Start again", "primary", function () {
+                        W.cancelled = false;
+                        step1();
+                    }), cancelBtn("Close")]);
+                    focusStep();
+                });
+            }
+
+            function inspectReq() {
+                var r = {};
+                r[tokenIn.inspect] = W.token;
+                return r;
+            }
+
+            /* import-inspect, RETRIED on a `conflict` — because one of the two
+             * things `conflict` means here is transient and the other is not,
+             * and getting it wrong costs the operator their whole upload.
+             *
+             * The helper bounds how many inspects and commits may run at once
+             * (constants.import_max_concurrent): each one reads a file that may
+             * be 128 MiB or derives a key at the Argon2 ceiling, and nothing
+             * else counted work in flight. The (N+1)th caller is REFUSED rather
+             * than queued, because queueing would hold this Cockpit channel
+             * open for the duration — so a plain `conflict` here can simply
+             * mean "another operator is adopting a safe right now".
+             *
+             * The failure path below destroys the staging, which is right for
+             * every permanent refusal and WRONG for that one. Re-uploading 128
+             * MiB because two people clicked at the same moment is the same
+             * class of bug as re-uploading it because of a typed passphrase,
+             * and the helper deliberately keeps the staged bytes in both cases.
+             * So a conflict is retried a few times with a short wait, and only
+             * an exhausted retry (or any other code) falls through.
+             *
+             * Bounded and short: a retry loop with no ceiling is a page that
+             * hangs, and the operator can always press the button again. */
+            function inspectWithRetry(paint) {
+                var tries = 0;
+                function attempt() {
+                    return callOnce(V.inspect, inspectReq(), W.admin)
+                        .catch(function (e) {
+                            var code = e && e.code;
+                            if (code !== "conflict" || tries >= 4 || W.cancelled)
+                                throw e;
+                            tries += 1;
+                            if (paint) paint("Another upload is being read on " +
+                                             "this host; waiting for it (try " +
+                                             tries + ")…");
+                            return new Promise(function (resolve) {
+                                window.setTimeout(resolve, 1200 + tries * 400);
+                            }).then(attempt);
+                        });
+                }
+                return attempt();
+            }
+
+            /* Sequential, never parallel. Order is the whole contract of a
+             * chunked upload, and one request in flight at a time also bounds
+             * how much of the operator's file this page is holding to exactly
+             * one chunk. */
+            function sendChunks(paint) {
+                var off = 0, seq = 0;
+                function next() {
+                    if (W.cancelled) return Promise.reject(
+                        mkErr("invalid", "The upload was cancelled."));
+                    if (off >= W.total) return Promise.resolve();
+                    var end = Math.min(W.total, off + W.chunkBytes);
+                    var at = off;
+                    return readBlob(W.file.slice(at, end)).then(function (buf) {
+                        var b64 = bytesToB64(new Uint8Array(buf));
+                        buf = null;
+                        var req = {};
+                        req[tokenIn.chunk] = W.token;
+                        if (offField) req[offField] = at;
+                        if (seqField) req[seqField] = seq;
+                        req[dataField] = b64;
+                        return callOnce(V.chunk, req, W.admin).then(function (res) {
+                            /* Drop the chunk the moment it is on its way. */
+                            req[dataField] = null;
+                            b64 = null;
+                            /* CROSS-CHECK what the helper says it has.
+                             *
+                             * `received` on its own is ambiguous — it could as
+                             * easily mean "this chunk" as "so far" — and acting
+                             * on the wrong reading would either stall the
+                             * upload or skip a chunk. It is only read as a
+                             * running total when the SAME reply also states a
+                             * `total_bytes` equal to the file this page is
+                             * sending, which pins it to the same frame of
+                             * reference. The unambiguous spellings are always
+                             * read. When the two disagree, stop: a silently
+                             * mis-assembled safe is the failure with no
+                             * symptom, and the sha256 check at inspect would
+                             * catch it far later and say much less. */
+                            var got = Number(pickKey(res,
+                                ["total_received", "bytes_received", "received_total"]));
+                            if (!isFinite(got) && Number(res && res.total_bytes) === W.total)
+                                got = Number(pickKey(res, ["received"]));
+                            if (isFinite(got) && got !== end)
+                                throw mkErr("internal",
+                                    "The helper has " + fmtBytes(got) + " staged but this " +
+                                    "page has sent " + fmtBytes(end) + ". The upload was " +
+                                    "stopped rather than finished wrongly.");
+                            noteExpiry(res);
+                            off = end;
+                            seq++;
+                            paint(off);
+                            return next();
+                        });
+                    });
+                }
+                return next();
+            }
+
+            /* The staging's idle expiry, whenever the helper mentions it. It is
+             * surfaced because a swept staging and a hung page look identical
+             * from the operator's chair, and only one of them is worth waiting
+             * for. */
+            function noteExpiry(res) {
+                var s = Number(pickKey(res, ["expires_in", "idle_seconds", "ttl"]));
+                if (isFinite(s) && s > 0) W.expiresAt = Date.now() + s * 1000;
+            }
+            function expiryNode() {
+                if (!W.expiresAt) return null;
+                /* The node is LOCAL to this call and the ticker closes over
+                 * that one, not over a shared variable: step 3 and step 4 each
+                 * draw their own countdown, and a ticker still pointing at the
+                 * previous step's detached node would write into nothing. */
+                var line = el("div", "sec-countdown");
+                line.setAttribute("aria-live", "polite");
+                if (W.expiryTimer) window.clearInterval(W.expiryTimer);
+                function tick() {
+                    var left = Math.ceil((W.expiresAt - Date.now()) / 1000);
+                    if (left <= 0) {
+                        window.clearInterval(W.expiryTimer);
+                        W.expiryTimer = null;
+                        line.textContent =
+                            "The staged upload has expired and the helper has discarded it. " +
+                            "Start again to upload the file.";
+                        return;
+                    }
+                    line.textContent =
+                        "The staged file is discarded after " + fmtSeconds(left) +
+                        " with nothing happening. That timer is a limit on this host's " +
+                        "disk and CPU, not on your guessing.";
+                }
+                tick();
+                W.expiryTimer = window.setInterval(tick, 1000);
+                return line;
+            }
+
+            /* ---- step 3: what the header CLAIMS ------------------------- */
+            function step3() {
+                markStep(2);
+                enterSubmit = null;
+                clear(host); clear(errHost);
+                var i = W.inspect || {};
+
+                var banner = el("div", "sec-alert info");
+                banner.appendChild(function () {
+                    var p = el("p");
+                    p.appendChild(el("strong", null, "Read from the file's header. "));
+                    p.appendChild(document.createTextNode(
+                        "NOT authenticated: no passphrase has been tried yet, nothing here " +
+                        "has been checked against a MAC, and a file can put whatever it " +
+                        "likes in its own header. It is here so you can confirm you " +
+                        "uploaded the file you meant to, before you type anything."));
+                    return p;
+                }());
+                host.appendChild(banner);
+
+                var facts = {};
+                ["format", "version", "cipher", "kdf", "iterations",
+                 "compressed"].forEach(function (k) {
+                    if (i[k] !== undefined && i[k] !== null) facts[k] = i[k];
+                });
+                /* A byte count is a SIZE, and "400000" is a number an operator
+                 * has to stop and parse. Only the presentation changes; the
+                 * figure is still the helper's. */
+                if (i.bytes !== undefined && i.bytes !== null)
+                    facts["file size"] = fmtBytes(i.bytes);
+                if (i.kdf_params && typeof i.kdf_params === "object")
+                    Object.keys(i.kdf_params).forEach(function (k) {
+                        facts["kdf " + k] = i.kdf_params[k];
+                    });
+                if (i.needs_password !== undefined)
+                    facts["passphrase required"] = i.needs_password !== false;
+                if (i.needs_keyfile !== undefined)
+                    facts["key file required"] = !!i.needs_keyfile;
+                if (Object.keys(facts).length) host.appendChild(kvList(facts));
+                else host.appendChild(el("p", "sec-subtle",
+                    "The helper reported no header fields for this file."));
+
+                /* The integrity check, which is a DIFFERENT claim from
+                 * authentication and must not be allowed to read like it. The
+                 * digest proves the bytes arrived intact; the caller supplied
+                 * both the bytes and the digest, so it proves nothing about who
+                 * the file belongs to or whether it opens. */
+                if (i.sha256_ok !== undefined)
+                    host.appendChild(el("div", "sec-alert " + (i.sha256_ok ? "ok" : "err"),
+                        i.sha256_ok
+                            ? "The reassembled upload matches the SHA-256 this browser " +
+                              "computed before sending it, so the bytes arrived intact. " +
+                              "That is an integrity check and nothing more — the digest " +
+                              "came from the same place the file did."
+                            : "The reassembled upload does NOT match the SHA-256 this " +
+                              "browser computed. It is not the file that was picked."));
+                /* The helper's own sentence about the file, verbatim. */
+                if (i.note) host.appendChild(el("p", "sec-subtle", String(i.note)));
+
+                /* Verbatim, like every other helper warning on this page. The
+                 * KDBX3 "this file is not authenticated" banner (I20) reaches
+                 * the operator through here. */
+                (Array.isArray(i.warnings) ? i.warnings : []).forEach(function (w) {
+                    host.appendChild(el("div", "sec-alert warn", String(w)));
+                });
+
+                var ex = expiryNode();
+                if (ex) host.appendChild(ex);
+
+                setActions([
+                    btn("This is the right file — unlock it", "primary", function () {
+                        step4();
+                    }),
+                    btn("Wrong file — discard it", "", function () {
+                        importAbortNow("the operator said it was the wrong file");
+                        W.token = null;
+                        step1();
+                    }),
+                    cancelBtn()
+                ]);
+                focusStep();
+            }
+
+            /* ---- step 4: THE CREDENTIAL, for the first time -------------
+             *
+             * This is what stops the whole verb being an arbitrary-file-write
+             * primitive: the only bytes that can ever land in the managed
+             * directory are bytes that are demonstrably a safe the uploader can
+             * already open. A file that does not open does not land.
+             *
+             * ON RATE-LIMITING THE RETRIES, since it is easy to mistake what
+             * the bound here is for:
+             *
+             *   Rate-limiting the GUESS is theatre. The person retrying already
+             *   possesses the file — they uploaded it — so they can guess
+             *   against their own copy, offline, on their own hardware, as fast
+             *   as they like. Nothing this host does changes that arithmetic by
+             *   a single bit.
+             *
+             *   What is NOT theatre is that every attempt costs THIS HOST a
+             *   full KDF derivation, which is deliberately expensive, and holds
+             *   a staged file on its disk. So the attempt count and the idle
+             *   expiry are RESOURCE CONTROLS. They protect the machine. They
+             *   are not protecting the safe and this page does not describe
+             *   them as though they were.
+             *
+             *   And a wrong passphrase must NOT destroy the staging. Making
+             *   somebody re-upload 100 MiB because of a typo is a bug wearing
+             *   a security control's clothes.
+             *
+             * The numbers shown are the HELPER'S. This page displays
+             * `attempts_remaining` and the expiry it was told; it does not
+             * count attempts itself, because a count the page invented would be
+             * a promise about somebody else's limit. */
+            function step4() {
+                markStep(3);
+                clear(host); clear(errHost);
+                var i = W.inspect || {};
+
+                host.appendChild(el("p", "sec-modal-intro",
+                    "The passphrase for the file you just uploaded. The helper opens the " +
+                    "staged file with it; a file that does not open is not registered and " +
+                    "does not land anywhere."));
+                if (i.needs_keyfile)
+                    host.appendChild(el("div", "sec-alert info",
+                        "This file's header says a key file is part of its key. Supply it " +
+                        "below as well — it is sent with the passphrase, in the same request, " +
+                        "and neither is kept afterwards."));
+                /* The attempt budget, named before the first try rather than
+                 * discovered on the last one. The number is the helper's; see
+                 * the note above on what it is and is not protecting. */
+                var budget = Number((SCHEMA && SCHEMA.constants &&
+                                     SCHEMA.constants.import_max_attempts) || 0);
+                if (W.attempts === null && isFinite(budget) && budget > 0)
+                    host.appendChild(el("p", "sec-subtle",
+                        "You get " + budget + " attempts against this staged file. Each one " +
+                        "costs this host a full key derivation, which is what that limit is " +
+                        "for — it is not protecting the safe, because you are holding the " +
+                        "file and can try passphrases against your own copy offline."));
+
+                /* The helper's own commit form, minus the plumbing. The
+                 * passphrase and key-file controls come from the verb's
+                 * descriptor; the strength meter is deliberately OFF, for the
+                 * same reason it is off on the unlock dialog — scoring a
+                 * passphrase that already exists answers nothing and costs a
+                 * copy of it in flight per keystroke. */
+                var specs = verbArgs(V.commit).filter(function (a) {
+                    var n = specName(a);
+                    return n && n !== tokenIn.commit;
+                }).map(function (a) {
+                    if (!isSecretSpec(a)) return a;
+                    var copy = {};
+                    Object.keys(a).forEach(function (k) { copy[k] = a[k]; });
+                    copy.strength = false;
+                    return copy;
+                });
+                var form = buildForm(specs);
+                host.appendChild(form.node);
+
+                var ex = expiryNode();
+                if (ex) host.appendChild(ex);
+
+                host.appendChild(el("p", "sec-subtle",
+                    "It goes into one variable, is written to the helper's standard input, " +
+                    "and is overwritten. It is not stored in this browser and never appears " +
+                    "on a command line (I10, I11). A wrong passphrase does not throw the " +
+                    "upload away — you can try again without re-uploading."));
+
+                var go = btn("Unlock and register the safe", "primary", submit);
+                setActions([go, btn("Discard the upload", "", function () {
+                    importAbortNow("the operator discarded it");
+                    W.token = null;
+                    m.close();
+                }), cancelBtn()]);
+
+                enterSubmit = submit;
+                focusStep();
+
+                function submit() {
+                    clear(errHost);
+                    var bad = form.validate();
+                    if (bad) { errHost.appendChild(el("div", "sec-alert err", bad)); return; }
+                    go.disabled = true;
+
+                    /* ---- THE ONE VARIABLE, exactly as unlockDialog does it.
+                     * Every secret control is read here, one at a time,
+                     * straight into the JSON body, and released on the next
+                     * statements. Nothing else in this file ever holds it. */
+                    var req = form.values();
+                    req[tokenIn.commit] = W.token;
+                    var names = form.secretNames();
+                    var n, pw, k;
+                    for (k = 0; k < names.length; k++) {
+                        n = names[k];
+                        pw = form.readSecret(n);
+                        if (pw !== null && pw !== "") req[n] = pw;
+                        pw = "\0".repeat(pw ? pw.length : 0);
+                        pw = null;
+                    }
+                    var body = JSON.stringify(req);
+                    names.forEach(function (nm) { req[nm] = null; });
+                    req = null;
+                    form.wipeSecrets();
+
+                    callOnceBody(V.commit, body, W.admin).then(function (res) {
+                        body = null;
+                        /* Committed: the staging is the helper's problem now
+                         * and there is nothing left to abort. */
+                        IMPORT = null;
+                        W.token = null;
+                        form.wipeAll();
+                        m.close();
+                        importResultDialog(res);
+                    }).catch(function (e) {
+                        body = null;
+                        go.disabled = false;
+                        clear(errHost);
+                        errHost.appendChild(errNode(e));
+                        var left = pickKey(e,
+                            ["attempts_remaining", "attempts_left", "remaining_attempts"]);
+                        if (left !== undefined) {
+                            W.attempts = Number(left);
+                            errHost.appendChild(el("div", "sec-alert warn",
+                                W.attempts > 0
+                                    ? W.attempts + " attempt" + (W.attempts === 1 ? "" : "s") +
+                                      " left against this upload before the helper discards " +
+                                      "it. That is a limit on how much work this host will " +
+                                      "do for one staged file, not a limit on guessing — " +
+                                      "you have the file."
+                                    : "No attempts left: the helper has discarded the staged " +
+                                      "file. Upload it again to try another passphrase."));
+                            if (W.attempts <= 0) { IMPORT = null; W.token = null; }
+                        }
+                        if (errCode(e) === "bad-credential")
+                            errHost.appendChild(el("div", "sec-alert info",
+                                "The upload is still staged. Try the passphrase again — " +
+                                "there is no need to re-upload the file."));
+                        if (errCode(e) === "locked-out" && errSeconds(e))
+                            lockoutCountdown(errHost, errSeconds(e));
+                        noteExpiry(e);
+                        form.focusFirst();
+                    });
+                }
+            }
+
+            step1();
+        }, { wide: true, onClose: function () {
+            /* Cancel, Escape, the backdrop, and navigating away all land here.
+             * A staging nobody is going to commit is aborted (C5 step 6). */
+            W.file = null;
+            if (W.expiryTimer) { window.clearInterval(W.expiryTimer); W.expiryTimer = null; }
+            importAbortNow("");
+        } });
+    }
+
+    /* callOnce, but with the body ALREADY serialized.
+     *
+     * The credential-bearing paths build their own JSON string so the
+     * passphrase is never handed to a generic serializer that might keep it
+     * somewhere — unlockDialog has done this since the first build, through
+     * the session's send(). This is the same thing for a single-shot verb, and
+     * it exists so the import commit does not have to be the one credential
+     * path in this file that works differently from the others. */
+    function callOnceBody(verb, body, adminClass) {
+        return new Promise(function (resolve, reject) {
+            var proc = cockpit.spawn([HELPER, verb], spawnOpts(adminClass));
+            proc.input(body);                       /* stdin, then CLOSED (I10) */
+            proc.then(function (out) {
+                var obj;
+                try { obj = parseOneObject(out); } catch (e) { reject(e); return; }
+                if (obj && obj.error) reject(mkErr(obj.error, obj.detail, obj));
+                else resolve(obj);
+            }).catch(function (err, out) {
+                reject(fromSpawnFailure(err, out));
+            });
+        });
+    }
+
+    function importResultDialog(res) {
+        modal("The safe was registered", function (box, m) {
+            var lead = el("p");
+            box.appendChild(lead);
+            var id = registryResultBody(box, res);
+            lead.textContent = "The uploaded file opened with the passphrase you gave, so it " +
+                "was moved into place and registered" +
+                (id ? " as “" + String(id) + "”" : "") + ".";
+            box.appendChild(el("p", "sec-subtle",
+                "Your original file is untouched where it was. Opening this safe asks for " +
+                "the passphrase again, like every other safe on this page."));
+            actionRow(box, [btn("Close", "primary", function () { m.close(); })]);
+        }, { onClose: function () { refreshAll(); } });
+        announce("The uploaded safe was registered.");
+    }
+
+    /* ------------------------------------------------------------------ *
+     * 3 · FORGET AND DELETE
+     *
+     * Creating without removing means an operator can fill the registry and
+     * never clean it, so both exist — but they are not the same act and the
+     * page must not let them look like it.
+     *
+     *   FORGET is the ordinary one, and the safe one: the registry entry goes,
+     *   the FILE STAYS EXACTLY WHERE IT IS. It is reversible by registering it
+     *   again, which is what the upload wizard is for.
+     *
+     *   DELETE destroys the file and its whole backup ring. It is behind a
+     *   typed id, it says plainly that shredding is best-effort on modern
+     *   storage, and it is drawn last and in red so it is not the button next
+     *   to the one you meant.
+     * ------------------------------------------------------------------ */
+    function forgetDialog(safe) {
+        var verb = verbFor("safeForget");
+        if (!verb) return;
+        verbDialog(verb, { safe: safe.id }, null, null, {
+            title: "Forget " + (safe.label || safe.id),
+            safe: safe,
+            runLabel: "Remove the registry entry",
+            beforeForm: function (box) {
+                var w = el("div", "sec-alert warn");
+                w.appendChild(function () {
+                    var p = el("p");
+                    p.appendChild(el("strong", null, "The file stays on disk."));
+                    p.appendChild(document.createTextNode(
+                        " This removes the registry entry and nothing else: the safe " +
+                        "disappears from this page, and the encrypted file, its backups and " +
+                        "everything in it are exactly where they were."));
+                    return p;
+                }());
+                w.appendChild(el("p", null,
+                    "Nothing here can open it afterwards, because this page has no way to " +
+                    "reach a file that is not in the registry (I4). Registering it again " +
+                    "with “Add an existing safe” brings it back."));
+                box.appendChild(w);
+            },
+            confirm: "I understand this removes the registry entry and leaves the file on disk.",
+            onResult: function (res) {
+                var msg = "“" + (safe.label || safe.id) + "” was removed from the registry; " +
+                    "its file was left on disk" +
+                    (pickKey(res, ["path", "file"])
+                        ? " at " + String(pickKey(res, ["path", "file"])) : "") + ". " +
+                    /* The helper's own sentence, appended verbatim. It is
+                     * written by the code that did the unlinking and knows
+                     * exactly what it did and did not touch. */
+                    String(pickKey(res, ["warning"]) || "");
+                /* The re-read FIRST, the banner SECOND. refreshAll() empties
+                 * the alert region as its first statement, so saying it before
+                 * asking would announce the outcome and then wipe it — the
+                 * operator would watch the safe vanish with no word about why. */
+                refreshAll();
+                alertText(msg, "ok");
+                announce(msg);
+            }
+        });
+    }
+
+    /* The confirm token safe-delete refuses to run without.
+     *
+     * Same division of labour as the export token (I21): the token is
+     * machine-readable and names THIS safe, so an agreement given for a
+     * throwaway safe cannot be replayed against the domain administrator one.
+     * The prefix is the helper's, from its constants, never a literal here —
+     * a page that hard-coded it would keep sending a token the helper had
+     * stopped accepting and the failure would read as a permissions bug. When
+     * the helper publishes no prefix, the token is the id itself, which is
+     * still "an explicit token naming the id" and is the most this page can
+     * honestly compose. */
+    function safeDeleteToken(safe) {
+        var c = (SCHEMA && SCHEMA.constants) || {};
+        var prefix = c.delete_confirm_prefix || c.safe_delete_confirm_prefix ||
+                     c.destroy_confirm_prefix;
+        return prefix ? String(prefix) + String(safe.id) : String(safe.id);
+    }
+
+    function deleteDialog(safe) {
+        var verb = verbFor("safeDelete");
+        if (!verb) return;
+        var presets = { safe: safe.id };
+        /* Whichever field the verb declares for its token — the helper calls it
+         * `delete_confirm` to keep it distinct from export's `confirm`, and a
+         * page that hard-coded either name would silently send nothing. */
+        var confirmField = requestFieldName(verb,
+            ["delete_confirm", "confirm", "confirm_token", "token"]);
+        if (confirmField) presets[confirmField] = safeDeleteToken(safe);
+        verbDialog(verb, presets, null, null, {
+            title: "Delete " + (safe.label || safe.id) + " and its file",
+            safe: safe,
+            runLabel: "Destroy this safe and its backups",
+            beforeForm: function (box) {
+                var w = el("div", "sec-danger-block");
+                w.appendChild(function () {
+                    var p = el("p");
+                    p.appendChild(el("strong", null,
+                        "This destroys the encrypted file and its whole backup ring."));
+                    return p;
+                }());
+                w.appendChild(el("p", null,
+                    "Every credential in “" + (safe.label || safe.id) + "” goes with it. " +
+                    "There is no undo, no recycle bin and no escrow: this program has no " +
+                    "copy of a safe it has deleted, and neither has the helper."));
+                w.appendChild(el("p", null,
+                    "Overwriting a file before unlinking it is BEST EFFORT and nothing more. " +
+                    "On an SSD, on a copy-on-write filesystem, on anything with wear " +
+                    "levelling, and on any snapshot or backup taken before now, the old " +
+                    "bytes may well still be recoverable. Treat the passphrase as exposed " +
+                    "rather than treating the file as gone."));
+                w.appendChild(el("p", null,
+                    "If you only want it off this page, use Forget instead — that leaves the " +
+                    "file alone."));
+                box.appendChild(w);
+            },
+            typeToConfirm: {
+                expect: safe.id,
+                label: "Type the safe's id, “" + safe.id + "”, to confirm",
+                help: "Typed rather than ticked on purpose: a tick is one gesture and so is " +
+                      "a mis-click, and this is the one action on this page that cannot be " +
+                      "undone at all."
+            },
+            confirm: "I understand the encrypted file and every backup of it are destroyed, " +
+                     "and that this cannot be undone.",
+            onResult: function (res) {
+                var msg = "“" + (safe.label || safe.id) + "” was deleted" +
+                    (pickKey(res, ["backups_removed", "backups"]) !== undefined
+                        ? ", with " + String(pickKey(res, ["backups_removed", "backups"])) +
+                          " backup generation(s)" : "") + ". " +
+                    /* Verbatim: this is the helper's own statement about what
+                     * an overwrite is and is not worth on this storage, and it
+                     * is more accurate than anything this page could add. */
+                    String(pickKey(res, ["warning"]) || "");
+                /* If it was the safe that happens to be open, that session is
+                 * now pointing at a file that no longer exists. Lock it and say
+                 * why rather than letting the first save find out. */
+                var openId = BROWSE ? BROWSE.safe.id : null;
+                if (SESSION && openId === safe.id) lockNow("the safe was deleted");
+                else refreshAll();
+                /* After the re-read, for the reason given in forgetDialog. */
+                alertText(msg, "ok");
+                announce(msg);
+            }
+        });
+    }
+
+    /* The two entry points, drawn wherever the safe list is. Both are behind
+     * "does the helper publish the verb", like everything else here: a build
+     * of this page against a helper that cannot create a safe has no New-safe
+     * button, and one against a helper with no import verbs has no Upload
+     * button — not a disabled one, not one that explains itself, none. */
+    function registryActions(host) {
+        var made = false;
+        if (verbFor("safeCreate")) {
+            host.appendChild(btn("New safe…", "primary", function () { newSafeDialog(); }));
+            made = true;
+        }
+        if (importSupported()) {
+            host.appendChild(btn("Add an existing safe…", "", function () { importDialog(); }));
+            made = true;
+        } else if (importVerbs().begin && importVerbs().commit) {
+            /* The verbs are there and the browser primitive is not. Say which,
+             * rather than leaving a gap that reads as "this helper cannot do
+             * it": one of those is a configuration problem and the other is
+             * not, and they look identical from the outside. */
+            host.appendChild(el("p", "sec-subtle",
+                "Uploading a safe needs the browser's SubtleCrypto digest to checksum the " +
+                "file before it is sent, and this context does not provide it (it needs a " +
+                "secure origin). The helper's import verbs are present."));
+        }
+        return made;
+    }
+
+    /* ================================================================== *
      * Page lifetime: hide, unload, and the automatic lock
      * ================================================================== */
     function bindLifetime() {
@@ -6347,6 +8010,11 @@
         window.addEventListener("pagehide", function () {
             clipboardClear("the page was hidden");
             if (SESSION) lockNow("the page was closed");
+            /* A staged upload nobody is coming back to. The helper sweeps it on
+             * its own idle timer anyway, but telling it now is the difference
+             * between a file that is cleaned up in seconds and one that sits on
+             * this host's disk until a timeout fires (C5 step 6). */
+            importAbortNow("");
         });
 
         document.addEventListener("visibilitychange", function () {

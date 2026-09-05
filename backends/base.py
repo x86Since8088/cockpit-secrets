@@ -56,6 +56,7 @@ import binascii
 import ctypes
 import ctypes.util
 import errno
+import fcntl
 import hashlib
 import hmac
 import json
@@ -625,6 +626,34 @@ class Limits:
     #: Argon2 parallelism. Stops "p=255" — 255 threads inside a helper that is
     #: supposed to live for milliseconds; a fork-bomb by proxy.
     ARGON2_MAX_PARALLELISM = 8
+
+    #: WRITE FLOORS — the other end of the same clamp, and they exist for the
+    #: opposite reason. The ceilings above stop a hostile FILE from spending
+    #: this host; these stop US from creating a safe weaker than the tools that
+    #: will open it. A file we READ may sit below them (a database written by
+    #: an older KeePass legitimately does) and is opened unchanged; a database
+    #: this program CREATES may not. That asymmetry is exactly `PWS3_MIN_ITER`
+    #: vs `PWS3_WRITE_MIN_ITER` one format over, and it is the shape a floor has
+    #: to have: refusing to read an old file is a data-loss bug, while writing a
+    #: new weak one is a security bug we chose.
+    #:
+    #: The numbers are OWASP's current Argon2id minimum (m=19 MiB, t=2, p=1),
+    #: which is the lowest published figure any of the reference implementations
+    #: would still call adequate. They are a FLOOR, not a recommendation; the
+    #: defaults below are what a caller that names nothing actually gets.
+    ARGON2_WRITE_MIN_MEMORY_KIB = 19 * 1024
+    ARGON2_WRITE_MIN_TIME = 2
+    ARGON2_WRITE_MIN_PARALLELISM = 1
+
+    #: The cost a NEW KDBX database is created with when the request names no
+    #: parameters. Deliberately the same numbers as the blank KDBX4 template
+    #: that ships inside pykeepass (t=14, m=64 MiB, p=2), which is already the
+    #: cost `upgrade_to_kdbx4` produces on this host — so "created here" and
+    #: "upgraded here" mean one security level rather than two, and neither is a
+    #: number this project invented for itself.
+    ARGON2_DEFAULT_MEMORY_KIB = 64 * 1024
+    ARGON2_DEFAULT_TIME = 14
+    ARGON2_DEFAULT_PARALLELISM = 2
     #: AES-KDF (KDBX 3.x and KDBX4-with-AESKDF) transform rounds. 1e8 is already
     #: several seconds. Stops "rounds=2^31", which is a wall-clock DoS with no
     #: memory footprint for an RSS ceiling to catch.
@@ -640,6 +669,13 @@ class Limits:
     #: WRITE floor — Password Safe's own current default. We never write a file
     #: weaker than the reference implementation would, even when we read one.
     PWS3_WRITE_MIN_ITER = 262_144
+    #: The stretch a NEW PWS3 database is created with when the request names
+    #: nothing. The floor and the default are the same number ON PURPOSE: it is
+    #: the reference implementation's own current value, so raising the default
+    #: above it would make files this program creates measurably different from
+    #: files Password Safe creates for no stated reason, and lowering it is what
+    #: the floor exists to refuse.
+    PWS3_DEFAULT_ITER = 262_144
 
     #: Wall-clock budget for one key derivation. Enforcement is honest but
     #: after-the-fact: neither Argon2 in argon2-cffi nor an iterated-SHA256 loop
@@ -726,14 +762,33 @@ class Limits:
     # cannot each grow their own slightly-different idea of "too big".
 
     @classmethod
-    def check_argon2(cls, memory_kib, time_cost, parallelism):
-        """Refuse out-of-range Argon2 parameters BEFORE derivation (I7)."""
+    def check_argon2(cls, memory_kib, time_cost, parallelism, *,
+                     for_write=False):
+        """Refuse out-of-range Argon2 parameters BEFORE derivation (I7).
+
+        `for_write` additionally applies the WRITE floors, and it is spelled the
+        same way `check_pws3_iter` spells its own for the same reason: reading a
+        database somebody else wrote weakly is not our decision, and creating
+        one is. The ceilings apply on both paths, always — a caller that asks
+        this host for `m=4 GiB` is the same denial of service whether the
+        request arrived in a file or in a form.
+        """
         for name, value in (("memory", memory_kib), ("time", time_cost),
                             ("parallelism", parallelism)):
             if not isinstance(value, int) or isinstance(value, bool):
                 raise Invalid("Argon2 %s parameter is not an integer" % name)
             if value <= 0:
                 raise Invalid("Argon2 %s parameter is not positive" % name)
+        if for_write:
+            for name, value, floor in (
+                    ("memory", memory_kib, cls.ARGON2_WRITE_MIN_MEMORY_KIB),
+                    ("time", time_cost, cls.ARGON2_WRITE_MIN_TIME),
+                    ("parallelism", parallelism,
+                     cls.ARGON2_WRITE_MIN_PARALLELISM)):
+                if value < floor:
+                    raise Invalid("Argon2 %s parameter %d is below the %d "
+                                  "floor this program will create a safe with"
+                                  % (name, value, floor))
         if memory_kib > cls.ARGON2_MAX_MEMORY_KIB:
             raise Invalid("Argon2 memory %d KiB exceeds the %d KiB limit"
                           % (memory_kib, cls.ARGON2_MAX_MEMORY_KIB))
@@ -1279,7 +1334,8 @@ def open_safe_fd(path, *, expect_uid=None, want_write=False):
       3. `os.fstat` **the fd**. Never a second `stat` of the path: the path can
          change between the two calls and the fd cannot.
       4. Regular file, or refuse. A FIFO would block the helper forever; a
-         device would do something worse.
+         device would do something worse. `O_NONBLOCK` is set ON THE OPEN so
+         that step never has to be reached to be safe -- see below.
       5. `st_uid == expect_uid`, or refuse. This is what makes "the user class
          may only reach files that user owns" true.
       6. No group or other permission bits at all (mode & 0o077 == 0). A safe
@@ -1322,6 +1378,21 @@ def open_safe_fd(path, *, expect_uid=None, want_write=False):
     flags |= os.O_NOFOLLOW | os.O_CLOEXEC
     if hasattr(os, "O_NOCTTY"):
         flags |= os.O_NOCTTY        # a device slipped in here cannot steal a tty
+    # O_NONBLOCK, AND IT IS LOAD-BEARING (I44). The S_ISREG refusal in step 4
+    # is AFTER the open, and `open(2)` on a FIFO with no writer BLOCKS FOREVER
+    # before it ever returns -- so the check that was supposed to make a FIFO
+    # safe could never run. A registry `path` naming a FIFO therefore hung the
+    # helper on every invocation, `schema` and `health` included, which is the
+    # one pair a stuck plugin needs to be able to answer to explain itself.
+    # It became reachable when C4 handed an unprivileged user a registry they
+    # can write and the loader started probing every per-user path at load.
+    #
+    # O_NONBLOCK makes the open RETURN instead, so step 4 gets to run and
+    # refuse. It is dropped again below the moment the file is known to be a
+    # regular file, because a regular fd left non-blocking changes read/write
+    # semantics for every caller downstream (a short read is legal on a
+    # non-blocking fd, and `read_all` would silently truncate a safe).
+    flags |= os.O_NONBLOCK
     try:
         fd = os.open(path, flags)
     except OSError as exc:
@@ -1342,6 +1413,16 @@ def open_safe_fd(path, *, expect_uid=None, want_write=False):
         st = os.fstat(fd)                      # the fd, never the path again
         if not stat.S_ISREG(st.st_mode):
             raise Invalid("safe path is not a regular file")
+        # Regular file confirmed: drop O_NONBLOCK before anybody reads. On a
+        # regular file it is a no-op for correctness on Linux today, but
+        # `read_all` and `write_all` are written against BLOCKING semantics and
+        # leaving the flag set would make that assumption depend on the
+        # filesystem rather than on this line.
+        try:
+            cur = fcntl.fcntl(fd, fcntl.F_GETFL)
+            fcntl.fcntl(fd, fcntl.F_SETFL, cur & ~os.O_NONBLOCK)
+        except OSError:
+            raise Invalid("safe file could not be opened")
         if st.st_uid != expect_uid:
             # Deliberately does NOT name either uid: on the user path that would
             # tell an unprivileged caller who owns a file they cannot read.
@@ -2134,6 +2215,72 @@ def known_formats():
     return sorted(_BACKENDS)
 
 
+class _CredentialView:
+    """`with Backend.credential_view(x) as (password, keyfile):` — see there.
+
+    Exists so the ownership rule around `Secret` has exactly one implementation.
+    The ABC's rule is that a caller's `Secret` is zeroed by the CALLER, never by
+    the callee; a `Secret` this program mints from raw bytes or text is ours and
+    must be zeroed here. Two call sites each writing that `try/finally` by hand
+    is how one of them ends up zeroing the helper's own request passphrase half
+    way through a verb, or leaking one it minted.
+    """
+
+    __slots__ = ("_password", "_keyfile", "_owned")
+
+    _FIELDS = ("password", "keyfile")
+
+    def __init__(self, credential):
+        self._owned = []
+        password = keyfile = None
+        if credential is None:
+            pass
+        elif isinstance(credential, Secret):
+            password = credential
+        elif isinstance(credential, (str, bytes, bytearray, memoryview)):
+            password = self._mint(credential)
+        elif isinstance(credential, dict):
+            unknown = sorted(set(credential) - set(self._FIELDS))
+            if unknown:
+                # Fail closed on a key we do not understand, exactly as the
+                # registry loader does: a credential dict carrying `passphrase`
+                # (or a typo of `password`) must not silently become "no
+                # passphrase at all", which is the one misreading that turns a
+                # protected safe into an unprotected one.
+                raise Invalid("unknown credential field %r"
+                              % _sanitize_detail(unknown[0], 24))
+            password = self._adopt(credential.get("password"))
+            keyfile = self._adopt(credential.get("keyfile"))
+        else:
+            raise Invalid("credential must be a passphrase or a "
+                          "{password, keyfile} object")
+        self._password = password
+        self._keyfile = keyfile
+
+    def _adopt(self, value):
+        if value is None or isinstance(value, Secret):
+            return value
+        return self._mint(value)
+
+    def _mint(self, value):
+        s = Secret(value)
+        self._owned.append(s)
+        return s
+
+    def __enter__(self):
+        return (self._password, self._keyfile)
+
+    def __exit__(self, exc_type, exc, tb):
+        for s in self._owned:
+            s.zero()
+        self._owned = []
+        return False
+
+    def __repr__(self):
+        return "<credential password=%s keyfile=%s>" % (
+            self._password is not None, self._keyfile is not None)
+
+
 class Backend(abc.ABC):
     """One safe file, one format, one short-lived process.
 
@@ -2747,6 +2894,356 @@ class Backend(abc.ABC):
                            "data: %s" % "; ".join(list(lost)[:5]))
         return True
 
+    # -- creation and import  (C1..C7) -------------------------------------
+    #
+    # THE TWO PRIMITIVES THE `safe-create` / `safe-import` VERBS STAND ON, and
+    # the reason they are here and not in the helper.
+    #
+    # Both are CLASS methods and neither touches the filesystem. That is not a
+    # style choice: the helper owns every path in this program (I4), it MINTS
+    # the destination from a registry id rather than accepting one, and a
+    # backend that could write a file of its own choosing would be a second
+    # place for a path to enter. `create_new` returns bytes; where those bytes
+    # land is not a backend's business.
+    #
+    # `create_new` is the whole answer to "an operator cannot make a safe", and
+    # `validate_candidate` is the whole answer to "an upload must not be an
+    # arbitrary-file-write primitive": the only bytes an import may ever commit
+    # are bytes that are demonstrably a database of this format which the
+    # uploader can already open. Everything else about the import flow — the id
+    # allow-list, the staging directory, the size cap, the registry write — is
+    # the helper's, and none of it is safe without this one.
+    #
+    # They follow `verify_own_output`'s shape exactly (I41's lesson): a shared,
+    # concrete POLICY on the ABC, standing on format hooks that REFUSE BY
+    # DEFAULT. A third backend that implements neither hook cannot create a
+    # safe and cannot accept an import; it cannot half-implement them into
+    # something that looks like it worked. `_unverified_creates()` below closes
+    # the omission the default cannot — a `build_new` that never re-reads what
+    # it built — the same way `_unverified_writes()` closes it for `save`.
+
+    @staticmethod
+    def credential_view(credential):
+        """Normalise a credential into `(password, keyfile)` `Secret`s.
+
+        Used as a context manager::
+
+            with cls.credential_view(credential) as (password, keyfile):
+                ...
+
+        Accepts `None`, a `Secret`, raw text/bytes (passphrase only), or
+        `{"password": …, "keyfile": …}`. A `Secret` the CALLER passed in is
+        handed straight through and is NOT zeroed on exit — the ABC's rule is
+        that the caller owns its own passphrase and zeroes it in a `finally`.
+        Anything minted here from raw bytes IS zeroed on exit, because nothing
+        else holds a reference to it. An unknown key in the dict is `invalid`
+        rather than ignored (see `_CredentialView`).
+        """
+        return _CredentialView(credential)
+
+    @classmethod
+    def create_new(cls, *, credential, options=None):
+        """Build a brand-new, empty, valid database in memory. Returns bytes.
+
+        **It must not touch the filesystem** — no temp file, no destination, no
+        path argument anywhere in the call. The helper owns every write, mints
+        the path from the registry id, and lands the bytes through
+        `atomic_replace` (C1, I4). A backend that wrote its own file would be a
+        second place a path could enter the program.
+
+        `credential` is `credential_view`'s vocabulary; the passphrase arrives
+        as a `Secret` because it arrived on stdin (I10) and never became an
+        argv word or an environment variable on the way. `options` is a
+        format-specific dict — cipher, KDF, cost — and every backend clamps it
+        through `Limits` before it derives anything and re-checks the result
+        afterwards.
+
+        THE POLICY THIS METHOD IS, in order, and each step is a refusal:
+
+          1. **An empty credential is refused** (C7). A safe with no passphrase
+             and no key file is a file that anyone who can read it can open,
+             which is not a safe; `password_required: false` in the registry is
+             a statement that a KEY FILE opens it, never that nothing does.
+          2. `build_new` — the format hook. It is required to run its own
+             pre-write reader check and its own I22 round-trip guard before it
+             returns; `_unverified_creates()` refuses a backend whose
+             `build_new` reaches a serialiser without one.
+          3. the size cap, because a `create` is still a write and
+             `MAX_SAFE_BYTES` is the ceiling every other write obeys.
+          4. `verify_structure` — the key-free completeness check
+             `restore-backup` uses. Cheap, and it is the one check that says
+             "these bytes are a WHOLE file of this format" without a key.
+          5. `validate_candidate` with the SAME credential, which re-derives the
+             key from the passphrase from cold and opens the file through the
+             reader a later `unlock` will use.
+
+        Step 5 costs a second full KDF run — a second or two — and it is worth
+        every millisecond, because it is the only step that proves the file
+        opens with the PASSPHRASE. The pre-write check inside `build_new` holds
+        a transformed key it derived a moment ago; it would pass just as
+        happily on a database whose stored KDF parameters no longer describe
+        how that key was produced, and the operator would find out at the next
+        unlock, on the safe that now holds their credentials.
+
+        What it deliberately does NOT prove is that anyone ELSE can open the
+        file: a reader and a writer that share a bug agree perfectly (I19). The
+        foreign oracle is what tests that, and the backends' self-checks drive
+        it.
+        """
+        options = dict(options or {})
+        with cls.credential_view(credential) as (password, keyfile):
+            if not (password is not None and len(password)) and \
+                    not (keyfile is not None and len(keyfile)):
+                # C7. `Invalid` and not `BadCredential`: nothing was checked
+                # against anything, the request is simply incomplete, and the
+                # caller can fix it and try again.
+                raise Invalid("a new safe needs a passphrase or a key file; "
+                              "refusing to create one that opens with neither")
+            data = cls.build_new(
+                credential={"password": password, "keyfile": keyfile},
+                options=options)
+            if not isinstance(data, (bytes, bytearray)):
+                raise Internal("the %s backend did not return bytes for a new "
+                               "database" % cls.format)
+            data = bytes(data)
+            if not data:
+                raise Internal("the %s backend built an empty database"
+                               % cls.format)
+            if len(data) > Limits.MAX_SAFE_BYTES:
+                raise Invalid("the database we built is %d bytes, over the %d "
+                              "byte limit" % (len(data), Limits.MAX_SAFE_BYTES))
+            cls.verify_structure(data)
+            cls.validate_candidate(
+                data, credential={"password": password, "keyfile": keyfile})
+        return data
+
+    @classmethod
+    def build_new(cls, *, credential, options):
+        """Format hook for `create_new`. **Refuses by default.**
+
+        Returns the complete bytes of an empty database — one root group and
+        nothing else. No sample entry, no default password, no "welcome"
+        record: a template entry in a password manager is a thing operators
+        leave behind, and one carrying a plausible-looking password is a thing
+        they later mistake for a real credential.
+
+        An implementation MUST, before it returns:
+
+          * clamp its cost parameters through `Limits.check_*` with the WRITE
+            floors applied, so a request cannot create a safe weaker than this
+            program is willing to write;
+          * re-read the bytes it built through the reader a later `unlock`
+            uses, and refuse rather than return a file we cannot open (I24,
+            I41 — this is `verify_own_output`'s guarantee, applied to bytes
+            that do not have an instance yet);
+          * run the format's I22 round-trip guard, so a database that could not
+            be SAVED is never CREATED. Creating one would hand the operator a
+            safe that refuses the first edit they make to it.
+
+        Deliberately not abstract and deliberately not a stub that returns
+        something: the default refuses, following `read_back`'s precedent, so a
+        format that has not written this cannot be silently treated as able to
+        create safes.
+        """
+        raise Unsupported("this format cannot create a new database")
+
+    @classmethod
+    def validate_candidate(cls, data, *, credential):
+        """THE IMPORT GATE. Do these untrusted bytes open with this credential?
+
+        Returns `{format, version, cipher, kdf, entries, groups, warnings}`.
+        Raises, and the distinction between the two failures is the design
+        decision this docstring exists to record.
+
+        RUNS ON FULLY UNTRUSTED BYTES. Somebody uploaded them; nothing about
+        them has been checked by anyone. So it obeys every hostile-input
+        control the unlock path obeys, because it IS the unlock path: the size
+        cap, the key-free structural check, the `Limits` KDF clamps applied
+        BEFORE derivation (I7), the parse budget, the structural caps and the
+        hardened XML parser (I8). **There is deliberately no second, laxer
+        parse.** A validator that accepted a file the real reader would later
+        refuse is I24/I41 rebuilt as a feature: the import would report success
+        and the safe would fail at its first unlock, after the operator had
+        already deleted the copy they uploaded from.
+
+        WHAT MAY BE DISTINGUISHED, AND WHY IT IS NOT A NEW ORACLE
+        --------------------------------------------------------
+        The helper has to be able to tell the operator "that is not a safe"
+        apart from "that passphrase did not open it", or the import UI can only
+        say "no". On its face this is exactly I6's shape — a caller supplying a
+        file AND a guess, learning per attempt which was wrong — so the line is
+        drawn where it can be defended rather than where it is convenient:
+
+          * **Before any key material is used**, a refusal is `Invalid` and
+            names the real reason. Everything checked there is a pure function
+            of the bytes: the magic, the version, the framing, the declared
+            lengths, the KDF parameters. The uploader HOLDS those bytes. They
+            can read every one of those facts with `head -c 200 | xxd`, and
+            `import-inspect` reports them deliberately, with no credential at
+            all, precisely because a KDBX or PWS3 header is not secret.
+            Refusing to say what anybody holding the file already knows buys
+            nothing and costs the operator the one message that would have told
+            them they picked the wrong file.
+
+          * **At or after the moment the credential is used**, everything
+            collapses to `BadCredential` with the format's single shared
+            detail: a wrong passphrase, a failed header HMAC, a failed block
+            HMAC, and every structural failure on decrypted-but-not-yet-
+            authenticated bytes. Those are the ones that differ per GUESS and
+            per tampered byte, and they are the entire oracle I6 closes. This
+            method gets that for free rather than by care, because it routes
+            through `_decode` / `_verify_kdbx4` and their flattening, which is
+            the second reason not to write a separate parse path.
+
+        The remaining honest gap, stated rather than papered over: this is a
+        per-attempt yes/no on a credential, which is what an unlock is, so the
+        helper must spend a `Limits.FAIL_FLOOR_SECONDS` floor on the failures
+        and count them the way it counts unlock failures (I16). That is the
+        helper's job and not a backend's — but a backend that made the two
+        answers cheap to tell apart would have made that job impossible, which
+        is why the split above is at the credential and not one step later.
+        """
+        if isinstance(data, memoryview):
+            data = bytes(data)
+        if not isinstance(data, (bytes, bytearray)):
+            raise Invalid("the candidate is not a byte string")
+        data = bytes(data)
+        if not data:
+            raise Invalid("the candidate is empty")
+        if len(data) > Limits.MAX_SAFE_BYTES:
+            # O(1), against the declared length, before anything is parsed —
+            # the same arithmetic-not-allocation rule `check_length` states.
+            raise Invalid("the candidate is %d bytes, over the %d byte limit"
+                          % (len(data), Limits.MAX_SAFE_BYTES))
+        # Key-free and structural: this is the half that is allowed to say what
+        # it found, and it runs FIRST so that "you uploaded a JPEG" never has
+        # to be answered as "the passphrase did not open this safe".
+        cls.verify_structure(data)
+        with cls.credential_view(credential) as (password, keyfile):
+            summary = cls.open_candidate(data, password=password,
+                                         keyfile=keyfile)
+        return cls._candidate_summary(summary)
+
+    @classmethod
+    def open_candidate(cls, data, *, password, keyfile):
+        """Format hook for `validate_candidate`. **Refuses by default.**
+
+        Opens `data` through the SAME reader `unlock()` uses — the same clamps,
+        the same MAC gate, the same post-decode refusals — and returns a plain
+        dict of `{version, cipher, kdf, entries, groups, warnings}`. It must not
+        return a value out of the database: not a title, not a password, not a
+        field name the file chose. `_candidate_summary` enforces that by
+        rebuilding the answer from a fixed key list, so a backend cannot leak
+        through this door even by accident, but the rule is here as well
+        because the enforcement is downstream of the mistake.
+
+        Refuses by default, for `build_new`'s reason.
+        """
+        raise Unsupported("this format cannot validate a candidate database")
+
+    @staticmethod
+    def _candidate_summary(summary):
+        """Rebuild a candidate summary from a FIXED key list. Never passthrough.
+
+        Invariant 1 of this class, applied to a verb that did not exist when it
+        was written: `entries` must never carry a password, and neither may
+        this. The helper's response scrubber is the other belt, but a summary
+        assembled here from known keys cannot carry an unknown one at all —
+        and "the backend returned a dict and we forwarded it" is how a `b64`
+        or a `value` key gets shipped to a browser one refactor from now.
+
+        Counts and format facts only. `warnings` are operator-facing sentences
+        the backends compose from constants; they are truncated, never quoted
+        from the file.
+        """
+        if not isinstance(summary, dict):
+            raise Internal("a backend returned a malformed candidate summary")
+        out = {
+            "format": _sanitize_detail(str(summary.get("format") or ""), 16),
+            "version": _sanitize_detail(str(summary.get("version") or ""), 16),
+            "cipher": _sanitize_detail(str(summary.get("cipher") or ""), 24),
+            "kdf": _sanitize_detail(str(summary.get("kdf") or ""), 24),
+            "entries": int(summary.get("entries") or 0),
+            "groups": int(summary.get("groups") or 0),
+            "warnings": [_sanitize_detail(str(w), 400)
+                         for w in list(summary.get("warnings") or [])[:16]],
+        }
+        return out
+
+    @classmethod
+    def inspect_bytes(cls, data):
+        """Header facts from staged bytes. **NO CREDENTIAL, and none needed.**
+
+        This is `probe()` for a file that is not a registered safe yet, and it
+        is what `import-inspect` answers with (C5 step 3): format, version,
+        cipher, KDF and its parameters, and whether a passphrase or a key file
+        will be wanted. Everything here is readable from the first few hundred
+        bytes by anyone holding the file — and the person who just uploaded it
+        holds the file — so there is nothing to protect and a great deal to
+        gain: an operator gets to confirm they staged the file they meant to
+        BEFORE they type a passphrase, rather than after.
+
+        It runs the `Limits` KDF clamps on the DECLARED parameters and refuses
+        an out-of-range file here, which is the whole point of doing it at this
+        step: a KDF bomb must be refused before an operator is asked for a
+        passphrase they would then wait minutes to be told was wrong (I7).
+
+        A caller must label the result for what it is. These are unauthenticated
+        header fields: nothing has verified them, a tampered file can say
+        anything, and the summary is a statement about what the file CLAIMS.
+        """
+        if isinstance(data, memoryview):
+            data = bytes(data)
+        if not isinstance(data, (bytes, bytearray)):
+            raise Invalid("the candidate is not a byte string")
+        data = bytes(data)
+        if len(data) > Limits.MAX_SAFE_BYTES:
+            raise Invalid("the candidate is %d bytes, over the %d byte limit"
+                          % (len(data), Limits.MAX_SAFE_BYTES))
+        cls.verify_structure(data)
+        facts = cls.header_facts(data)
+        if not isinstance(facts, dict):
+            raise Internal("a backend returned malformed header facts")
+        params = facts.get("kdf_params") or {}
+        return {
+            "format": _sanitize_detail(str(facts.get("format") or ""), 16),
+            "version": _sanitize_detail(str(facts.get("version") or ""), 16),
+            "cipher": _sanitize_detail(str(facts.get("cipher") or ""), 24),
+            "kdf": _sanitize_detail(str(facts.get("kdf") or ""), 24),
+            # Integers only, and by name: a KDF parameter block is a small map
+            # of numbers, and forwarding the backend's dict verbatim would
+            # forward the SALT, which is not secret but is also not something a
+            # browser has any use for.
+            "kdf_params": {k: int(params[k]) for k in
+                           ("memory_kib", "time", "parallelism", "rounds",
+                            "iterations")
+                           if isinstance(params.get(k), int)},
+            "needs_password": bool(facts.get("needs_password", True)),
+            "needs_keyfile": bool(facts.get("needs_keyfile", False)),
+            # Optional and BOOLEAN-COERCED, never passed through: a format that
+            # has no notion of compression omits it, and a format that does
+            # gets one bit rather than whatever object it was holding.
+            "compressed": (None if facts.get("compressed") is None
+                           else bool(facts.get("compressed"))),
+            "warnings": [_sanitize_detail(str(w), 400)
+                         for w in list(facts.get("warnings") or [])[:16]],
+        }
+
+    @classmethod
+    def header_facts(cls, data):
+        """Format hook for `inspect_bytes`. **Refuses by default.**
+
+        Returns the unauthenticated header of `data` as
+        `{format, version, cipher, kdf, kdf_params, needs_password,
+        needs_keyfile, warnings}`, plus an OPTIONAL `compressed` for a format
+        that has an answer to that (KDBX does; PWS3 has no such concept and
+        omits it, which `inspect_bytes` reports as null rather than false). Must need no key, must decrypt nothing, and
+        must not distinguish anything a credential would distinguish — it never
+        sees one.
+        """
+        raise Unsupported("this format cannot describe a database from its "
+                          "header alone")
+
     @abc.abstractmethod
     def save(self, *, override_stale=False):
         """Serialize and write the safe durably. The only method that writes.
@@ -2886,6 +3383,66 @@ def _unverified_writes(backend_dir=None):
                 if not any(n.endswith("verify_own_output") for n in called):
                     offenders.append("%s:%d %s.%s writes without a "
                                      "verify_own_output call"
+                                     % (src.name, fn.lineno, cls.name, fn.name))
+    return offenders
+
+
+def _unverified_creates(backend_dir=None):
+    """Every `build_new` in a Backend subclass that never re-reads what it built.
+
+    `_unverified_writes`' invariant, moved onto the creation primitive, for the
+    reason I41 exists at all: the rule was written into one backend and the
+    second backend reproduced the bug by omission, because nothing made the
+    omission visible. `create_new` is a new writer — the FIRST bytes of a safe
+    the operator is about to start trusting — and it has exactly the same way
+    to go wrong, with a worse consequence: `save()` at least leaves a working
+    file behind when it refuses, and a `create` that lands a file this program
+    cannot open leaves nothing to fall back to.
+
+    THE INVARIANT. A method named `build_new` on a class that inherits from
+    `Backend` must call something whose name ends in `verify_own_output`. As in
+    `_unverified_writes`, the suffix is matched rather than the exact name,
+    because `backends/kdbx.py` implements the identical guarantee as its own
+    private `_verify_own_output`.
+
+    What is deliberately NOT grepped for is the I22 round-trip guard, which
+    `build_new` is also required to run. The two backends spell it
+    `_assert_lossless` and `_ensure_lossless`, and a ban keyed on "a call whose
+    name contains lossless" would fire falsely on the first backend that named
+    it something else — and a ban that is wrong is a ban somebody switches off.
+    That half is proved by the backends' own self-checks instead, which build a
+    database the guard must refuse and assert that it does.
+    """
+    import pathlib
+    root = pathlib.Path(backend_dir or os.path.dirname(os.path.abspath(__file__)))
+    offenders = []
+    for src in sorted(root.glob("*.py")):
+        try:
+            tree = ast.parse(src.read_text(encoding="utf-8"), filename=str(src))
+        except SyntaxError as exc:                      # noqa: PERF203
+            offenders.append("%s:%s unparseable (%s)"
+                             % (src.name, exc.lineno, exc.msg))
+            continue
+        for cls in ast.walk(tree):
+            if not isinstance(cls, ast.ClassDef):
+                continue
+            bases = {ast.unparse(b).split(".")[-1] for b in cls.bases}
+            if "Backend" not in bases:
+                continue
+            for fn in cls.body:
+                if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                if fn.name != "build_new":
+                    continue
+                called = set()
+                for node in ast.walk(fn):
+                    if isinstance(node, ast.Call):
+                        f = node.func
+                        called.add(f.attr if isinstance(f, ast.Attribute)
+                                   else getattr(f, "id", ""))
+                if not any(n.endswith("verify_own_output") for n in called):
+                    offenders.append("%s:%d %s.%s builds a new database "
+                                     "without a verify_own_output call"
                                      % (src.name, fn.lineno, cls.name, fn.name))
     return offenders
 
@@ -3371,6 +3928,127 @@ def _selfcheck():                                       # noqa: C901
                      "        atomic_replace(self.path, self._serialize())\n")
         ok("the ban fires on a backend that forgot",
            len(_unverified_writes(planted)) == 1)
+
+        # ------------------------------- create / import primitives (C1-C7) --
+        print("\n== create_new and validate_candidate (C1-C7, I4, I6, I7) ==")
+
+        # C1 — the shapes that would make this an arbitrary-file-write
+        # primitive must not exist. Asserted against the SIGNATURES rather
+        # than described, because "no path parameter" is a property a later
+        # keyword argument can quietly remove.
+        import inspect as _inspect
+        for name in ("create_new", "build_new", "validate_candidate",
+                     "open_candidate", "inspect_bytes", "header_facts"):
+            params = set(_inspect.signature(
+                getattr(Backend, name)).parameters)
+            ok("%s takes no path-shaped parameter (C1, I4)" % name,
+               not (params & {"path", "dir", "dest", "destination",
+                              "target_path", "filename", "file"}))
+
+        raises("a backend with no build_new cannot create", Unsupported,
+               lambda: _StubBackend.create_new(credential="pw"))
+        # A backend that has not written `verify_structure` is refused one step
+        # earlier, which is also correct; `_WholeBytes` supplies that so the
+        # NEXT default in the chain is the one observed refusing.
+        raises("a backend with no open_candidate cannot import", Unsupported,
+               lambda: _WholeBytes.validate_candidate(b"\x00" * 64,
+                                                      credential="pw"))
+        raises("a backend with no header_facts cannot be inspected",
+               Unsupported, lambda: _WholeBytes.inspect_bytes(b"\x00" * 64))
+        raises("...and one with no verify_structure is refused sooner",
+               Unsupported,
+               lambda: _StubBackend.validate_candidate(b"\x00" * 64,
+                                                       credential="pw"))
+
+        # C7 — refusing an empty credential happens BEFORE the format hook, so
+        # even a backend that could build one never gets asked to.
+        raises("create_new refuses an empty passphrase (C7)", Invalid,
+               lambda: _StubBackend.create_new(credential=""))
+        raises("create_new refuses a null credential (C7)", Invalid,
+               lambda: _StubBackend.create_new(credential=None))
+        raises("create_new refuses an empty password/keyfile pair (C7)",
+               Invalid,
+               lambda: _StubBackend.create_new(
+                   credential={"password": "", "keyfile": b""}))
+
+        # The size cap is arithmetic on the declared length, before a parse.
+        raises("validate_candidate refuses an over-size candidate", Invalid,
+               lambda: _StubBackend.validate_candidate(
+                   b"x" * (Limits.MAX_SAFE_BYTES + 1), credential="pw"))
+        raises("validate_candidate refuses a non-byte candidate", Invalid,
+               lambda: _StubBackend.validate_candidate(1234, credential="pw"))
+        raises("validate_candidate refuses an empty candidate", Invalid,
+               lambda: _StubBackend.validate_candidate(b"", credential="pw"))
+
+        # The credential vocabulary fails closed on a key it does not know:
+        # `passphrase` must not silently become "no passphrase at all".
+        raises("an unknown credential field is invalid", Invalid,
+               lambda: _StubBackend.create_new(
+                   credential={"passphrase": "typo"}))
+
+        # Ownership: a Secret the caller passed in is NOT zeroed by the view;
+        # one minted from raw text IS. Getting this backwards either wipes the
+        # helper's request passphrase mid-verb or leaks one we made.
+        caller_owned = Secret("caller-owns-this")
+        with Backend.credential_view(caller_owned) as (pw, kf):
+            ok("a caller's Secret is passed through", pw is caller_owned)
+            ok("...with no key file", kf is None)
+        ok("a caller's Secret survives the view", not caller_owned.zeroed)
+        caller_owned.zero()
+        view = Backend.credential_view({"password": "minted-here"})
+        with view as (pw, kf):
+            minted = pw
+            ok("raw text is minted into a Secret", isinstance(pw, Secret))
+        ok("a minted Secret is zeroed on exit", minted.zeroed)
+
+        # The summary is REBUILT from a fixed key list, so a backend cannot
+        # leak a value through it even by returning one.
+        leaky = Backend._candidate_summary(
+            {"format": "kdbx", "version": "4.1", "cipher": "aes256",
+             "kdf": "argon2id", "entries": 3, "groups": 1, "warnings": [],
+             "password": "SENTINEL-DO-NOT-LEAK", "b64": "AAAA"})
+        ok("a candidate summary carries no key the ABC did not name",
+           set(leaky) == {"format", "version", "cipher", "kdf", "entries",
+                          "groups", "warnings"})
+        ok("...and no value from the backend's dict",
+           "SENTINEL-DO-NOT-LEAK" not in json.dumps(leaky))
+
+        # The write floors: a create may not go below what this program is
+        # willing to write, while a READ of the same numbers is fine.
+        Limits.check_argon2(Limits.ARGON2_WRITE_MIN_MEMORY_KIB,
+                            Limits.ARGON2_WRITE_MIN_TIME,
+                            Limits.ARGON2_WRITE_MIN_PARALLELISM,
+                            for_write=True)
+        ok("the Argon2 write floor admits its own minimum", True)
+        Limits.check_argon2(8192, 1, 1)
+        ok("...and a READ below it is still allowed", True)
+        raises("...but a WRITE below it is refused", Invalid,
+               lambda: Limits.check_argon2(8192, 1, 1, for_write=True))
+        raises("the default create cost is inside the ceilings", Invalid,
+               lambda: Limits.check_argon2(
+                   Limits.ARGON2_MAX_MEMORY_KIB + 1,
+                   Limits.ARGON2_DEFAULT_TIME,
+                   Limits.ARGON2_DEFAULT_PARALLELISM, for_write=True))
+        Limits.check_argon2(Limits.ARGON2_DEFAULT_MEMORY_KIB,
+                            Limits.ARGON2_DEFAULT_TIME,
+                            Limits.ARGON2_DEFAULT_PARALLELISM, for_write=True)
+        ok("the default create cost passes both ends of the clamp", True)
+        ok("the PWS3 create default is at or above the write floor",
+           Limits.PWS3_DEFAULT_ITER >= Limits.PWS3_WRITE_MIN_ITER)
+
+        # The I41-shaped ban, on the creation primitive this time.
+        offenders = _unverified_creates()
+        ok("no backend build_new returns without verify_own_output "
+           "(%d offender(s))" % len(offenders), not offenders)
+        for line in offenders:
+            print("        %s" % line)
+        with open(os.path.join(planted, "forgetful_create.py"), "w") as fh:
+            fh.write("class FourthBackend(Backend):\n"
+                     "    @classmethod\n"
+                     "    def build_new(cls, *, credential, options):\n"
+                     "        return cls._serialize(credential)\n")
+        ok("the create ban fires on a backend that forgot",
+           len(_unverified_creates(planted)) == 1)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -3425,6 +4103,20 @@ class _StubBackend(Backend):
     def save_as(self, target_path, *, override_stale=False):
         raise Unsupported("stub")
     def lock(self): return {"ok": True}
+
+
+class _WholeBytes(_StubBackend):
+    """A backend whose structural check passes, to isolate the hooks BELOW it.
+
+    `validate_candidate` and `inspect_bytes` both run `verify_structure` first,
+    so on a bare `_StubBackend` that default is what refuses and the hook under
+    test is never reached. This one supplies the structural half and nothing
+    else, so the self-check observes `open_candidate` / `header_facts` refusing
+    rather than a check two steps upstream of them."""
+
+    @staticmethod
+    def verify_structure(data):
+        return None
 
 
 class _ReadsBackFine(_StubBackend):

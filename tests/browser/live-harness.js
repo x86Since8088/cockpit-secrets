@@ -177,7 +177,11 @@ function Recorder(label) {
                     rec.state = "FAIL"; rec.why = why; bad++;
                     console.log("  \x1b[31mFAIL\x1b[0m  " + why);
                 },
-                done() { if (!rec.state) rec.state = "PASS"; return rec.state; }
+                /* `finished` is separate from `state` because an item whose
+                 * function THREW never gets here — and a reporter that defaults
+                 * a null state to PASS then reports green for work that did not
+                 * happen. Measured, on live-registry.spec.js's first run. */
+                done() { rec.finished = true; if (!rec.state) rec.state = "PASS"; return rec.state; }
             };
         },
         summary() { return { checks, bad, items }; }

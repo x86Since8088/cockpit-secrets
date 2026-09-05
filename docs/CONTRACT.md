@@ -9,7 +9,9 @@ argv.**
 - Every verb prints **exactly one JSON object on stdout and nothing else**. Diagnostics go to
   stderr. Exit 0 = success; on failure stdout carries `{"error": "..."}` and exit ≠ 0. The one
   exception is `open`, which is a session and writes one object per request line — that is
-  what makes it the only verb dispatched separately.
+  what makes it the only verb dispatched separately. **`safe-import` is deliberately not a
+  second one:** its five steps are five ordinary verbs tied together by a staging token, so a
+  128 MiB upload does not need a channel held open for its whole life.
 - The UI renders nothing it invented: every form, control, validation rule and label comes
   from `secrets-admin schema`.
 - **No verb accepts a secret as an argument.** Passwords, key-file bytes and new values are
@@ -18,6 +20,17 @@ argv.**
 **This file is the interface, and the whole build coordinates through it.** Where it and the
 `schema` verb disagree, the schema is what the page actually reads — so a disagreement is a
 bug in this file and gets fixed here, not worked around there. Schema version 2; helper 1.0.0.
+
+> **One qualification learned by cross-checking the two, which a reader needs before trusting
+> either.** The `schema` verb's `response` map is a *summary for a form renderer*, and for
+> several verbs it is deliberately shorter than what the verb actually prints — `strength`
+> returns six keys the schema does not name, `export` returns `mode` and `warning`, `health`
+> returns eleven top-level keys the schema abbreviates to five. So: **the schema is
+> authoritative for `request` fields** (that is what the page builds forms from, and what
+> `validate.sh`'s I4 ban scans), and **this document is authoritative for `response` keys.** A
+> response key named here and absent from the schema is not necessarily a lag; a *request*
+> field named here and absent from the schema always is. The current list of both is at the
+> end of this file.
 
 ## Invocation
 
@@ -75,16 +88,36 @@ Verbs take a registry **id**; there is no verb that opens a caller-supplied path
   "export_allowed": false,              // I21
   "export_dir": null,                   // I21 — absolute, never under /tmp
   "breach_corpus": null,                // absolute path to an OFFLINE corpus
-  "backup": { "keep": 10, "dir": null }
+  "backup": { "keep": 10, "dir": null },
+
+  "origin": "manual",                   // "manual" | "created" | "imported" — a RECORD
+  "created_utc": null,                  // when safe-create/safe-import wrote THIS ENTRY
+  "source": null                        // header summary read at import; not re-verified
 }
 ```
 
-Those sixteen keys are the whole vocabulary. `export_dir` and `breach_corpus` were the last
-two added, with the verbs below; both are helper-side absolute paths, never a path from a
-request (I4). `export_dir` is refused under `/tmp`, `/var/tmp` and `/dev/shm`, and setting it
-while `export_allowed` is false is refused rather than ignored — the two are one decision.
-`breach_corpus` names an offline file and nothing else: **there is no online fallback and there
-will not be one.**
+Those nineteen keys are the whole vocabulary. `export_dir` and `breach_corpus` are
+helper-side absolute paths, never a path from a request (I4). `export_dir` is refused under
+`/tmp`, `/var/tmp` and `/dev/shm`, and setting it while `export_allowed` is false is refused
+rather than ignored — the two are one decision. `breach_corpus` names an offline file and
+nothing else: **there is no online fallback and there will not be one.**
+
+`origin`, `created_utc` and `source` were the last three added, with the registry-writing
+verbs below. All three are **records, never permissions** — nothing is keyed on them,
+and the backend reads the real header on every unlock rather than trusting `source`. The one
+that invites a wrong assumption is `origin`: hand-writing `"origin": "created"` does **not**
+persuade `safe-delete` to destroy a file. That gate is *derived* — the entry's `path` must
+equal the path this program would mint for this id and access class today — precisely so a
+field an operator can edit cannot talk the helper into an `unlink`.
+
+`source.sha256_at_import` deserves its own sentence because it looks like an integrity check
+and is not one: it is the digest of the bytes **as uploaded**, it stops matching the moment
+the safe is first saved, and that is correct. It answers "is this the file I uploaded" at
+adoption time. Nothing later.
+
+An entry written before 0.4.0 carries none of the three, which reads as `manual` / `null` /
+`null` — the honest answer for a file this program did not write. Because all three are
+optional, adding them to the schema does not disturb one existing entry.
 
 ### An unknown key drops the entry
 
@@ -100,17 +133,84 @@ lost the whole entry on a host whose schema file lagged. It is **gone**, along w
 `registry_drift` key `health` used to report it through. The remedy for a helper that gains a
 field is to ship the schema file with it, which is what `install.sh` does.
 
+### The per-user registry — the one trust-model change in 0.4.0
+
+Root owns `/etc/cockpit-secrets/safes.d/`, so an unprivileged user cannot register a safe
+there, so before 0.4.0 they could not have one at all without an administrator. The second
+registry is what makes `safe-create` and `safe-import` usable by a normal user:
+
+| | system registry | per-user registry |
+|---|---|---|
+| Path | `/etc/cockpit-secrets/safes.d/*.json` | `~/.config/cockpit-secrets/safes.d/*.json` |
+| Directory | `0755 root:root` | `0700`, owned by that user |
+| Files | `0644 root:root` | `0600`, owned by that user |
+| Read when | always | **only when `euid != 0`** |
+| Access class | as written; omitted ⇒ `admin` | **forced to `user`**, whatever the file says |
+| Written by | hand, and `safe-create` / `safe-import` for an admin-class safe | hand, and `safe-create` / `safe-import` for a user-class safe |
+
+Both are validated by the same `schema/safe-registry.schema.json`. Five rules, all enforced in
+the helper, none of them optional:
+
+1. **A root-mode helper does not open it.** Not to merge it, not to fall back to it, not to
+   report on it. There is no code path in which a root process parses JSON out of a directory
+   an unprivileged user can write. This is rule 1 because rules 2–5 are consolation prizes if
+   it is ever broken.
+2. **Every entry loaded from it is forced to `access: "user"`.** An entry declaring `"admin"`
+   is not honoured, not silently corrected, and not partially applied: it is **dropped and
+   logged** into `health.registry_errors[]`. A file the user can write must never be the file
+   that names its own access class.
+3. **Its `path` must satisfy exactly what `open_safe_fd` already enforces** — a regular file
+   the calling user owns, `0600`, opened `O_NOFOLLOW` and `fstat`ed on the returned fd, with
+   no group- or other-writable directory above it (I5). The entry naming a file grants
+   nothing; the fd's `fstat` decides.
+4. **The directory and its files must be owned by that user and not group- or other-writable,
+   or the whole per-user registry is refused** — the same fail-closed rule as the system one.
+   Refused means no entry from it loads, not "the bad ones are skipped".
+5. **A system entry wins an id collision, and the shadowed per-user entry is reported as an
+   error** in `health.registry_errors[]` with a distinct reason. Never silently preferred,
+   never silently dropped: "the safe you opened is not the one you registered" has to be
+   visible.
+
+`health` reports the two registries separately under **`registry_sources`** — the system
+registry's directory, entry count and errors, and the same for the per-user one. On the root
+path the per-user half is reported as **`null` and says so**, rather than being omitted: "this
+helper did not read one" and "there was nothing to read" are different answers, and rule 1 is
+the reason for the first.
+
+**The safety argument, which is the whole justification and is repeated in a comment beside
+the loader.** Reading this file grants the user no access they did not already have. The
+helper is running *as them*, unescalated, and rule 3 means it will only ever open a file they
+own, `0600`, that they could have read with `cat` anyway. The registry does not confer a
+capability — it tells a program the user is already driving which of their own files to open.
+**It is a convenience surface, not a privilege surface.** That argument depends on rules 1–4
+in their entirety; relax any one and it stops holding, which is why the comment says so at the
+place a future change would be made.
+
+One asymmetry falls out of rule 1 and is stated rather than hidden: a user creating a
+user-class safe *can* read the system registry, so `safe-create` refuses a colliding id up
+front with `conflict`. An administrator creating a system-class safe *cannot* read any
+per-user registry, so it cannot check — that collision surfaces later, by rule 5, in the
+affected user's own `health` output. An unreadable directory is worth more than a checkable
+one.
+
+There is **no host-wide switch to disable per-user registries** in 0.4.0. It cannot live in
+the registry itself (a setting stored where the user can write it is not a setting); it would
+need a root-owned policy file the unescalated helper reads and obeys, and that file does not
+exist. Named here as a gap rather than described as a decision.
+
 ## Verbs
 
-Thirty-three verbs. `schema` publishes all of them with their request fields, response keys,
+Forty-one verbs — the thirty-three below plus the eight registry-writing ones added in
+0.4.0 (`safe-create`, the five `import-*` steps, `safe-forget`, `safe-delete`). `schema` publishes all of them with their request fields, response keys,
 `danger`/`mutates`/`needs` flags and a `breaks_when_wrong` sentence each; the tables here are
 the prose, and the schema is the machine-readable form the page builds from.
 
 ```
-secrets-admin schema                  -> { version, verbs[], groups[], fields[], enums{},
-                                           constants{}, ui_rules[] }
+secrets-admin schema                  -> { version, helper_version, base_version, verbs[],
+                                           groups[], fields[], enums{}, constants{},
+                                           ui_rules[] }
 secrets-admin list                    -> { safes:[{id,label,format,access,mode,locked,reason,
-                                           usable}] }
+                                           usable,registry,origin,manageable}] }
 secrets-admin probe    <stdin:{safe}> -> { format, version, kdf, iterations, needs_password,
                                            needs_keyfile, writable, needs_challenge,
                                            challenge_b64, yubikey_slot, warnings:[] }
@@ -142,9 +242,14 @@ secrets-admin lock     <stdin:{handle|safe}>
                                       -> { ok:true, locked, agent_dropped? }
 secrets-admin generate <stdin:{policy}>  -> { value, entropy_bits, calculation,
                                               alphabet_size }
-secrets-admin health                     -> { backends:{kdbx:…, psafe3:…}, registry_errors:[],
-                                              registry_gate:{…}, agent:{…}, export:{…},
-                                              breach:{…}, hardening:{…}, state:{…} }
+secrets-admin health                     -> { version, base_version, schema_version,
+                                              backends:{kdbx:…, psafe3:…}, registry_errors:[],
+                                              registry_root, registry_entries,
+                                              registry_gate:{…}, registry_sources:{…},
+                                              import_staging:{…}, agent:{…},
+                                              export:{…}, breach:{…}, library_root,
+                                              library_root_trusted, identity:{…},
+                                              hardening:{…}, state:{…}, policy:{…}, debug }
 secrets-admin audit-tail --n N           -> { entries:[…] }        # metadata only, never values
 ```
 
@@ -172,14 +277,15 @@ secrets-admin save-as    <stdin:{…, name, override_stale}>  -> { ok:true, path
 secrets-admin backups    <stdin:{safe}>
                         -> { safe, dir, keep, total, backups:[{name,when,size}] }
 secrets-admin restore-backup <stdin:{safe, name, override_stale}>
-                        -> { ok:true, restored, bytes, backup, created }
+                        -> { ok:true, restored, bytes, backup, created, undo, ring_full }
 secrets-admin export     <stdin:{safe, credentials, fmt, confirm}>
                         -> { path, bytes, entries, fmt, name, mode:"0600", warning }
 secrets-admin strength   <stdin:{value}>
-                        -> { entropy_bits, effective_bits, category, guessable_length,
-                             weaknesses:[{id,label,cost_bits}], calculation }
+                        -> { length, guessable_length, alphabet_size, entropy_bits,
+                             effective_bits, penalty_bits, category,
+                             weaknesses:[{id,label,cost_bits}], calculation, source, note }
 secrets-admin breach-check <stdin:{safe, value|sha1_prefix}>
-                        -> { available, found:bool|null, count, prefix5, method,
+                        -> { available, found:bool|null, count, prefix5, method, reason?,
                              network:"none", offline_only:true }
 ```
 
@@ -252,6 +358,461 @@ attach-list <stdin:{handle|safe+credentials, uuid}>
   declaring an older format version simply has no such fields and lists nothing; it is
   `attach-add` that refuses, naming the version, because a version is a reason not to WRITE and
   not a reason to misreport what the file already contains.
+
+## The verbs that WRITE the registry — `safe-create`, `import-*`, `safe-forget`, `safe-delete`
+
+Everything above this line reads the registry. These eight write it — `safe-create`, the five
+`import-*` steps, `safe-forget` and `safe-delete` — and that is a different
+kind of verb: **the registry is this program's trust root.** It says which files are safes,
+where they live, and what access class each one has; every other control — the class gate, the
+`fstat` ownership check, the backup ring, the export gate — is downstream of an entry these
+verbs now produce. Letting a browser request reach it is the most dangerous change in the
+project, and the shapes below are the reason it is survivable rather than a footnote to it.
+
+Three constraints run through all of them and are not negotiable per-verb:
+
+- **C1 · The path is minted by the helper, never supplied by the caller.** The caller sends an
+  `id`. The helper derives the file name from that id and the managed directory for that
+  access class. **There is no request field in any of these verbs that is a path, a file name,
+  a directory, or a component of one** (I4) — which is also why `validate.sh`'s I4 ban, which
+  scans the live `schema` verb for a request field named `path`/`dir`/`dest`/`filename`/…,
+  keeps passing after this change.
+
+  | access class | managed safe directory | minted safe path | minted registry entry |
+  |---|---|---|---|
+  | `admin` | `/etc/cockpit-secrets/safes/` `0700 root:root` | `<dir>/<id>.<ext>` `0600 root:root` | `/etc/cockpit-secrets/safes.d/50-<id>.json` `0644 root:root` |
+  | `user` | `~/.local/share/cockpit-secrets/safes/` `0700 <user>` | `<dir>/<id>.<ext>` `0600 <user>` | `~/.config/cockpit-secrets/safes.d/50-<id>.json` `0600 <user>` |
+
+  `<ext>` is `kdbx` or `psafe3`, chosen from the `format` enum — not from the request's text.
+  The `50-` prefix leaves room below it for the hand-written entries operators already have
+  and keeps the load order visible.
+
+- **C2 · The id is checked against a hard allow-list before it reaches any filesystem call.**
+  `^[a-z0-9][a-z0-9-]{1,62}$`, published as `constants.new_id_pattern`. Lower case, digits,
+  hyphen; no dot, no slash, no NUL, no leading hyphen, no Unicode, minimum two characters.
+  Anything else is `invalid` **before** a path is built from it. An id already present in the
+  registry, or whose minted path or minted entry file already exists on disk, is `conflict`.
+  **Neither is ever overwritten.**
+
+  This is deliberately stricter than the registry schema's own `id` pattern, which still
+  accepts `.` and `_` because entries written by hand before 0.4.0 use them. Tightening the
+  schema would drop those entries — silently deleting a working safe from an operator's list
+  on upgrade. So: the loose pattern is what the loader will *read*, the strict one is what
+  these verbs will *mint*.
+
+- **C3 · Admin is still the default.** A create or import with no `access` makes an
+  **admin-class** safe and needs the admin gate exactly like every other admin verb: `euid ==
+  0` and the real caller in an admin group (I1, I3). Two refusals fall straight out of the
+  per-user registry's rule 1:
+  - `access: "admin"` with `euid != 0` → `access-denied`.
+  - `access: "user"` with `euid == 0` → `invalid`, detail "call this without escalation". A
+    root helper must not write into a user's home directory, and it must not open the per-user
+    registry to check what is already there. An administrator who wants a user-class entry in
+    the *system* registry still writes it by hand, as before.
+
+#### The request fields these verbs add
+
+`schema.fields[]` gains thirteen entries. **Not one of them is a path, a file name, a directory
+or a component of one** — check that against `validate.sh`'s I4 ban, which reads the live
+schema and fails on a request field called `path`, `dir`, `dest`, `destination`,
+`target_path`, `filename` or `file`. Two existing fields are reused unchanged (`keyfile_b64`, `safe`).
+
+**`new_password` is a separate field from `password`, and that is not cosmetic.** `password`
+means "the credential that opens a REGISTERED safe", and three promises are attached to that
+meaning: the I16 lockout counts it, the per-safe rate cap bounds it, and a failure against it
+waits out `Limits.FAIL_FLOOR_SECONDS`. None of the three applies to a passphrase being SET on a
+safe that does not exist yet, or tried against a file the caller uploaded and still holds — so
+calling it `password` would attach three guarantees this code does not keep.
+`tests/integration/lockout.py` builds its list of credential-bearing verbs by asking the schema
+which verbs declare `password`; that list stays true because these verbs honestly do not.
+
+**`delete_confirm` is a separate field from `export`'s `confirm` for the same kind of reason,**
+and getting that wrong was a real defect (I49): the verb read `confirm` while the schema
+published `delete_confirm`, so through the published interface `safe-delete` could never
+succeed and it destroyed on a field nobody had been told about.
+`tests/ban_undeclared_fields.py` is now a standing gate: it walks the helper's AST, builds a
+call graph, and refuses any verb that can reach a `req.get("x")` its own published request does
+not declare.
+
+| field | type / control | secret | used by |
+|---|---|---|---|
+| `id` | string / text | no | all four groups. The registry id — **not** a file name |
+| `label` | string / text | no | `safe-create`, `import-begin` |
+| `access` | string / select (`access` enum) | no | `safe-create`, `import-begin`. Omitted ⇒ `admin` |
+| `mode` | string / select (`mode` enum) | no | `safe-create`, `import-begin`. Omitted ⇒ `rw` |
+| `format` | string / select (`format` enum) | no | `safe-create`; `import-commit`, where it must equal what inspect reported |
+| `total_bytes` | integer / number | no | `import-begin` |
+| `sha256` | string / text | no | `import-begin`. 64 lower-case hex characters |
+| `staging` | string / hidden | no | every `import-*` after `begin`. Opaque, uid-bound, **never a location** |
+| `chunk_offset` | integer / number | no | `import-chunk`. The absolute byte offset of this chunk, which must equal the `received` the previous reply reported |
+| `chunk_b64` | string / file-bytes | **no** | `import-chunk`. Base64 of one chunk of the ENCRYPTED database. Deliberately not `secret`: the uploader holds the file |
+| `kdf` | object | no | `safe-create`. One sub-object, not three flat fields: `{memory_kib, time, parallelism}` for KDBX and `{iterations}` for PWS3, each optional and bounded on both sides |
+| `make_keyfile` | bool / toggle | no | `safe-create`. Generate a key file as a SECOND factor; it is returned once and stored nowhere |
+| `new_password` | string / password | **yes** | `safe-create`, `import-commit`. A SEPARATE field from `password` on purpose — see below |
+| `delete_confirm` | string / text | no | `safe-delete`. `delete-safe:<id>`, compared in constant time |
+
+`staging` is declared `secret: false` on purpose, and the reasoning is the same as `handle`'s
+being `secret: true` is: a handle can be presented to read a decrypted value, so it is treated
+as key-adjacent, while a staging token names an encrypted blob the presenter already uploaded.
+It is still uid-bound, still never persisted in the browser (rule 2 applies to the whole page,
+not only to fields flagged secret), and still answers `access-denied` — not `not-found` — to
+anyone else.
+
+### `safe-create` — a new, empty safe
+
+```
+secrets-admin safe-create <stdin:{id, label, format, access, new_password,
+                                  keyfile_b64, make_keyfile, kdf}>
+    -> { ok:true, safe:{…exactly as `list` reports it…}, registry:"system"|"user",
+         bytes, format, kdf:{…}, strength:{entropy_bits, effective_bits, category,
+         weaknesses:[…]}, keyfile_b64 (ONLY when make_keyfile),
+         keyfile_warning (same condition) }
+```
+
+- `format` is required and is one of the `format` enum. A created KDBX is **KDBX 4.1** with
+  AES-256 and Argon2id at 64 MiB / t=8 / p=2; a created PWS3 is written at
+  `Limits.PWS3_WRITE_MIN_ITER`. It is **never** KDBX 3.x — that format has no authenticated
+  encryption (I20) and this program does not create one.
+- The KDF costs — `kdf: {memory_kib, time, parallelism}` for KDBX, `kdf: {iterations}` for
+  PWS3 — are the only tuning a request may carry, they are optional, and they are **bounded on
+  both sides**. The floors are `Limits`' OWN Argon2 write floors (OWASP's m=19 MiB, t=2, p=1)
+  and the PWS3 write floor (262 144), and the ceilings are the `Limits` clamps re-checked by
+  `Limits.check_argon2(..., for_write=True)` before the derivation (I7). The floor the schema
+  PUBLISHES as `min` is the floor the backend ENFORCES — they were once independent, and a
+  published bound that is not the enforced bound is worse than none. They are integers, not paths, so C1 is untouched; the cipher, the KDF
+  algorithm and the PWS3 iteration count are **not** settable at all. There is no request
+  that mints a deliberately weak safe.
+- **The credential arrives on stdin like every other credential** (I10): `new_password`, and
+  `keyfile_b64` for a KDBX key file (or `make_keyfile: true` to have one generated, returned
+  ONCE and stored nowhere). Creating with an **empty passphrase and no key file is
+  refused** (`invalid`) — that is not a configuration, it is an unlocked file.
+  `keyfile_b64` on a `psafe3` create is `unsupported`, naming the format's limit.
+- **The passphrase's strength is reported and never enforced.** `strength` runs on the chosen
+  passphrase and its verdict rides in the response so the page can say "this is weak". It does
+  not refuse. Choosing a passphrase is the operator's decision; telling them what they chose
+  is ours.
+- `mode` is optional and defaults to `"rw"`. `yubikey_slot`, `groups`, `agent`,
+  `export_allowed`, `keyfile` (the registry's helper-side path, as distinct from the
+  `keyfile_b64` used to create) and `breach_corpus` are **not** settable here — they are
+  edited into the entry afterwards, by hand or by root. A verb that could set `groups` would
+  be a verb that widens who may open a safe.
+- Order of operations, and it is the order that matters:
+  1. validate `id` (C2), resolve the access class and run its gate (C3);
+  2. refuse a colliding id, minted path, or minted entry file (`conflict`);
+  3. build the database in memory and write it to the minted path through the ordinary atomic
+     path — temp file in the same directory, `O_EXCL`, `0600`, `fsync`, `os.replace`,
+     `fsync(dir)` (I12);
+  4. **re-open the file that landed, through the same reader a later unlock will use, with the
+     same credential** (I24/I41). If it does not open, `unlink` it and answer `internal` — a
+     safe nobody can unlock must not become a registry entry;
+  5. validate the entry against `schema/safe-registry.schema.json` and only then write it
+     atomically (C6 below).
+
+  Nothing is registered until step 5, so every failure before it leaves the host exactly as it
+  was. If step 4 fails *and* the `unlink` also fails, the response is still an error and the
+  orphaned file is named in the `detail` — an unreferenced file is harmless, an unreported one
+  is not.
+
+### `safe-import` — adopt an existing safe, encrypted bytes first
+
+**Five ordinary verbs, not a session.** One request in, one JSON object out, `cockpit.spawn`
+per step, exactly like everything else. A safe is up to 128 MiB and one request is capped at
+1 MiB, so an upload is necessarily chunked, and the chunks are reassembled in a **staging
+directory that outlives the helper process** — which is what makes the steps separate verbs
+rather than frames in one held-open channel, and what makes the idle timer, the sweep and the
+per-caller staging limit meaningful rather than decorative.
+
+```
+secrets-admin import-begin   <stdin:{id, label, format, access, total_bytes, sha256}>
+    -> { ok:true, staging, chunk_bytes, total_bytes, received:0, expires_in, next }
+
+secrets-admin import-chunk   <stdin:{staging, chunk_offset, chunk_b64}>
+    -> { ok:true, received, total_bytes, remaining, complete, next }
+
+secrets-admin import-inspect <stdin:{staging}>
+    -> { ok:true, staging, id, label, access, bytes, sha256_ok:true,
+         authenticated:false, format, version, cipher, kdf, kdf_params:{…},
+         iterations, compressed (kdbx only), needs_password, needs_keyfile,
+         warnings:[], note, next }
+
+secrets-admin import-commit  <stdin:{staging, new_password, keyfile_b64}>
+    -> { ok:true, safe:{…as `list` reports it…}, registry, bytes, format,
+         entries_total, groups_total, warnings:[] }
+
+secrets-admin import-abort   <stdin:{staging}>
+    -> { ok:true, dropped, id, discarded_bytes }
+```
+
+#### The `staging` token
+
+`import-begin` mints it and every later step is addressed by it. It is an opaque
+128-bit random token — `secrets.token_urlsafe(16)`, the same minting as a `handle` — **bound
+to `(real uid, id, access class)`**, and it is the only thing that ties five separate
+invocations into one upload. Rules it keeps, and they are the handle's rules for the handle's
+reasons:
+
+- **Presenting a staging token you do not own is `access-denied`, not `not-found`** —
+  distinguishing them would turn these verbs into an oracle for which uploads exist.
+- **It is not a credential and it opens nothing.** It names an encrypted blob and a declared
+  id. Everything it can do still runs the access gate from kernel identity on every verb.
+- **It is never a path.** The staging directory's name is derived from it helper-side; the
+  token itself never reaches the response as a location, and no request field carries one (C1).
+- One caller may hold `constants.import_max_stagings` (8) at once; the ninth `begin` is
+  `conflict` naming the limit.
+
+One honesty note, the same one the agent's `SO_PEERCRED` carries: **for the admin class the
+helper runs as root, so the staging root cannot tell two administrators apart.** An
+admin-class staging is visible to any administrator who can list `/var/lib/cockpit-secrets/
+state/import/`. It contains an encrypted safe file that its uploader already possessed, and
+root is out of scope in THREAT-MODEL.md — but "only the operator who started it can see it" is
+a claim this design does **not** make for the admin class.
+
+#### The ordering is a requirement, not a preference: bytes first, credential last
+
+**No credential travels before `import-commit`.** Not in `begin`, not in any `chunk`,
+not in `inspect`. `new_password` and `keyfile_b64` are legal fields on `import-commit` and on
+no other verb in this group; sending either earlier is **`invalid`, naming the field** — not
+tolerated-and-ignored.
+
+That refusal is enforced in the DISPATCHER, not in the three verbs, and the difference matters
+(I50). It was once true only that those verbs never READ a credential, which is not the same
+as refusing one: they accepted `password`, `new_password`, `keyfile_b64` and `passphrase` and
+answered `ok`, so the whole guarantee lived in `secrets.js` where any other client — or a
+reordering of the page's steps — could undo it. `run_verb` now refuses a credential-bearing key
+that the verb's OWN declared request does not list, so a verb written next year gets the
+refusal without anybody adding a line.
+
+Two reasons the ordering is fixed here rather than left to the page:
+
+- **A large upload takes visible time.** Collecting the passphrase in the file-picker step
+  means holding it in browser memory for the whole transfer — exactly the window I11 and I14
+  exist to shrink. Prompting after the bytes are staged means it exists for one request.
+- **The header of a KDBX or PWS3 file is not secret.** Format, version, cipher, KDF and its
+  parameters are readable from the bytes by anyone who holds the file, and the person
+  uploading it holds the file. So `import-inspect` can report all of it with **no credential
+  at all**, and the operator confirms they uploaded the file they meant to *before* they type
+  anything. The page must label that summary as what it is: **read from an unauthenticated
+  header** — the response says `authenticated: false` for exactly this reason, and on a
+  tampered file the summary is what the tamperer wrote.
+
+#### Step by step
+
+**`import-begin`** — declares `id`, `label`, `access` (omitted ⇒ `admin`, C3), optional
+`mode`, `total_bytes` and `sha256` (lower-case hex, 64 characters, of the **whole** file). No
+credential. It:
+
+- validates the id (C2) and runs the access gate (C3);
+- refuses a colliding id / minted path / minted entry file with `conflict`;
+- **refuses a `total_bytes` over `Limits.MAX_SAFE_BYTES` (128 MiB) before a single byte
+  arrives** — a declared size is checkable for free and there is no reason to receive 4 GiB
+  before saying no;
+- creates the staging directory: `<staging root>/<32 hex characters>/`, `mkdir` `0700`
+  (atomic, `EEXIST` is a refusal), containing one file opened
+  `O_CREAT|O_EXCL|O_WRONLY|O_NOFOLLOW`, `0600`. **Never the final path. Never `/tmp`.**
+
+  | access class | staging root |
+  |---|---|
+  | `admin` | `/var/lib/cockpit-secrets/state/import/` `0700 root:root` |
+  | `user` | `~/.local/state/cockpit-secrets/state/import/` `0700 <user>` |
+
+  Staging is deliberately *not* required to share a filesystem with the managed safe
+  directory: commit copies the staged bytes through the ordinary temp-file-in-the-target-
+  directory path (I12), so `os.replace` is always intra-filesystem and this never depends on
+  how the host is partitioned.
+
+It mints and returns the `staging` token. There is no way to add a second file to a staging:
+one staging is one safe.
+
+**`import-chunk`** — `staging`, `offset` (decoded byte offset, which must equal the bytes
+received so far) and `data_b64`. No credential. The cap is enforced **incrementally, as each chunk arrives, never
+after**: a chunk that would take the total past the declared `total_bytes`, or past
+`MAX_SAFE_BYTES`, is refused and the chunk is not written. The reply's `chunk_bytes` is 512 KiB
+decoded, published in `constants.import_chunk_bytes`; the ceiling that actually bites is
+`MAX_REQUEST_BYTES` (1 MiB for the whole JSON frame) and base64 costs a third, so 512 KiB
+leaves headroom for the framing. An out-of-order `offset` is `invalid` and changes nothing —
+this is a stream, not a random-access file. Every accepted chunk resets the staging's idle
+clock, which is what "measured from its last use" means.
+
+**`import-inspect`** — `staging`, and nothing else. No credential. In order:
+
+1. the received length must equal the declared `total_bytes`;
+2. the SHA-256 of the reassembled file must equal the declared `sha256`, compared with
+   `hmac.compare_digest`;
+3. the first bytes must match **exactly one of the two signatures this program knows** — KDBX
+   `0x9AA2D903` or PWS3 `"PWS3"`. This is a two-way exact discriminator over known constants,
+   not format guessing: bytes that are neither are refused here and no parser sees them;
+4. the unauthenticated header is parsed, and only the header;
+5. **the `Limits` KDF clamps are applied to the DECLARED parameters now** — `check_argon2`,
+   `check_aeskdf_rounds`, `check_pws3_iter` — so a KDF bomb is refused before anyone is asked
+   for a passphrase they would then wait minutes for (I7).
+
+Any of those failing refuses the import **and destroys the staging**, because the bytes have
+been shown not to be a safe of a format we support and there is nothing to retry against.
+`import-inspect` is otherwise idempotent and may be repeated.
+
+**`import-commit`** — **the credential arrives here, on stdin, for the first time.**
+`staging`; `format`, the format the operator confirmed, which must equal what
+`import-inspect` reported (else `invalid`); and `password` / `keyfile_b64`, the
+credential. It:
+
+1. re-runs the access gate — the class is re-checked on **this** verb, from kernel identity,
+   exactly as on every other verb, and never taken from what `begin` recorded;
+2. **parses the staged file with the real backend and requires the credential to open it.**
+   This is what stops the verb being an arbitrary-write primitive: **the only bytes that can
+   ever land are bytes that are demonstrably a safe the uploader can already open.** A file
+   that does not open does not land;
+3. copies the staged bytes into the minted path through the ordinary atomic write (I12);
+4. re-opens the file that landed, with the same credential, through the same reader a later
+   unlock will use (I24/I41) — if it does not open, `unlink` and refuse;
+5. validates and atomically writes the registry entry, with `origin: "imported"`,
+   `created_utc`, and the `source` block recording what step 4 of `import-inspect` read;
+6. destroys the staging.
+
+`id`, `label` and `access` are fixed by `import-begin` and **cannot be changed by
+`import-commit`** — a commit that could restate the access class would be a way to upload
+as a user and register as an administrator. They are not request fields on `commit` at all,
+which is stronger than validating them there.
+
+**A wrong passphrase at commit does NOT destroy the staging.** Re-uploading 100 MiB because of
+a typo is a bug, not a security control: the verb answers `bad-credential`, the staged bytes
+stay, and the `detail` names how many attempts are left (a count is not a secret). The budget
+is `constants.import_max_attempts` (5) failed attempts **per staging**, after which the
+staging is destroyed and the token answers `invalid` naming the exhausted budget.
+
+> **Why that budget exists, written down so nobody mistakes it for something else.**
+> Rate-limiting this guess is **theatre**. The person who uploaded the file *has* the file;
+> they can guess against their own copy, offline, on their own hardware, as fast as they like,
+> and nothing this host does changes that. What is **not** theatre is that every attempt costs
+> *this machine* one full KDF derivation at parameters the uploaded file chose. So the attempt
+> budget and the idle expiry are **resource controls on this host, not credential controls on
+> that file**, and the code says so at the counter.
+>
+> The I16 unlock lockout is deliberately **not** wired in here, and this is the distinction
+> I16 would otherwise blur. I16 counts failures per `(real uid, registry safe id)` against a
+> safe that *exists*; during an import the id is not in the registry yet, so consulting it
+> would (a) let anyone poison the lockout counter of an id a real safe later takes, and (b)
+> hand the operator a resource control wearing the vocabulary of a credential control.
+> **`import-commit` therefore never returns `locked-out`.** Exhausting the budget is
+> `invalid`, and the detail says "attempt budget", not "locked out".
+
+**`import-abort`** — `staging`, and it destroys it. It is the explicit half of something
+that also happens on its own: **staging is destroyed on every failure path, on a successful
+commit, and on the idle timer** (`constants.import_idle_seconds`, 900 s, measured from its
+**last use** and not from the begin).
+
+Because staging outlives the helper process, **a dropped Cockpit channel does not clean it
+up** — say that plainly rather than implying the process model does the work here as it does
+everywhere else. Closing the tab mid-upload leaves an encrypted blob on disk until the idle
+timer reaps it. The page should call `import-abort` when the operator cancels; the timer
+is what covers the case where it cannot.
+
+So **stale staging is swept**: on **every verb of any kind**, because the sweep lives in
+`init_state` rather than in the import verbs — a `health` or a `list` cleans up too. It is
+reported by **`health.import_staging`** —
+`{dir, staged, idle_seconds, chunk_bytes, max_bytes, max_attempts, max_concurrent, reason}` —
+so an operator can answer "is anything staged, and what are the limits" with no credential.
+It reports a **count and never a token**: a staging token plus the right uid is what
+`import-commit` needs, so `health` is a diagnostic and not a place to hand them out.
+
+The sweep removes only entries under the staging root, only names matching the 32-hex token
+shape, only entries that are **actually directories** — a symlink wearing a token's name is
+skipped rather than followed, and its two files are unlinked through a descriptor on the
+directory rather than by path, so nothing outside the root is reachable even by name (I53) —
+and only ones unused for longer than `constants.import_idle_seconds` (900 s).
+
+Two bounds, and they count different things. `constants.import_max_stagings` (8) is how many
+stagings one caller may **hold**. `constants.import_max_concurrent` (2) is how many
+`import-inspect` / `import-commit` calls may be **running** at once, per identity, taken as a
+non-blocking `flock` on a slot file inside the staging root. Nothing counted the second until
+0.4.0, and 32 simultaneous inspects of one 128 MiB staging measured 7.6 GiB resident across 32
+root-capable processes (I54). The (N+1)th caller is refused with `conflict` rather than queued:
+queueing would hold a Cockpit channel open for the duration and turn a memory problem into a
+channel-exhaustion problem.
+
+Staged bytes are an **encrypted** safe file, so an orphan is a disk-space problem rather
+than a disclosure — but a disk-space problem that nothing cleans up is how a host fills.
+
+### `safe-forget` and `safe-delete` — because creating without removing is a trap
+
+```
+secrets-admin safe-forget <stdin:{safe}>
+    -> { ok:true, forgotten:<id>, registry, file_kept:true, warning }
+
+secrets-admin safe-delete <stdin:{safe, delete_confirm}>
+    -> { ok:true, deleted:<id>, registry, file_removed, file_missing, bytes,
+         backups_removed, overwritten, warning }
+```
+
+**`safe-forget` removes the registry entry and leaves the file exactly where it is.** It is
+the default and the safe one: the safe stops being something this page can open, and not one
+byte of anybody's credentials is destroyed. The response names the `path` that has been left
+behind, because "we forgot it" is only a useful answer if you are told where it went.
+
+**`safe-delete` forgets it *and* destroys the file and its whole backup ring.** It is the only
+verb in this program that deliberately destroys credentials, so:
+
+- it requires the exact confirmation token **`delete-safe:<id>`**
+  (`constants.delete_confirm_prefix`), compared with `hmac.compare_digest`. The token names
+  the safe, so a confirmation an operator gave for a throwaway cannot be replayed against the
+  domain-administrator one — the same idiom as `export`'s `export-plaintext:<id>`;
+- it is **admin-only for an admin-class safe**, like every admin verb;
+- it is **audited by id, never by path**, and the audit line records the number of backup
+  generations destroyed;
+- it **refuses unless the entry's `path` is exactly the path this program would mint for that
+  id and access class today.** This is the derived gate, and it is what confines destruction
+  to files this program created. A hand-registered safe at `/srv/keys/prod.kdbx` — or a
+  per-user entry pointing at something in the operator's own tree that is not a safe at all —
+  answers `access-denied` naming the rule, and the operator forgets it and removes the file
+  themselves. `origin` corroborates; it does not authorise (C1 again: we only destroy what we
+  minted).
+
+Both verbs act on **one registry**, chosen by where the entry actually lives, and the same
+rules that govern reading it govern removing from it:
+
+| entry lives in | `safe-forget` / `safe-delete` runs | who may |
+|---|---|---|
+| system registry, `access: "admin"` | escalated, `euid == 0` | the admin gate, as always |
+| system registry, `access: "user"` | escalated, `euid == 0` | **admin only** — the entry file is `0644 root:root` and an unescalated helper cannot write it, whatever class the entry declares |
+| per-user registry | unescalated, as that user | that user |
+
+A system user-class entry is therefore forgettable by an administrator and **not
+`safe-delete`-able by anyone**: its `path` is in a directory the user controls, so it fails
+the derived gate above, and asking a root process to `unlink` a path inside a user-writable
+directory is the I5 hazard with a friendly button on it. Forget it and let the user remove
+their own file.
+
+### What `list` now reports, and the errors these verbs can return
+
+`list`'s rows gain three keys so the page can draw the right controls without inventing policy:
+
+| key | meaning |
+|---|---|
+| `registry` | `"system"` or `"user"` — which registry this entry came from |
+| `origin` | `"manual"` \| `"created"` \| `"imported"`, straight from the entry |
+| `manageable` | whether **this caller** could `safe-forget` this entry. It is decoration in the usual way (I3): the helper is what refuses, and it re-derives the answer on the verb |
+
+| verb | can return |
+|---|---|
+| `safe-create` | `invalid` (bad id, empty credential with no key file, `access:"user"` while escalated, unknown `format`), `access-denied` (admin gate; managed directory not owned/moded as required), `conflict` (id, minted path or minted entry already exists), `unsupported` (`keyfile_b64` on `psafe3`), `internal` (the created file did not read back — nothing was registered) |
+| `import-*` | `invalid` (bad id, credential sent before commit, declared size over `MAX_SAFE_BYTES`, a bad `chunk_offset`, sha-256 mismatch, unknown signature, KDF over the clamps, attempt budget exhausted), `access-denied` (admin gate, **or a staging token belonging to another uid**), `not-found` (a staging token that never existed or has expired), `conflict` (id / minted path / minted entry exists; or more than `import_max_stagings` open), `bad-credential` (commit only: the staged file did not open — staging kept), `unsupported` (a format the backend cannot open for writing), `internal` |
+| `safe-forget` | `not-found` (no such id in a registry this caller reads), `access-denied` (wrong class, or a system entry from an unescalated helper), `internal` |
+| `safe-delete` | everything `safe-forget` can, plus `invalid` (missing or malformed `delete_confirm`), `conflict` (two registry files declare that id — I51), `access-denied` (the token did not match, **or the derived path gate refused**) |
+
+`safe-create`, `import-commit`, `safe-forget` and `safe-delete` are all
+`mutates: true`, `danger: true`, and audited by id and outcome — never by path, never by value
+(I15). None of them ever returns `locked-out`.
+
+### C6 · Registry writes are atomic and validated before they land
+
+Every entry these verbs write is serialized, **validated against
+`schema/safe-registry.schema.json` before it touches the filesystem**, and then written
+`0644 root:root` (system) or `0600 <user>` (per-user) by temp file + `fsync` + `os.replace` +
+directory `fsync` — the same `atomic_replace` primitive as every other write in this program
+(I12, I13, non-negotiable 6).
+
+A half-written registry entry is **dropped by the loader**, which is correct and fail-closed,
+and also *silent*: the operator's safe simply is not in the list. So the rule is not "the
+loader copes"; the rule is **never produce one**.
 
 ## The `entry` and `changes` objects
 
@@ -443,3 +1004,128 @@ typed that wrong".
 8. No `set -x` in any wrapper. No CSP relaxation in `manifest.json` (I9).
 9. **The passphrase is prompted on EVERY unlock** (I18), which the agent's ticket keeps true
    by construction rather than by policy.
+
+---
+
+## `constants{}` — what the schema verb publishes
+
+The page must never hard-code any of these; the helper is the one place they are defined, and
+`constants` is how they reach the browser. Measured from the live helper on 2026-09-04:
+
+```
+reveal_seconds 15 · fail_floor_seconds 0.75 · session_idle_seconds 120 ·
+session_max_seconds 900 · lockout_threshold 5 · lockout_max_seconds 900.0 ·
+lockout_safe_threshold 20 · lockout_safe_window_seconds 60.0 ·
+max_request_bytes 1048576 · max_keyfile_bytes 1048576 · max_safe_bytes 134217728 ·
+max_attachment_bytes 33554432 · max_yubikey_response_bytes 1024 · max_entries 100000 ·
+helper "/usr/local/sbin/secrets-admin" · registry_dir "/etc/cockpit-secrets/safes.d" ·
+export_dir_default "/var/lib/cockpit-secrets/exports" ·
+export_confirm_prefix "export-plaintext:" · breach_corpus_file "breach-corpus.txt" ·
+agent_admin_run "/run/cockpit-secrets"
+```
+
+0.4.0 adds these, and the registry-writing verbs are unusable without them:
+
+| constant | value | what it is |
+|---|---|---|
+| `new_id_pattern` | `^[a-z0-9][a-z0-9-]{1,62}$` | the id allow-list these verbs MINT against (C2). Stricter than the schema's `id` pattern, on purpose |
+| `user_registry_dir` | `~/.config/cockpit-secrets/safes.d` | the per-user registry for **this caller**. `null` when `euid == 0` — a root helper does not have one and must not report one |
+| `user_safes_dir` | `~/.local/share/cockpit-secrets/safes` | managed safe directory for the `user` class |
+| `safes_dir` | `/etc/cockpit-secrets/safes` | managed safe directory for the `admin` class |
+| `registry_dir` | `/etc/cockpit-secrets/safes.d` | the system registry directory |
+| `import_chunk_bytes` | `524288` (`IMPORT_CHUNK_BYTES`) | decoded bytes per `import-chunk`; base64 plus framing stays under `max_request_bytes`. `import-begin`'s reply names it as `chunk_bytes` |
+| `import_idle_seconds` | `900` (`IMPORT_IDLE_SECONDS`) | staging expiry, measured from its **last use**, and the same threshold the sweep uses. A **resource** control |
+| `import_max_stagings` | `8` (`IMPORT_MAX_STAGINGS`) | concurrent stagings one caller may HOLD. Bounds "start ten thousand uploads" |
+| `import_max_attempts` | `5` (`IMPORT_MAX_ATTEMPTS`) | failed `import-commit` credentials before the staging is destroyed. A **resource** control, never a credential control — see the note under `import-commit` |
+| `import_max_concurrent` | `2` (`IMPORT_MAX_CONCURRENT`) | how many `import-inspect` / `import-commit` calls may be RUNNING at once, per identity. A different bound from `import_max_stagings`, and the one that was missing (I54). The (N+1)th caller gets `conflict`, never a queue |
+| `delete_confirm_prefix` | `delete-safe:` (`DELETE_CONFIRM_PREFIX`) | `safe-delete`'s token is this plus the id |
+
+The KDF a `safe-create` uses is published on the `kdf` FIELD rather than as a constant,
+because it is a sub-form the page renders: each sub-field carries its own `default`, `min` and
+`max`. The defaults are KDBX Argon2id at m=64 MiB / t=8 / p=2 and PWS3 at 262 144 iterations;
+the floors are `Limits`' own write floors (OWASP's m=19 MiB / t=2 / p=1, and PWS3's 262 144)
+and the ceilings are the `Limits` clamps. **The published `min` is the enforced floor** — they
+were once separate numbers, and a bound the schema advertises that the backend then refuses is
+worse than no bound at all.
+
+
+## Where this document and the live `schema` verb currently disagree
+
+Cross-checked field by field against `COCKPIT_SECRETS_ETC=/nonexistent ./secrets-admin schema`.
+First run against the 33-verb helper on 2026-09-04, and **re-run against the shipped 0.4.0
+helper the same day** (`helper_version 1.0.0`, `base_version 1.0.0`, schema version 2, **41
+verbs, 43 fields**). Reported rather than papered over, in three groups.
+
+The re-run's mechanical results: every verb the schema publishes is named in this document, and
+`schema` and this file agree on the id, the group, `needs`, `mutates`, `danger` and the request
+list of all 41. What still differs is group B below, which is the schema's `response` map being
+an abbreviation rather than either side being wrong.
+
+**A · Fixed in this document (it was lagging the code).** `restore-backup` also returns `undo`
+and `ring_full`; `breach-check` also returns `reason`; `strength` returns `length`,
+`alphabet_size`, `penalty_bits`, `source` and `note` on top of what was listed; `schema`
+returns `helper_version` and `base_version`; `health` returns eleven top-level keys this file
+had summarised as eight. All corrected above.
+
+**B · The `schema` verb's `response` map is an abbreviation, and the helper is the one to
+change.** These are not errors in this document — the verbs really do return the keys — but a
+page that trusted `schema.verbs[].response` as a complete list would be wrong:
+
+| verb | returns, but `schema` does not declare |
+|---|---|
+| `schema` | `helper_version`, `base_version`, `ui_rules` |
+| `strength` | `length`, `guessable_length`, `alphabet_size`, `penalty_bits`, `source`, `note` |
+| `export` | `mode: "0600"`, `warning` (both present in the helper at the response construction) |
+| `health` | `version`, `base_version`, `schema_version`, `registry_root`, `registry_entries`, `registry_gate`, `agent`, `export`, `breach`, `library_root`, `library_root_trusted`, `identity`, `debug` |
+
+`guessable_length` is the interesting one: it was named in this document and *not* in the
+schema, and the runtime does return it — so the document was right and the schema map was
+short. That is the case for the rule stated at the top: **schema is authoritative for
+requests, this file for responses.**
+
+**C · Cross-checkable now, and cross-checked.** Everything in "The verbs that WRITE the
+registry" was specified here *ahead of* the helper — at the time it was written
+`secrets-admin schema` listed 33 verbs and none of `safe-create`, `import-*`, `safe-forget`
+or `safe-delete` existed. It now lists **41 verbs and 43 fields**, every one of those blocks
+is checkable against a running helper, and the section below records what disagreed and which
+side moved.
+
+Two of the three groups above are unchanged by that: the `schema` verb's `response` map is
+still an abbreviation (group B), and `list`'s map has been widened to name the eleven keys it
+actually returns.
+
+---
+
+## Where this document and the shipped helper agreed after 0.4.0's integration
+
+This section replaces the "currently disagree" list that stood here while the registry-write
+verbs were still being written. Every item in it was resolved in one direction or the other,
+and the direction is recorded because "it was fixed" is not a checkable claim.
+
+**The standing rule, unchanged:** the `schema` verb is authoritative for REQUEST fields —
+`secrets.js` builds its forms from it and cannot see this file — and this document is
+authoritative for RESPONSE keys and for behaviour.
+
+| What disagreed | Resolved by | Why that direction |
+|---|---|---|
+| verb ids `safe-import-begin` … | **this document** now says `import-begin` … | the schema is authoritative for the interface; the page, the tests and the audit log all already used the shipped names |
+| `offset` / `data_b64` on a chunk | **this document** now says `chunk_offset` / `chunk_b64` | same rule. `data_b64` is a different field with a different meaning (`attach-add`), and reusing it here would have made one name mean two things |
+| `kdf_memory_kib` / `kdf_time` / `kdf_parallelism` as three flat fields | **this document** now says one `kdf` object | the helper publishes a sub-form so the page can render the KDBX and PWS3 parameter sets without inventing which apply to which |
+| `password` on `safe-create` and `import-commit` | **this document** now says `new_password` | `password` carries three promises (the I16 lockout, the per-safe cap, the constant-time floor) that do not apply to setting a passphrase on a safe that does not exist yet. `tests/integration/lockout.py` derives its verb list from that field name and stays true because of it |
+| `confirm` on `safe-delete` | **the helper** now reads `delete_confirm`, which is what this document and the schema both published | the code was reading `export`'s field name, so the verb was unreachable through the published interface (I49). `tests/ban_undeclared_fields.py` is the standing gate |
+| `safe-forget` returning no `path` | **the helper** now returns it | this document said the response names the file left behind, and it was right: "we stopped listing it" is only useful if you are told where it went. The path is in the RESPONSE and still never in the audit line |
+| `list` rows missing `origin` and `manageable` | **the helper** now returns both | this document specified them; the entries carry `origin` as of I46, and `manageable` is computed from the same two facts the verb gates on |
+| `handle` undeclared on `backups`, `breach-check`, `restore-backup` and `export` | **the schema** now declares it on all four | all four resolve their safe through `_entry_for`, which accepts one — so the capability was real, unpublished, and (once the dispatcher started refusing undeclared credential fields) unusable. Verified working inside a real `open` session afterwards |
+| `constants.new_id_pattern` vs `constants.new_id_pattern` | **this document** now cites `new_id_pattern` | the shipped constant name |
+| `constants.create_kdbx_kdf_min` (8 MiB / t=2 / p=1) | **the helper** now publishes `Limits`' own Argon2 WRITE floors (m=19 MiB, t=2, p=1) as the schema `min` | the helper advertised a floor of 8 MiB that the backend then refused. A published bound that is not the enforced bound is worse than no bound |
+
+Two constants this document did not know about, both added by the integration:
+
+- **`import_max_concurrent`** (2) — how many `import-inspect` / `import-commit` calls may run
+  at once, per identity. Every other import limit counts things a caller may HOLD; none
+  counted things RUNNING, and 32 simultaneous inspects of one 128 MiB staging measured 7.6 GiB
+  resident across 32 root-capable processes (I54). The (N+1)th caller is refused with
+  `conflict`, never queued: queueing would hold a Cockpit channel open for the duration.
+- **`compressed`** on `import-inspect` — an optional boolean from the outer header, present
+  for KDBX and absent for PWS3, which has no such concept. Reported as `null` rather than
+  `false` when the format has no answer.

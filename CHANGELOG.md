@@ -5,12 +5,189 @@ carries the current one and `install.sh` prints it.
 
 Two conventions worth knowing before reading an entry:
 
-- Hazard ids (**I1**–**I42**) refer to [`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md).
+- Hazard ids (**I1**–**I55**) refer to [`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md).
   A line that cites one is claiming that hazard is mitigated in this release, not
   that it was thought about.
 - Some components are optional by design and can be absent from a build (the
   unlock agent above all). **`secrets-admin health` is the authority on what a
   given installation actually has** — not this file.
+
+## 0.4.0 — 2026-09-04
+
+**You can now create a safe and adopt an existing one.** Until this release a
+safe existed only if root hand-wrote the file into `/etc/cockpit-secrets/safes/`
+AND hand-wrote a registry entry into `/etc/cockpit-secrets/safes.d/`. A tool
+that claims to fully manage safes has to be able to make one and to take one in,
+and now it can — from the page, without an administrator for a user-class safe.
+
+This is also the most dangerous change in the project, because it is the first
+time a **browser request writes into the registry**, which is this program's
+trust root. Everything else is downstream of the registry: it says which files
+are safes, where they live, and what access class each one has. A red-team round
+against the first implementation found **twelve defects**; all twelve are fixed
+here, each with a regression check that was watched going red with its fix
+reverted and a standing ban in `validate.sh` that was watched firing on a
+deliberate violation.
+
+### Added
+
+- **`safe-create`** — mint a new, empty, valid KDBX 4.1 or Password Safe v3
+  database and register it. The passphrase arrives on stdin like every other
+  credential (I10); the strength estimate is shown as advice and never as a
+  gate, because refusing an operator's chosen passphrase is not this program's
+  decision to make. A key file can be generated as a SECOND factor, is returned
+  **once**, and is stored nowhere.
+- **`import-begin` / `-chunk` / `-inspect` / `-commit` / `-abort`** — adopt an
+  existing safe. **The encrypted file is uploaded FIRST and the passphrase is
+  asked for LAST**, and that ordering is a requirement rather than a
+  preference: a large upload takes visible time, and collecting the passphrase
+  up front means holding it in browser memory for the whole transfer, which is
+  exactly the window I11 and I14 exist to shrink. Because a KDBX or PWS3 header
+  is not secret — and the person uploading holds the file — `import-inspect`
+  reports format, version, cipher, KDF and its parameters **with no credential
+  at all**, so the operator can confirm they uploaded the file they meant to
+  before typing anything. The UI labels that summary as what it is: read from
+  the header, not authenticated. A KDF bomb is refused at that step, before
+  anybody waits on a derivation. A wrong passphrase at commit does NOT destroy
+  the staged bytes.
+- **`safe-forget`** (remove the registry entry, leave the file exactly where it
+  is — the default and the safe one) and **`safe-delete`** (forget it *and*
+  destroy the file plus its derived backup ring, behind an exact confirmation
+  token naming the id). Creating without removing would have built a trap.
+- **A per-user registry** at `~/.config/cockpit-secrets/safes.d/`, which is the
+  one trust-model change in this release. Root owns the system registry, so
+  without this an unprivileged user could not have a safe of their own without
+  an administrator. It is read **only** when the helper is running unescalated
+  as that user; **a root-mode helper never opens it** (proved two ways — an
+  instrumented-open shim with a positive control, and `strace` at a real euid 0
+  through `/srv/jobs`); every entry loaded from it is forced to `access: "user"`
+  and one declaring `admin` is dropped and reported; its `path` must pass
+  `open_safe_fd`; and a system entry with the same id wins, with the shadowed
+  per-user entry reported as an error rather than silently preferred. The safety
+  argument, stated at the loader: this grants the user no access they did not
+  already have, because the helper is running *as them*. It is a convenience
+  surface, not a privilege surface.
+- **Provenance in the registry** — `origin`, `created_utc` and `source`. A
+  created or imported entry now records that this program made it, when, and
+  (for an import) the unauthenticated header summary the operator was shown
+  before they typed a passphrase.
+- **Three new backend primitives**, all of which take BYTES and none of which
+  takes a path, a filename or a directory: `Backend.create_new`,
+  `Backend.validate_candidate` and `Backend.inspect_bytes`. `create_new` is
+  concrete policy on the ABC standing on format hooks that refuse by default,
+  so a third backend cannot half-implement creation into something that looks
+  like it worked.
+
+### Fixed — the twelve the red team found (I43–I54), and one this release found itself
+
+- **I43 · `import-commit` proved one read of the staged file and landed a
+  different one.** It addressed the blob by path twice with a full KDF
+  derivation in between, so the bytes that were proven to open and the bytes
+  that became a safe were never the same bytes — and the verb's whole security
+  argument, that a file which does not open does not land, was false. Fixed
+  structurally: `_open_candidate` no longer accepts a path, so there is nothing
+  left to re-read.
+- **I44 · a registry entry naming a FIFO hung every helper invocation,
+  forever** — including `schema` and `health`, the two a stuck plugin needs to
+  explain itself with. `open_safe_fd`'s "regular file, or refuse" check runs
+  after the open, and `open(2)` on a FIFO blocks. One flag: `O_NONBLOCK`,
+  cleared once `S_ISREG` passes.
+- **I45 · a failed registry write left an orphan safe file and burned the id
+  forever.** `_land_new_safe` now places the file and publishes the entry as one
+  operation, and unlinks the file again if the entry cannot be written.
+- **I46 · `_KNOWN_KEYS` omitted the three provenance keys**, so the three
+  shipped `etcdefaults/` examples were accepted by jsonschema and silently
+  DROPPED by the helper — an operator following the shipped documentation got a
+  safe that did not appear in `list`. Both halves fixed in one change, and
+  `tests/ban_registry_vocabulary.py` now compares the two vocabularies in both
+  directions on every gate run.
+- **I47 · `safe-delete` shredded any file a registry entry named**, without ever
+  opening it through a backend, and swept any directory `backup.dir` named. The
+  derived-path gate `docs/CONTRACT.md` already specified is now implemented, and
+  the ring is derived from the minted path.
+- **I48 · `safe-delete` destroyed the file BEFORE unregistering it** and then
+  reported the whole thing `access-denied` — the operator was told nothing had
+  happened after the safe and its entire backup ring were gone. The registry
+  entry goes first now.
+- **I49 · `safe-delete` checked `confirm` while its schema published
+  `delete_confirm`**, so through the published interface the destructive verb
+  could never succeed. Generalised into `tests/ban_undeclared_fields.py`, an AST
+  + call-graph gate that refuses any verb reading a request field its own schema
+  omits — which immediately found four more, all real: `backups`,
+  `breach-check`, `restore-backup` and `export` all accept a session `handle`
+  and none declared it. All four now do.
+- **I50 · the pre-commit import steps ACCEPTED a credential and ignored it.**
+  C5's ordering lived entirely in `secrets.js`. It is now enforced in the
+  dispatcher, driven by each verb's own declared request, so a new verb gets the
+  refusal without anybody adding a line.
+- **I51 · `safe-forget` reported success while the safe stayed registered**,
+  when two registry files declared one id. The loader carries every file that
+  declared an id and forget refuses, naming them.
+- **I52 · `safe-create` accepted bidi-override and zero-width characters in
+  `label`** — the field the registry schema itself names as how a passphrase
+  gets typed into the wrong prompt.
+- **I53 · the start-up staging sweep followed a symlink named like a staging
+  token** and unlinked `blob` / `meta.json` outside the staging root, on every
+  helper invocation including at euid 0.
+- **I54 · nothing bounded how many `import-inspect` / `import-commit` calls ran
+  at once.** 32 simultaneous inspects of one 128 MiB staging measured **7.58 GiB**
+  resident across 32 processes, every one euid 0 on the admin path. Bounded now
+  by a non-blocking work slot that refuses rather than queues; the per-request
+  cost also halved as a side effect of I43's single read (299 MiB -> 42 MiB peak
+  on the same 128 MiB file).
+
+- **I55 · a safe created at a reused id inherited the deleted one's lockout.**
+  Found by cleaning the host after the live walkthrough, which was the first
+  thing in this project's history to delete a safe and then reuse its id. The
+  I16 counter is keyed on (real uid, safe id) and used to outlive the safe, so a
+  brand-new safe was `locked-out` on its first unlock with the passphrase the
+  operator had just chosen. Cleared in `_land_new_safe` and in `v_safe_delete`,
+  so neither route can leave one armed.
+
+### Changed
+
+- `secrets-admin` builds a new KDBX through `KdbxBackend.create_new` instead of
+  editing pykeepass's blank template itself. The old path inherited the
+  template's **master seed, encryption IV and inner protected-stream key** into
+  every safe it created — the last of those is the ChaCha20 key masking every
+  protected value in the XML, and it was a published constant until the
+  operator's first save. It also called `Secret.str_view()`, minting an
+  unwipeable `str` of the new master passphrase. All of it is gone.
+- `KDBX_MEMORY_MIN` / `_TIME_MIN` / `_PAR_MIN` are now `Limits`' own Argon2
+  write floors (OWASP's m=19 MiB, t=2, p=1) rather than independent numbers.
+  The helper used to publish a minimum of 8 MiB that the backend would then
+  refuse — a published bound that is not the enforced bound is worse than none.
+- `tests/integration/lockout.py` section A no longer asserts "exactly one of
+  eight guesses was evaluated", which was true only while eight helper
+  invocations fit inside the 2 s window the first failure opens. On a loaded
+  machine they take 2.4 s, the eighth guess legitimately falls outside, and the
+  test failed reporting a defect that was not there — it had been failing at
+  HEAD for three separate agents. It now replays the escalating schedule
+  (2 s, 4 s, 8 s …) against the observed timings from a **second implementation
+  written from the published constants**, and a new section A0 MEASURES the
+  first two windows against `LOCKOUT_BASE_SECONDS`. Strictly stronger and
+  load-independent: a scratch build with the backoff zeroed passes the version
+  that called the helper's own `_backoff_for` and fails this one with five red
+  checks.
+- `tests/integration/flow.py`'s class-gate sweep builds each request from that
+  verb's own declared fields instead of sending `password` to all of them. 88
+  checks -> 115, all green.
+- **Four defects in this package's own test suite**, all of the same class — a
+  check that could not fail. A `waitForFunction` with a string body is `eval`
+  and the live CSP refuses it, so a swallowed rejection read a stale dialog; a
+  predicate matched the create form's own help text and returned before the
+  button was clicked; `Recorder.item()` defaulted a null state to `PASS`, so an
+  item whose function threw reported green; and `input[type=checkbox]` caught
+  the `make_keyfile` toggle as well as the confirmation gates. Three of the
+  eight new `validate.sh` bans also failed to fire the first time they were
+  tested against a deliberate violation, each because they grepped for a name
+  that also appears in a definition. Every ban in this release was watched
+  failing before it was kept.
+- `install.sh` installs `etcdefaults/user-safes.d/` to
+  `/usr/local/share/cockpit-secrets/examples/` as documentation and validates it
+  against the schema; `validate.sh` checks its JSON. It is still never seeded
+  into the system registry — a per-user entry there is an entry naming a home
+  directory read by a root helper.
 
 ## 0.3.0 — 2026-09-04
 

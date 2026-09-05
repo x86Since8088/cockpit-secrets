@@ -164,6 +164,20 @@ def main():
                  and v["id"] != "save"]
         r.check("the schema declares a class-gated verb surface to check",
                 len(gated) >= 10, gated)
+        # EVERY REQUEST BELOW IS BUILT FROM THE VERB'S OWN DECLARED REQUEST.
+        #
+        # It used to send `password` to all of them, which was harmless while
+        # the helper ignored a field it had no use for. It is not harmless any
+        # more: the dispatcher now REFUSES a credential sent to a verb whose
+        # schema declares none (I48, C5's ordering enforced server-side), so a
+        # blanket `password` made seven of these answer `invalid` — argument
+        # validation — instead of reaching the class gate at all. That would
+        # have been the test quietly stopping to test anything.
+        #
+        # Filtering to the declared fields is the stronger version of the same
+        # check, not a weaker one: the verbs are now called the way a
+        # conforming client calls them, and the assertion is unchanged.
+        declared = {v["id"]: set(v.get("request") or []) for v in schema["verbs"]}
         for verb in sorted(gated):
             # `autosave` is what makes a single-shot MUTATION a well-formed
             # request: without it the helper answers `invalid` before it looks
@@ -194,6 +208,9 @@ def main():
                                    "confirm": "export-plaintext:lab-admin"},
                         "breach-check": {"value": "x"},
                         }.get(verb, {}))
+            req = {k: v for k, v in req.items() if k in declared[verb]}
+            r.check("  %s's request is buildable from its own schema" % verb,
+                    "safe" in req or "handle" in req, sorted(req))
             out, rc, _e = env.run(verb, req)
             r.check("an admin safe is access-denied to a non-root helper (%s)"
                     % verb,

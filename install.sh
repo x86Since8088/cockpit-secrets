@@ -100,6 +100,7 @@ SAFESDIR="$ETCDIR/safes"
 LOGDIR="$DESTDIR/var/log/cockpit-secrets"
 STATEDIR="$DESTDIR/var/lib/cockpit-secrets/state"
 EXPORTDIR="$DESTDIR/var/lib/cockpit-secrets/exports"
+EXAMPLEDIR="$DESTDIR/usr/local/share/cockpit-secrets/examples"
 USERUNITDIR="$DESTDIR/usr/local/lib/systemd/user"
 SYSUNITDIR="$DESTDIR/usr/local/lib/systemd/system"
 
@@ -308,8 +309,13 @@ fi
 # --- the registry schema and the seeded examples ---------------------------
 # The examples ship as documentation, so they must actually be valid against the
 # schema they document. A broken example teaches an operator a broken shape.
+# The `user-safes.d/` glob is SEPARATE and is not a tidy-up: `*.json` does not
+# descend, so the per-user example was the one shipped registry entry that no
+# gate validated. It is validated here and installed as DOCUMENTATION below —
+# never seeded into the system registry, because a per-user entry there is an
+# entry naming a path in somebody's home directory read by a root helper.
 shopt -s nullglob
-EXAMPLES=("$SRC"/etcdefaults/*.json)
+EXAMPLES=("$SRC"/etcdefaults/*.json "$SRC"/etcdefaults/user-safes.d/*.json)
 shopt -u nullglob
 python3 - "$SRC/schema/safe-registry.schema.json" "${EXAMPLES[@]}" <<'PY' \
     || die "an etcdefaults example is not valid against the registry schema. Nothing was changed."
@@ -541,6 +547,20 @@ for src in "$SRC"/etcdefaults/*.json; do
         install -o root -g root -m 0644 -- "$src" "$dst"
         changed "seeded $dst"
     fi
+done
+shopt -u nullglob
+
+# The PER-USER example goes where documentation goes, not where policy goes.
+# `etcdefaults/user-safes.d/README.md` tells the operator to copy it into a
+# user's own `~/.config/cockpit-secrets/safes.d/`, and it has to exist somewhere
+# on the installed host for that instruction to mean anything. It is NOT seeded
+# into $SAFESD — see the comment above the loop.
+ensure_dir "$EXAMPLEDIR" 0755 "it holds shipped documentation, not policy."
+ensure_dir "$EXAMPLEDIR/user-safes.d" 0755 "it holds the per-user registry example."
+shopt -s nullglob
+for src in "$SRC"/etcdefaults/user-safes.d/*; do
+    [[ -f $src ]] || continue
+    put 0644 "$src" "$EXAMPLEDIR/user-safes.d/$(basename -- "$src")"
 done
 shopt -u nullglob
 

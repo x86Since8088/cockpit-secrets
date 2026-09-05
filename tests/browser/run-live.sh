@@ -138,7 +138,12 @@ fi
 
 # ------------------------------------------------------------- the run ------
 rc=0
-for spec in live-ui.spec.js live-access.spec.js; do
+# live-registry.spec.js is FIRST on purpose: it creates the two safes it needs,
+# uses them, and destroys them again, so it must not run against a page another
+# spec has left mid-session. It is also the only spec that WRITES to the host —
+# into the signed-in account's own home, never /etc — and running it first means
+# a failure there is reported before two suites of unrelated output.
+for spec in live-registry.spec.js live-ui.spec.js live-access.spec.js; do
     head "running $spec"
     if node "$HERE/$spec"; then :; else rc=1; fi
 done

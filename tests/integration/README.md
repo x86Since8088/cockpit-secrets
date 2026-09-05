@@ -20,9 +20,12 @@ own, and none of those proofs crosses a module boundary.
     python3 tests/integration/properties.py       # ~40 s
     python3 tests/integration/newverbs.py         # ~50 s
     python3 tests/integration/agent_cycle.py      # ~40 s
+    python3 tests/integration/lockout.py          # ~60 s, and most of it is SLEEPING
+    python3 tests/integration/adversarial.py      # ~15 s
+    python3 tests/integration/registry_writes.py  # ~55 s
     python3 tests/integration/corpus_vs_helper.py # ~85 s
 
-`run_tests.sh` in the source root runs all six plus every other gate.
+`run_tests.sh` in the source root runs all nine plus every other gate.
 
 - **`flow.py`** — the contract flow end to end on BOTH formats: probe → unlock →
   tree → entries → reveal → totp → add → edit → move → save → lock, an `open`
@@ -56,6 +59,23 @@ own, and none of those proofs crosses a module boundary.
   id, and to expire on its own deadline. Also the refusals: a 0755 run
   directory and a regular file on the socket path are both declined, silently
   and without failing the verb.
+- **`registry_writes.py`** — the registry WRITE path, and specifically the
+  twelve defects the 0.4.0 red-team round found in it (I43–I54). `newverbs.py`
+  proves the eight registry verbs DO their job; this one proves they cannot be
+  talked into doing something else, which needs a different fixture: a per-user
+  registry the caller can write (C4 hands them that deliberately), files that
+  are not safes, entries pointing outside the managed directories, and a
+  staging directory raced against its own commit.
+
+  Every check in it was **watched going red with its fix reverted**, one fix at
+  a time. Two of them are worth naming because they are races rather than
+  assertions: `section_single_read` creates a safe with a deliberately expensive
+  KDF, commits it in a thread, and overwrites the staged blob 1.2 s in — the
+  landed bytes must be the validated ones (I43); and `section_concurrency` fires
+  more simultaneous `import-inspect` calls than the published bound allows and
+  requires the surplus to be refused with a retryable `conflict` that does NOT
+  destroy the staging (I54).
+
 - **`corpus_vs_helper.py`** — all 67 malformed-input cases through the helper,
   each compared to its sidecar's expected code, its wall-clock budget and its
   `must_not_leak` list. The budget is not decoration: it is what distinguishes

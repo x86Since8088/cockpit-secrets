@@ -15,12 +15,25 @@ only script the page loads besides its own is Cockpit's `../base1/cockpit.js`.
 
 ### Where this actually stands — read this before you trust it
 
-**Version 0.3.0.** It runs, it is installed on one host, and it has been
+**Version 0.4.0.** It runs, it is installed on one host, and it has been
 attacked. What that means, precisely:
 
-- Six adversarial lenses, and an independent re-gate of the result, found
-  **eighteen defects** in 0.2.0 and in this package's own test suite.
-  **Seventeen are fixed; one is argued and left standing with a runtime
+- **0.4.0 is the release in which a browser request first writes into the
+  registry** — this program's trust root, which decides which files are safes
+  and what access class each one has. That is the most dangerous change the
+  project has made, and it was treated that way: a red-team round against the
+  first implementation of `safe-create` / `safe-import` / `safe-forget` /
+  `safe-delete` found **twelve defects**, including a `safe-delete` that would
+  shred any file a registry entry named and an `import-commit` that validated
+  one read of the uploaded file and landed a different one. A thirteenth turned
+  up while cleaning the host after the live walkthrough. All thirteen are fixed
+  (I43–I55), each with a regression check watched going red with its fix
+  reverted and a standing ban watched firing on a deliberate violation.
+
+- Six adversarial lenses, an independent re-gate of the result, and a further
+  red-team round against 0.4.0's registry-write feature have found **thirty-one
+  defects** in this program and in its own test suite.
+  **Thirty are fixed; one is argued and left standing with a runtime
   warning** (the hardware-token challenge does not rotate — I35, and the
   reasoning is in RESIDUAL-RISK §2.1). Three further low-severity items are
   open and tracked rather than closed: I36 (a decrypted attachment stays
@@ -42,8 +55,11 @@ attacked. What that means, precisely:
   Password Safe has ever been read, and KDBX 4 + AES-KDF has never been read or
   written.
 - It has been driven end to end in a real browser against real Cockpit —
-  ten items, 131 checks, [`docs/LIVE-WALKTHROUGH.md`](docs/LIVE-WALKTHROUGH.md)
-  — and at a real euid 0 through this host's root job runner.
+  ten items and 131 checks for the browse/edit/save surface, plus five more
+  items and 57 checks for 0.4.0's create-and-adopt flows, in
+  [`docs/LIVE-WALKTHROUGH.md`](docs/LIVE-WALKTHROUGH.md) — and at a real euid 0
+  through this host's root job runner, where `keepassxc-cli` opens a safe this
+  program created and reads back an entry this program saved into it.
 
 It has **not** been reviewed by anybody outside the system that wrote it, and
 it has run on exactly one machine.
@@ -63,6 +79,23 @@ rather than papered over.
 
 ## What it does
 
+- **Create** a new, empty safe — KDBX 4.1 (AES-256, Argon2id) or Password Safe
+  v3 — from the page, and register it in one act. A key file can be generated as
+  a second factor; it is shown **once** and stored nowhere. The passphrase
+  strength estimate is advice on screen and never a gate.
+- **Adopt** a safe you already have, by uploading it. **The encrypted file goes
+  up first and the passphrase is asked for last**, deliberately: a large upload
+  takes time, and collecting the passphrase in the file-picker step would hold
+  it in the browser for the whole transfer. Before you type anything the page
+  shows what the file's own header says — format, version, cipher, KDF and its
+  cost — because a KDBX or PWS3 header is not secret and you are holding the
+  file. That summary is labelled as what it is: **read from the header, not
+  authenticated.** Nothing lands until the file has actually opened with the
+  credential you gave.
+- **Unregister** (`safe-forget` — the file stays exactly where it is) or
+  **destroy** (`safe-delete` — the file and its backup ring, behind a
+  confirmation token that names the safe). Both are offered side by side, with
+  the reversible one first.
 - **Unlock** a registered safe with a passphrase typed into the page, optionally
   with a registry-declared key file. KDBX 4.x and Password Safe v3 read/write;
   **KDBX 3.1 read-only**, behind a permanent banner, because that format has no
@@ -95,10 +128,16 @@ rather than papered over.
 - **It does not export by default.** "Export as CSV" writes every secret in the
   safe to disk in the clear. It is admin-only, off unless the registry enables
   it per safe, and audited by name.
-- **It does not rotate a master passphrase, and it cannot create a safe.**
-  `save-as` copies an *open* database to a new name; it cannot make one from
-  nothing and cannot change the passphrase. Use the desktop client —
+- **It does not rotate a master passphrase.** `safe-create` makes a new safe and
+  `save-as` copies an *open* database to a new name, but neither changes the
+  passphrase of an existing safe. Use the desktop client —
   [`docs/OPERATIONS.md`](docs/OPERATIONS.md) has the procedure.
+- **It does not create a safe that opens with no passphrase**, and it will not
+  adopt one either. This program never registers a key-file *path*, so it cannot
+  honestly describe such a safe in the registry — and a key file stored beside
+  the safe it opens is worth nothing. A key file is accepted as a SECOND factor
+  only. `import-commit` refuses a file that opens on a key file alone, with the
+  reason.
 - **It does not escrow or recover anything.** Lose the master passphrase and the
   safe is gone. That is the point of it.
 
@@ -197,6 +236,41 @@ supported way to find out why a safe is missing from the list.
 
 An entry that fails schema validation is **dropped and logged** — never
 partially applied, and never defaulted to the permissive class.
+
+An entry the page created or imported also carries `origin` (`created` /
+`imported` / `manual`), `created_utc`, and — for an import — a `source` block
+recording the unauthenticated header summary you were shown before you typed
+your passphrase. None of the three grants anything: `safe-delete`'s gate is
+**derived** from the id, not read from `origin`, precisely so that a
+hand-edited provenance key cannot talk the helper into unlinking a file it did
+not create.
+
+### The second registry: `~/.config/cockpit-secrets/safes.d/`
+
+Root owns `/etc/cockpit-secrets/safes.d/`, so an unprivileged user cannot write
+there — which meant that before 0.4.0 they could not have a safe of their own
+without an administrator hand-writing an entry for them. The **per-user
+registry** is what lets `safe-create` and the import flow work for a normal
+user, and it is the one trust-model change in this program's history. Five
+rules, all enforced in the helper:
+
+1. It is read **only** when the helper is running unescalated as that user. A
+   root-mode helper does not even open it (`health` says so, and it is proved
+   two ways in `docs/STRESS-REPORT.md`).
+2. Every entry loaded from it is forced to `access: "user"`. One declaring
+   `admin` is **dropped and reported**, never downgraded.
+3. Its `path` must resolve to a file that user owns, 0600, with no
+   group/other-writable parent — the same check `open_safe_fd` applies
+   everywhere else.
+4. The directory and its files must be owned by that user and not
+   group/other-writable, or the whole per-user registry is refused.
+5. A system entry and a per-user entry with the same id: **the system entry
+   wins**, and the shadowed per-user entry is reported as an error.
+
+**Why that is safe, in one sentence:** it grants the user no access they did not
+already have, because the helper is running *as them* and they can read their
+own files anyway. It is a convenience surface, not a privilege surface — and if
+any of rules 1–4 is ever relaxed, that sentence stops being true.
 
 ### The two access classes, and `admin` is the default
 

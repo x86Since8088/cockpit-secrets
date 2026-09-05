@@ -115,6 +115,13 @@ run "integration: the lockout — concurrency, identity, reach" 600 \
 # are unit tests in tests/test_regressions.py, which validate.sh runs.
 run "integration: the adversarial findings"    600 \
     python3 tests/integration/adversarial.py
+# The registry WRITE path: the twelve defects the 0.4.0 red-team round found in
+# safe-create / safe-import / safe-forget / safe-delete, each one driven against
+# the real helper with a per-user registry the caller can write. Every check in
+# it goes red when its fix is reverted; the greppable half of the same guards is
+# in validate.sh.
+run "integration: the registry write path"     900 \
+    python3 tests/integration/registry_writes.py
 
 if ((QUICK)); then
     skip "integration: corpus vs the helper" "--quick"

@@ -434,3 +434,130 @@ rendering and the page's read-only refusal are unverified.
 
 All process-inspection tests ran against a helper running as an ordinary user. The admin path runs
 as root, and what a second unprivileged user can see of *that* process was not measured.
+
+---
+
+## Part 4 · What the 0.4.0 registry-write feature leaves open
+
+Creating and adopting safes gave a browser request its first write into the trust root. Twelve
+defects were found and closed (I43–I54 in `docs/KNOWN_ISSUES.md`). These are what is left.
+
+### 4.1 An unprivileged user can still destroy their own files with `safe-delete` — through the file, not through the verb
+
+`safe-delete` now refuses unless the entry's `path` is exactly the path this program would mint
+for that id and access class today, so a hand-written entry pointing at `~/.ssh/id_ed25519` is
+`access-denied` and the file is untouched. What that gate does **not** do is stop a user destroying
+a safe **this program did create**. That is the verb working: the operator asked, typed
+`delete-safe:<id>` in full, and the safe was theirs.
+
+The honest residue is the blast radius of a mistyped id: the confirmation token names the safe, but
+two safes whose ids differ by one character are two tokens that differ by one character, and the
+`_shred` is not recoverable through this program. The backup ring goes with the file deliberately
+(leaving complete copies of a safe somebody asked to destroy would make the verb a lie), so there
+is no undo inside the program at all. `safe-forget` is the reversible half and is offered beside it.
+
+### 4.2 `_shred` is a courtesy, and the response says so
+
+Unchanged from 0.3.0 and worth repeating because `safe-delete` is new: the overwrite-then-unlink is
+meaningless on a copy-on-write filesystem, on an SSD, and against any snapshot, journal or backup.
+The verb's `warning` says this in full every time. An operator who reads "overwritten: true" and
+stops taking other precautions has been misled by the word, not by the code.
+
+### 4.3 A ring at a registry-supplied `backup.dir` is left behind by `safe-delete`
+
+Deliberate, and it is the safe half of I47's fix: this verb will not unlink inside a directory a
+request-editable field named. So a safe whose entry sets `backup.dir` is destroyed while complete
+copies of it may remain in that directory. The response says so in as many words — but nothing
+removes them, and an operator who does not read the warning will believe the safe is gone.
+
+### 4.4 `unlock` on a large registered safe is still unbounded
+
+I54 bounded `import-inspect` and `import-commit` to `IMPORT_MAX_CONCURRENT` (2) simultaneous
+callers, because those two are the verbs a caller can point at 128 MiB of their own choosing
+without needing a registered safe or an administrator. `unlock` has the same per-request shape —
+one full file read plus a KDF at up to `ARGON2_MAX_MEMORY_KIB` — and has **no cap at all**. N
+simultaneous unlocks of a large registered safe is N times that cost, and each is its own process.
+
+It is not fixed here for one reason and it is not a good enough reason to be comfortable with: the
+lockout (I16) bounds how many FAILED unlocks one principal can make, but nothing bounds successful
+ones, and extending the work slot to `unlock` would change the behaviour of every existing verb in
+a release whose subject is the write path. Somebody should do it.
+
+### 4.5 The staged-upload retry bound is a resource control, not a credential control
+
+Stated in the code and repeated here because it is easy to misread. `IMPORT_MAX_ATTEMPTS` (5) and
+`IMPORT_IDLE_SECONDS` (900) do **not** protect the uploaded safe from guessing: the person who
+uploaded it still holds it and can guess against their own copy offline as fast as their hardware
+allows. They protect **this host's CPU and disk**, because every attempt costs one full KDF
+derivation on a helper that may be root. The I16 lockout is deliberately not wired into
+`import-commit` and the page does not imply it is.
+
+### 4.6 One user can hold 1 GiB of this host's disk for 15 minutes, on purpose
+
+`IMPORT_MAX_STAGINGS` (8) × `MAX_SAFE_BYTES` (128 MiB) is a gigabyte per identity, held until the
+idle sweep at 900 s. That is the intended bound and it is enforced (the 7th–10th `import-begin`
+return `conflict`), but it is a bound *chosen*, not a bound that is small. On a host with a small
+`/var` this is a way for an ordinary user to fill it. `health.import_staging` reports the count.
+
+### 4.7 A per-user entry whose file has vanished cannot be forgotten
+
+C4 rule 3 requires a per-user entry's `path` to pass `open_safe_fd`, and it was not relaxed — so an
+entry naming a file that no longer exists is DROPPED at load and `safe-forget` cannot reach it. The
+drop is reported in `health.registry_errors` and the message NAMES THE FILE TO REMOVE, and the file
+is in the caller's own home where `rm` is a real remedy. A **system** entry whose file vanished is
+not dropped, stays listed, and can still be forgotten — which is the case that matters, because
+only root could clean `/etc`.
+
+### 4.8 If the system registry root is untrusted or missing, per-user safes disappear too
+
+`load_registry` returns early when the system registry root fails its trust check, and the per-user
+registry is not read either. Fail-closed and unchanged from before this feature, but newly
+surprising: removing `/etc/cockpit-secrets` now makes a user's OWN safes vanish from `list`, not
+just the administrator's.
+
+### 4.9 A safe created here always has a passphrase, and a key-file-only import is refused
+
+Stricter than C7 asks, and structural rather than lazy: this helper never registers a key-file
+PATH, and `safe-registry.schema.json` permits `password_required: false` only alongside a
+registered `keyfile` or `yubikey_slot`. Writing "no passphrase" would mean storing the key file at
+a path we register, and the schema's own comment says what that is worth — *"an attacker who gets
+the safe gets the key in the same directory"*. So `import-commit` refuses a file that opens with a
+key file and no passphrase, with `unsupported` and the reason.
+`tests/fixtures/lab-kdbx41-keyfile-only.kdbx` is therefore not importable through this verb. An
+administrator can still hand-write that entry.
+
+### 4.10 The dispatcher's credential guard is a name check, not a taint analysis
+
+`_refuse_undeclared_credential` refuses a request key that is a declared secret field, or one of
+the aliases named in `_CREDENTIAL_ALIASES`. A client that shipped a passphrase to `import-begin`
+under a key called `note` would not be caught: nothing inspects the VALUE, and nothing could
+without being a worse idea than the problem. What the guard buys is that the obvious spellings —
+the ones a real client or a real regression would use — are refused by name on the server, so C5's
+ordering is no longer a promise made only by `secrets.js`.
+
+### 4.11 A PWS3 this program creates cannot take attachments
+
+`Backend.build_new` writes format version **0x030D**, and the attachment fields (0x25..0x29)
+were introduced at **0x030F** (Password Safe V3.68), so `attach-add` refuses on a Password Safe
+database `safe-create` made — correctly, and naming the version. Everything else on it works:
+entries, fields, TOTP, history, save.
+
+The version is deliberately not raised, and the reasoning is `backends/psafe3.py`'s: a declared
+version is a claim about which readers can open a file, raising it would make every safe created
+here unreadable by Password Safe before 3.68, and **there is no Password Safe on this host to
+check either choice against** (COMPATIBILITY §3.3). Refusing loudly at a version everything reads
+is the conservative half of that trade.
+
+What was actually wrong was that nobody was told until they tried. `safe-create` now returns a
+`warnings` entry saying it at the moment the operator picks the format, with the remedy in the
+same sentence — create the safe in Password Safe itself and adopt it here. It was found by
+running the live walkthrough against a CREATED PWS3 rather than the committed fixture, which is
+the kind of thing only a live run finds.
+
+### 4.12 A 128 MiB upload has been staged, but never committed
+
+The memory measurements in I54 used a real 128 MiB staging. What was never built is a VALID 128 MiB
+safe, so `import-commit` at that size — and the sustained half of I54's amplification, where a
+valid large staging survives a successful inspect and can be re-inspected without limit — is
+inference from two measured facts rather than one measured attack. `MAX_ATTACHMENT_BYTES` (32 MiB)
+against `MAX_REQUEST_BYTES` (1 MiB) makes building one slow.

@@ -2,14 +2,14 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "https://edt1/cockpit-secrets/schema/safe-registry.schema.json",
   "title": "cockpit-secrets safe registry entry",
-  "description": "One JSON object per file in /etc/cockpit-secrets/safes.d/*.json (directory 0755 root:root, files 0644 root:root). The registry is the ONLY source of safes: verbs take the 'id' from here and never a path from the caller (I4). An entry that fails this schema is DROPPED and logged by secrets-admin -- never partially applied, and never defaulted to the permissive access class (I1).",
+  "description": "One JSON object per file in the SYSTEM registry /etc/cockpit-secrets/safes.d/*.json (directory 0755 root:root, files 0644 root:root) or in a PER-USER registry ~/.config/cockpit-secrets/safes.d/*.json (directory 0700, files 0600, owned by that user). The registry is the ONLY source of safes: verbs take the 'id' from here and never a path from the caller (I4). An entry that fails this schema is DROPPED and logged by secrets-admin -- never partially applied, and never defaulted to the permissive access class (I1). The same schema validates both registries, but the per-user one is read ONLY by a helper running unescalated as that user, every entry loaded from it is FORCED to access:'user' whatever the file says, and a system entry with the same id always wins -- see docs/CONTRACT.md, 'The per-user registry'. This file is written by hand, and (since 0.4.0) by the safe-create and safe-import verbs; the three provenance keys at the bottom are the only ones those verbs add.",
   "type": "object",
   "additionalProperties": false,
   "required": ["id", "label", "format", "path"],
 
   "properties": {
     "id": {
-      "$comment": "The name every verb uses to reach this safe, and the name written into the audit log and the backup ring. It is matched literally, so a duplicate id across two files in safes.d means the lexically LAST file silently wins -- keep them unique. Slashes, spaces, '..' and upper case are refused because this string reaches file names and log lines; allowing them would put path traversal into the one identifier the whole access model is keyed on.",
+      "$comment": "The name every verb uses to reach this safe, and the name written into the audit log and the backup ring. It is matched literally, so a duplicate id across two files in ONE registry directory means the lexically LAST file silently wins -- keep them unique. (Across the two registries there is no silent winner: the system entry wins and the shadowed per-user entry is reported in health.registry_errors[].) Slashes, spaces, '..' and upper case are refused because this string reaches file names and log lines; allowing them would put path traversal into the one identifier the whole access model is keyed on. DELIBERATE ASYMMETRY: this pattern still accepts '.' and '_' because entries written by hand before 0.4.0 use them, and TIGHTENING IT HERE WOULD DROP THOSE ENTRIES -- silently deleting a working safe from an operator's list on upgrade. The safe-create / safe-import verbs MINT ids against the stricter '^[a-z0-9][a-z0-9-]{1,62}$' (published as constants.safe_id_pattern) because a minted id becomes a file name this program chose; the looser pattern here is what the loader will still READ.",
       "type": "string",
       "minLength": 1,
       "maxLength": 63,
@@ -40,7 +40,7 @@
     },
 
     "access": {
-      "$comment": "THE ACCESS CLASS, AND THE MOST DANGEROUS FIELD IN THIS FILE. 'admin' means the helper refuses the verb unless euid == 0 and the real caller is in one of 'groups'; the plugin calls it with superuser:'require'. 'user' means the helper runs unescalated as the logged-on user and the safe file must be owned by that user. OMITTING THIS KEY MEANS 'admin' -- the default is the restrictive class on purpose (I1), because a typo in this file must fail closed. Setting 'user' on a root-owned safe does not make it readable; it makes every unlock fail with 'access-denied'. Setting 'admin' on a safe in a user's home directory is worse: it asks a root helper to open a file in a directory that user controls, and only the O_NOFOLLOW/fstat/parent-directory guards stand between that and a symlink attack.",
+      "$comment": "THE ACCESS CLASS, AND THE MOST DANGEROUS FIELD IN THIS FILE. 'admin' means the helper refuses the verb unless euid == 0 and the real caller is in one of 'groups'; the plugin calls it with superuser:'require'. 'user' means the helper runs unescalated as the logged-on user and the safe file must be owned by that user. OMITTING THIS KEY MEANS 'admin' -- the default is the restrictive class on purpose (I1), because a typo in this file must fail closed. Setting 'user' on a root-owned safe does not make it readable; it makes every unlock fail with 'access-denied'. Setting 'admin' on a safe in a user's home directory is worse: it asks a root helper to open a file in a directory that user controls, and only the O_NOFOLLOW/fstat/parent-directory guards stand between that and a symlink attack. IN A PER-USER REGISTRY THIS KEY IS NOT HONOURED: every entry loaded from ~/.config/cockpit-secrets/safes.d/ is forced to 'user', and one that declares 'admin' is DROPPED and logged rather than obeyed -- otherwise a file the user can write would be a file that names its own access class, which is the whole trust root handed over in one line.",
       "type": "string",
       "enum": ["admin", "user"],
       "default": "admin"
@@ -203,6 +203,89 @@
         }
       },
       "default": { "keep": 10, "dir": null }
+    },
+
+    "origin": {
+      "$comment": "PROVENANCE, and it is a RECORD rather than a permission. 'manual' (the default, and what every entry written before 0.4.0 means) is 'an administrator hand-wrote this entry and put the file there'; 'created' means safe-create minted both the file and this entry; 'imported' means safe-import staged an uploaded file, opened it with a credential the uploader supplied, and then minted both. Set it wrong and you have lied to the operator about where a safe came from -- which matters most in the safe-delete confirmation, where 'this program made this file' is the sentence that makes destroying it feel reasonable. It does NOT decide whether safe-delete will run: that gate is the DERIVED one (the entry's 'path' must equal the path this program would mint for this id and access class today), precisely so a hand-edited 'origin' cannot talk the helper into unlinking a file it did not create. Omitting the key means 'manual', which is the honest default for a file this program did not write.",
+      "type": "string",
+      "enum": ["manual", "created", "imported"],
+      "default": "manual"
+    },
+
+    "created_utc": {
+      "$comment": "When THIS ENTRY was written by safe-create or safe-import, UTC, RFC-3339 with a literal trailing 'Z'. It is not the safe file's mtime, not when the database inside it was first made, and it is never updated by a save -- an entry that says 2026-09-04 next to a safe modified this morning is correct, not stale. Set it wrong and the only cost is a misleading answer to 'when did this safe appear on this host'; the audit log is the authority for that and this is the convenience copy. null (and absence) means 'not recorded', which is what a hand-written entry says.",
+      "anyOf": [
+        { "type": "null" },
+        {
+          "type": "string",
+          "minLength": 20,
+          "maxLength": 27,
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,6})?Z$"
+        }
+      ],
+      "default": null
+    },
+
+    "source": {
+      "$comment": "THE HEADER SUMMARY READ AT IMPORT TIME, AND NOTHING MORE. safe-import's inspect step parses the UNAUTHENTICATED header of the staged bytes -- format, version, cipher, KDF and its parameters are readable by anyone holding the file, which is why that step needs no credential at all -- and this key records what it said, so an operator can later see what they adopted without unlocking it. Three things it is NOT, each of which is a way to get this wrong: it is not re-verified afterwards, so it goes stale the moment the safe is rewritten with different parameters by another client; it is not authenticated, so on a tampered file it records what an attacker wrote; and NOTHING is keyed on it -- the backend reads the real header on every unlock and does not consult this. The damage from a wrong value is therefore an operator who believes a safe is stronger (or a different format) than it is. null, and absence, mean 'not recorded' and are correct for a hand-written or created-here entry.",
+      "anyOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["inspected_utc"],
+          "properties": {
+            "format_version": {
+              "$comment": "The version string the header declared, e.g. '4.1' or '0x030F'. Cosmetic; the backend re-reads it.",
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32
+            },
+            "cipher": {
+              "$comment": "The cipher named in the header, e.g. 'aes256-cbc', 'chacha20', 'twofish-cbc'. Cosmetic; the backend re-reads it. Recording a cipher this build cannot open does not make it openable -- unlock still answers with the backend's own reason.",
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32
+            },
+            "kdf": {
+              "$comment": "The KDF named in the header, e.g. 'argon2id', 'argon2d', 'aes-kdf', 'sha256-iterated'. Cosmetic; the backend re-reads it.",
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32
+            },
+            "kdf_params": {
+              "$comment": "The KDF's declared cost, as the header stated it -- BEFORE the Limits clamps, so a value here may legitimately exceed what this host will derive. Every key is optional and every one is an integer, and additionalProperties is false: THE HELPER MUST DROP A PARAMETER IT HAS NO KEY FOR HERE RATHER THAN WRITE IT, because writing an unknown key makes the whole entry fail validation on the next load and the operator's safe disappears from the list. A new KDF gains its key in this file in the same change as the backend that reports it, never after.",
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "memory_kib": { "type": "integer", "minimum": 0 },
+                "time":       { "type": "integer", "minimum": 0 },
+                "parallelism":{ "type": "integer", "minimum": 0 },
+                "rounds":     { "type": "integer", "minimum": 0 },
+                "iterations": { "type": "integer", "minimum": 0 }
+              }
+            },
+            "bytes": {
+              "$comment": "Size of the file as imported. Compare it with the file today to see that something has rewritten the safe since; that is all it is for.",
+              "type": "integer",
+              "minimum": 0
+            },
+            "sha256_at_import": {
+              "$comment": "Lower-case hex SHA-256 of the bytes AS UPLOADED, which safe-import verified against the digest the operator declared before it would inspect them. IT IS NOT A TAMPER CHECK FOR LATER: the first save rewrites the file and this digest stops matching, correctly and permanently. Its one job is answering 'is the file on this host the file I uploaded' at a moment when nothing has written to it yet. Treating a mismatch as evidence of tampering on a safe that has been used is a misreading of this field, not a finding.",
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "inspected_utc": {
+              "$comment": "When the header above was read, UTC, RFC-3339 with a literal trailing 'Z'. Required, because a header summary with no timestamp invites being read as current.",
+              "type": "string",
+              "minLength": 20,
+              "maxLength": 27,
+              "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,6})?Z$"
+            }
+          }
+        }
+      ],
+      "default": null
     }
   },
 

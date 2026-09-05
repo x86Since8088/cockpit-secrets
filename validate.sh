@@ -62,7 +62,12 @@ done
 ((found_py)) || skip "no python sources yet"
 rm -f /tmp/.pyerr
 
-for f in manifest.json etcdefaults/*.json tests/fixtures/*.json; do
+# `etcdefaults/*.json` does NOT descend, so the per-user registry example under
+# `etcdefaults/user-safes.d/` was the one shipped registry entry no gate looked
+# at. One extra glob puts it under the standing check, the same way install.sh's
+# schema-validation loop now covers it.
+for f in manifest.json etcdefaults/*.json etcdefaults/user-safes.d/*.json \
+         tests/fixtures/*.json; do
     [[ -f $f ]] || continue
     if python3 -c "import json,sys;json.load(open(sys.argv[1]))" "$f" 2>/dev/null
     then pass "json $f"; else fail "json $f is not valid JSON"; fi
@@ -274,6 +279,154 @@ if [[ -f secrets-admin ]]; then
         pass 'INPUT-2 parse_request answers invalid for a body it cannot parse'
     else fail "INPUT-2 parse_request no longer catches RecursionError"; fi
 else skip "INPUT-2 secrets-admin not written yet"; fi
+
+# ------------------------------------------------ the registry write path ---
+#
+# Everything below closes a defect found in the 0.4.0 red-team round. Each one
+# is here because the mistake is CHEAP TO GREP FOR: a ban that has to
+# understand the program is a ban that will be wrong, and these are all "this
+# exact spelling means the fix is gone".
+
+# I43 — the candidate check must take BYTES. It used to take the staged file's
+# PATH while import-commit separately re-read that path for the bytes it wrote,
+# so the bytes that were proven to open and the bytes that landed as a safe
+# were never the same bytes. The signature IS the fix: with bytes there is
+# nothing left to re-read.
+if [[ -f secrets-admin ]]; then
+    bad=0
+    grep -q 'def _open_candidate(fmt, data, password, keyfile, \*, mine):' \
+        secrets-admin || bad=1
+    grep -q 'def _header_facts(fmt, data):' secrets-admin || bad=1
+    # And no second read of the staged blob inside the commit body: exactly one
+    # `read_all` may appear there, and it is the one at the top.
+    n=$(sed -n '/^def _commit_staged/,/^def /p' secrets-admin \
+        | grep -c 'read_all(' || true)
+    (( n <= 1 )) || bad=1
+    if ((bad)); then
+        fail "I43 the import candidate check takes a path again, or the commit re-reads the staged blob"
+        grep -n 'def _open_candidate\|def _header_facts' secrets-admin | sed 's/^/        /'
+    else pass "I43 the import candidate check takes bytes, read once"; fi
+else skip "I43 secrets-admin not written yet"; fi
+
+# I44 — open_safe_fd's S_ISREG refusal runs AFTER the open, and open(2) on a
+# FIFO blocks forever, so the check could never run. One flag is the fix.
+if [[ -f backends/base.py ]]; then
+    if sed -n '/^def open_safe_fd/,/^def /p' backends/base.py \
+       | grep -q 'flags |= os.O_NONBLOCK'; then
+        pass "I44 open_safe_fd opens O_NONBLOCK so a FIFO cannot hang it"
+    else fail "I44 open_safe_fd can block forever on a FIFO in the registry"; fi
+else skip "I44 backends/base.py not written yet"; fi
+
+# I45/I47/I48/I49/I50 — five properties of the two verbs that destroy or create.
+if [[ -f secrets-admin ]]; then
+    bad=""
+    grep -q 'def _land_new_safe(' secrets-admin \
+        || bad+=" I45:no-_land_new_safe"
+    # No verb may place a safe and publish its entry as two independent steps:
+    # `_place_new_safe` is called from exactly ONE place, and that place is
+    # `_land_new_safe`, which unlinks the file again if the entry cannot be
+    # published. A second call site is the orphan back.
+    n=$(sed -n '/^def _land_new_safe/,/^def /p' secrets-admin \
+        | grep -c '_place_new_safe(' || true)
+    t=$(grep -c '_place_new_safe(' secrets-admin || true)   # 1 def + 1 call
+    (( n == 1 && t == 2 )) || bad+=" I45:_place_new_safe-appears-$t-times-(want 1 def + 1 call in _land_new_safe)"
+    grep -q 'path = _minted_path_or_refuse(entry, ctx)' secrets-admin \
+        || bad+=" I47:no-derived-path-gate"
+    # The ring must be derived from the minted path, never from the registry.
+    sed -n '/^def _delete_ring/,/^def /p' secrets-admin \
+        | grep -q 'backup_dir_for(safe_path, None)' || bad+=" I47:ring-not-derived"
+    # safe-delete unregisters BEFORE it shreds: v_safe_forget must appear
+    # before the first _shred in the verb body.
+    body=$(sed -n '/^def v_safe_delete/,/^def /p' secrets-admin)
+    f=$(printf '%s' "$body" | grep -n 'v_safe_forget(' | head -1 | cut -d: -f1)
+    d=$(printf '%s' "$body" | grep -n '_shred(path)' | head -1 | cut -d: -f1)
+    [[ -n $f && -n $d ]] && (( f < d )) || bad+=" I48:shred-before-unregister"
+    grep -q 'confirm = req.get("delete_confirm")' secrets-admin \
+        || bad+=" I49:delete-confirm-field"
+    # The DEFINITION and the CALL, counted: grepping for the name alone passed
+    # with the call replaced by `pass`, because the def line spells it the same
+    # way. Two occurrences is one def plus one call site, and the call site is
+    # checked to be inside run_verb.
+    g=$(grep -c '_refuse_undeclared_credential(verb, req)' secrets-admin || true)
+    (( g == 2 )) || bad+=" I50:credential-guard-appears-$g-times-(want def+call)"
+    sed -n '/^def run_verb(/,/^# ===/p' secrets-admin \
+        | grep -q '^        _refuse_undeclared_credential(verb, req)$' \
+        || bad+=" I50:guard-not-called-from-run_verb"
+    if [[ -n $bad ]]; then
+        fail "the registry write path lost a guard:$bad"
+    else pass "I45/I47/I48/I49/I50 create rolls back, delete is derived, unregisters first, reads its declared confirm, and refuses an undeclared credential"; fi
+else skip "I45/I47/I48/I49/I50 secrets-admin not written yet"; fi
+
+# I46 — the helper's own loader must accept the keys the helper writes. Both
+# halves in one check, because either alone is the bug: writing a key the
+# loader drops makes the operator's safe vanish from `list`, and `origin`,
+# `created_utc` and `source` were declared in the schema and shipped in
+# examples while `_KNOWN_KEYS` did not list them.
+if [[ -f secrets-admin && -f schema/safe-registry.schema.json ]]; then
+    if python3 tests/ban_registry_vocabulary.py >/tmp/.vocab 2>&1
+    then pass "I46 _KNOWN_KEYS and safe-registry.schema.json declare the same keys"
+    else fail "I46 the helper's registry vocabulary disagrees with its own schema file"
+         sed 's/^/        /' /tmp/.vocab | head -8; fi
+    rm -f /tmp/.vocab
+else skip "I46 helper or schema not written yet"; fi
+
+# I51/I52/I53/I54/I55 — the five smaller ones, each a single spelling.
+if [[ -f secrets-admin ]]; then
+    bad=""
+    # The loader must RECORD every file that declared an id, and forget must
+    # READ that list. Grepping for the key name alone passed with the recording
+    # line replaced by `pass`, because the same key appears again in the
+    # duplicate branch; and grepping forget for `raise Conflict(` passed with
+    # `dupes` hard-coded empty, because the branch was still there and simply
+    # never taken. Both are pinned to the line that does the work.
+    grep -q '            entry\["registry_files"\] = \[name\]' secrets-admin \
+        || bad+=" I51:loader-does-not-record-every-file"
+    sed -n '/^def v_safe_forget/,/^def _shred/p' secrets-admin \
+        | grep -q 'dupes = \[n for n in (entry.get("registry_files") or \[\])' \
+        || bad+=" I51:forget-does-not-read-the-list"
+    grep -q '_LABEL_SPOOF_CHARS' secrets-admin || bad+=" I52:label-constant"
+    grep -q 'unicodedata.category(ch) == "Cf"' secrets-admin || bad+=" I52:Cf-sweep"
+    sed -n '/^def _sweep_staging/,/^def /p' secrets-admin \
+        | grep -q 'os.lstat(d)' || bad+=" I53:sweep-follows-symlinks"
+    sed -n '/^def _staging_destroy/,/^def /p' secrets-admin \
+        | grep -q 'dir_fd=dirfd' || bad+=" I53:destroy-unlinks-by-path"
+    # BOTH expensive verbs, named individually: the slot on one of the two is
+    # not a bound, and a whole-file grep passed with the inspect call site
+    # removed because the commit one still matched.
+    sed -n '/^def v_import_inspect/,/^def _inspect_staged/p' secrets-admin \
+        | grep -q 'with _ImportWorkSlot(' || bad+=" I54:inspect-unbounded"
+    sed -n '/^def v_import_commit/,/^def _commit_staged/p' secrets-admin \
+        | grep -q 'with _ImportWorkSlot(' || bad+=" I54:commit-unbounded"
+    # I55 — a safe that is destroyed takes its I16 counter with it, and a safe
+    # created at a freed id starts clean. Both call sites, because the counter
+    # can be inherited through either route (delete-then-create, or
+    # forget-remove-create) and one of the two alone leaves the other open.
+    sed -n '/^def _land_new_safe/,/^def /p' secrets-admin \
+        | grep -q 'lockout_reset(ctx.ident, entry\["id"\])' \
+        || bad+=" I55:create-inherits-a-stale-lockout"
+    sed -n '/^def v_safe_delete/,/^def /p' secrets-admin \
+        | grep -q 'lockout_reset(ctx.ident, entry\["id"\])' \
+        || bad+=" I55:delete-leaves-its-lockout-armed"
+    if [[ -n $bad ]]; then
+        fail "the registry write path lost a smaller guard:$bad"
+    else pass "I51/I52/I53/I54/I55 duplicate ids, spoofed labels, the staging sweep, import concurrency and the lockout of a reused id are all still guarded"; fi
+else skip "I51/I52/I53/I54/I55 secrets-admin not written yet"; fi
+
+# EVERY FIELD A VERB READS MUST BE A FIELD ITS SCHEMA DECLARES.
+#
+# This is I49 generalised, and it is the check that would have found it on its
+# own: `safe-delete` read `confirm` while the schema published
+# `delete_confirm`, so the destructive verb was unreachable through the
+# published interface and destroyed on a field nobody was told about. An AST
+# walk, not a grep, because `req.get("x")` has to be attributed to the verb
+# function it appears in.
+if [[ -f secrets-admin ]]; then
+    if python3 tests/ban_undeclared_fields.py >/tmp/.undecl 2>&1
+    then pass "I49 every field a verb reads is declared in its schema request"
+    else fail "I49 a verb reads a request field its schema does not declare"
+         sed 's/^/        /' /tmp/.undecl | head -12; fi
+    rm -f /tmp/.undecl
+else skip "I49 secrets-admin not written yet"; fi
 
 # Not a KNOWN_ISSUES hazard, just a trap that cost real time: a stray NUL byte
 # in a source file parses fine, passes both gates, and makes grep treat the

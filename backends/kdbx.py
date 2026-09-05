@@ -174,6 +174,55 @@ _KDF_ARGON2D = b"\xefcm\xdf\x8c)DK\x91\xf7\xa9\xa4\x03\xe3\n\x0c"
 _KDF_ARGON2ID = b"\x9e)\x8b\x19V\xdbGs\xb2=\xfc>\xc6\xf0\xa1\xe6"
 _KDF_AESKDF = b"\xc9\xd9\xf3\x9ab\x8aD`\xbft\r\x08\xc1\x8aO\xea"
 
+#: Cipher UUID by name — the reverse of `_CIPHERS`, for the one operation that
+#: CHOOSES a cipher instead of reading one. Built from the same dict so the two
+#: directions cannot drift.
+_CIPHER_UUIDS = {name: uuid for uuid, name in _CIPHERS.items()}
+
+#: The nonce/IV length each cipher needs. **Getting this wrong produces a file
+#: that authenticates perfectly and decrypts to garbage**, because the header
+#: HMAC covers the IV field whatever length it is: KeePass reads 12 bytes for
+#: ChaCha20 and 16 for the AES/Twofish block ciphers, so a 16-byte ChaCha20
+#: nonce is a different keystream, not an error. It is a table rather than a
+#: default because there is no safe default to fall back to.
+_CIPHER_IV_LEN = {"aes256": 16, "twofish": 16, "chacha20": 12}
+
+#: What `create_new` will build. Deliberately a short list:
+#:
+#:   * **4.1 is the default and 4.0 is offered** because KeePassXC 2.7 writes
+#:     4.1 and every maintained reader accepts it. 3.x is NOT offered at all —
+#:     this backend opens KDBX3 read-only because the format has no
+#:     authenticated encryption (I20), and creating a file in a format we
+#:     refuse to write would be a safe the operator could never save.
+#:   * **Argon2id is the default**, Argon2d selectable. Argon2id is the variant
+#:     RFC 9106 §4 tells you to pick when you do not have a specific reason;
+#:     Argon2d is here because KeePass's own blank template uses it and an
+#:     operator whose other databases are Argon2d may want to match.
+#:   * **AES-256 and ChaCha20**, not Twofish. We can READ a Twofish KDBX, but
+#:     nothing in this tree has ever WRITTEN one and the KDBX Twofish mode has
+#:     no foreign-oracle coverage in `tests/` — shipping a create path whose
+#:     output nothing has checked against KeePassXC is exactly the I19 failure
+#:     this project measures rather than claims.
+_NEW_KDBX_VERSIONS = ("4.1", "4.0")
+_NEW_KDBX_CIPHERS = ("aes256", "chacha20")
+_NEW_KDBX_KDFS = ("argon2id", "argon2d")
+
+#: `create_new` options, exhaustively. Anything else is `invalid` rather than
+#: ignored — the registry loader's rule (`additionalProperties: false`) applied
+#: to a request body, and for the registry's reason: a misspelt `cypher` that
+#: is silently dropped gives the operator a database that is not the one they
+#: asked for, and the half that survives is always the default.
+_NEW_KDBX_OPTIONS = frozenset({
+    "format_version", "cipher", "kdf", "memory_kib", "time", "parallelism",
+    "name",
+})
+
+#: Longest database name `create_new` will write into `Meta/DatabaseName`. The
+#: name is operator text going into XML — lxml escapes it, and `_check_text`
+#: bounds it at `MAX_FIELD_BYTES` — but a database name is a label, not a
+#: field, and 256 bytes is already far past anything a UI can render.
+_MAX_DB_NAME_BYTES = 256
+
 #: VariantDictionary value types (KDBX4 KDF parameters).
 _VD_UINT32 = 0x04
 _VD_UINT64 = 0x05
@@ -1298,6 +1347,20 @@ def _parse_iso(text, what="time"):
     return value.astimezone(_dt.timezone.utc)
 
 
+def _kdbx4_time(when=None):
+    """A KDBX4 timestamp: base64 of little-endian uint64 seconds since year 1.
+
+    The inverse of the conversion `_convert_times_to_kdbx4` performs. It exists
+    for `build_new`, which has to stamp a document copied from a template whose
+    every timestamp is the day that template was built — an unremarkable detail
+    until a "new" database claims it was created in 2020 and every audit that
+    reads it is wrong about when the operator's safe came into existence.
+    """
+    when = when or _dt.datetime.now(_dt.timezone.utc)
+    seconds = int((when - _KP_EPOCH).total_seconds())
+    return base64.b64encode(struct.pack("<Q", seconds)).decode("ascii")
+
+
 def _check_text(value, what):
     """Bound one field's size before it is stored (I7)."""
     if value is None:
@@ -1670,10 +1733,67 @@ class KdbxBackend(Backend):
         _install_xml_hardening()                     # idempotent; fail closed
         if password is None and self.entry.get("password_required", True):
             # The schema permits password_required:false only alongside a key
-            # file, but a schema is not an enforcement point (I1).
+            # file, but a schema is not an enforcement point (I1). This is
+            # REGISTRY policy and is therefore here rather than in
+            # `_open_bytes`, which knows only about bytes and a credential.
             raise BadCredential(_BAD_CRED)
 
         data, fp = self._read()
+        warnings = self._open_bytes(data, password, keyfile,
+                                    yubikey_response=yubikey_response,
+                                    what="opening this database")
+        if self.entry.get("yubikey_slot") and self._header.major >= 4:
+            # Said at unlock as well as at probe: the probe warning is shown
+            # before the token is touched, and a caller that goes straight to
+            # `unlock` (the agent, a script, the integration suite) never sees
+            # it. A property this important should not depend on which door was
+            # used. See `_YUBIKEY_CONSTANT_CHALLENGE_WARNING`.
+            warnings.append(_YUBIKEY_CONSTANT_CHALLENGE_WARNING)
+
+        self.fingerprint = fp
+        self.warnings = warnings
+        self.handle = _sysrandom.token_hex(16)       # 128 bits, opaque
+        self.unlocked = True
+        return {
+            "handle": self.handle,
+            # In the default configuration the handle dies with this process,
+            # so there is no clock to report: 0 means "as long as this
+            # operation" (docs/ARCHITECTURE.md). A session or the opt-in agent
+            # is the only thing that gives it a lifetime.
+            # `or {}` and not a default: the schema allows "agent": null, and
+            # `.get("agent", {})` returns None for that, not the default.
+            "expires_in": int((self.entry.get("agent") or {}).get(
+                "idle_seconds", 0)
+                if (self.entry.get("agent") or {}).get("enabled") else 0),
+            "entries_total": len(self._index),
+            "groups_total": len(self._group_index),
+            "warnings": list(self.warnings),
+        }
+
+    def _open_bytes(self, data, password, keyfile, *, yubikey_response=None,
+                    what="opening this database"):
+        """THE READER. Clamp -> derive -> verify -> parse -> index. Returns
+        the warnings; the caller owns the fingerprint, the handle and
+        `self.unlocked`.
+
+        Split out of `unlock()` so that `open_candidate()` — the import gate —
+        can be the SAME code rather than a second parse path that agrees with
+        it today. That is I24/I41's lesson stated one layer up: a validator
+        which accepted a file this reader would later refuse would report a
+        successful import and fail at the first unlock, after the operator had
+        deleted the copy they uploaded from. There is exactly one function that
+        turns KDBX bytes into an open database, and this is it.
+
+        What is deliberately NOT here, because it is REGISTRY policy rather
+        than a property of the bytes: the `password_required` check, the
+        `yubikey_slot` warning, and the fingerprint. `unlock()` keeps those; a
+        candidate has no registry entry to have policy in.
+
+        Nothing decrypted escapes before the MAC verifies (I6), and every
+        refusal below the credential answers `BadCredential` with the one
+        shared detail.
+        """
+        _install_xml_hardening()                     # idempotent; fail closed
         hdr = _read_header(data)
         _clamp_kdf(hdr)                              # I7 — BEFORE deriving
 
@@ -1699,13 +1819,6 @@ class KdbxBackend(Backend):
                 "this database is KDBX %s; writes stay off until the "
                 "round-trip check confirms nothing would be lost"
                 % hdr.version)
-        if self.entry.get("yubikey_slot") and hdr.major >= 4:
-            # Said at unlock as well as at probe: the probe warning is shown
-            # before the token is touched, and a caller that goes straight to
-            # `unlock` (the agent, a script, the integration suite) never sees
-            # it. A property this important should not depend on which door was
-            # used. See `_YUBIKEY_CONSTANT_CHALLENGE_WARNING`.
-            warnings.append(_YUBIKEY_CONSTANT_CHALLENGE_WARNING)
 
         # Only now is it safe to let a parser near the plaintext. pykeepass
         # gets the transformed key and NOT the passphrase, so the master
@@ -1720,7 +1833,7 @@ class KdbxBackend(Backend):
             # per-entry cost. Measured before it existed: 100 000 entries whose
             # protected values fail to decode took 46 s at 100% CPU and were
             # then accepted.
-            with Limits.parse_budget(what="opening this database"):
+            with Limits.parse_budget(what=what):
                 kp = PyKeePass(io.BytesIO(data), transformed_key=transformed)
         except (Invalid, Unsupported):
             raise
@@ -1734,12 +1847,11 @@ class KdbxBackend(Backend):
         self._tk = Secret(transformed)
         self._header = hdr
         self._data = data
-        self.fingerprint = fp
         self._reindex()
         # Over-size is refused here rather than earlier because the counts are
         # only knowable once the payload is parsed. `lock()` — not a bare
         # `self._kp = None` — is what drops the transformed key with it: an
-        # unlock that ends in a refusal must not leave key material behind.
+        # open that ends in a refusal must not leave key material behind.
         if len(self._index) > Limits.MAX_ENTRIES:
             self.lock()
             raise Invalid("this database declares more than %d entries"
@@ -1748,25 +1860,7 @@ class KdbxBackend(Backend):
             self.lock()
             raise Invalid("this database declares more than %d groups"
                           % Limits.MAX_GROUPS)
-
-        self.warnings = warnings
-        self.handle = _sysrandom.token_hex(16)       # 128 bits, opaque
-        self.unlocked = True
-        return {
-            "handle": self.handle,
-            # In the default configuration the handle dies with this process,
-            # so there is no clock to report: 0 means "as long as this
-            # operation" (docs/ARCHITECTURE.md). A session or the opt-in agent
-            # is the only thing that gives it a lifetime.
-            # `or {}` and not a default: the schema allows "agent": null, and
-            # `.get("agent", {})` returns None for that, not the default.
-            "expires_in": int((self.entry.get("agent") or {}).get(
-                "idle_seconds", 0)
-                if (self.entry.get("agent") or {}).get("enabled") else 0),
-            "entries_total": len(self._index),
-            "groups_total": len(self._group_index),
-            "warnings": list(self.warnings),
-        }
+        return warnings
 
     def _challenge_component(self, hdr, yubikey_response):
         """Turn a token answer into its composite-key contribution, or None.
@@ -3227,6 +3321,386 @@ class KdbxBackend(Backend):
             raise Invalid("this KDBX file carries %d bytes after the end of "
                           "its payload" % (len(data) - off))
 
+    # -- creation and import  (C1..C7) -------------------------------------
+
+    @classmethod
+    def header_facts(cls, data):
+        """`Backend.header_facts` for KDBX. **No credential, none needed.**
+
+        Everything returned is outer-header cleartext — the same bytes
+        `probe()` reports from a registered safe, read from staged bytes
+        instead of from a path. That is the whole justification for answering
+        it before a passphrase is asked for: the format, the cipher and the KDF
+        parameters are readable with `head -c 300 | xxd` by anyone holding the
+        file, and the person who just uploaded it holds the file.
+
+        `_clamp_kdf` runs HERE and refuses out of range, which is the point of
+        doing this step at all: a database asking for `m=4 GiB, t=1000000` must
+        be refused before an operator is asked for a passphrase they would then
+        wait minutes to be told was wrong (I7). A rejection at this step costs
+        the host microseconds; the same rejection one step later costs it the
+        derivation.
+
+        `needs_password` / `needs_keyfile` are the honest answer and not a
+        guess: **KDBX records nothing about which credentials open it.** For a
+        registered safe `probe()` answers from the registry, which is the only
+        authority there is (I1); a candidate has no registry entry yet, so the
+        warning says so rather than the fields implying a fact the file does
+        not carry.
+        """
+        hdr = _read_header(data)
+        _clamp_kdf(hdr)                      # I7 — before anyone is prompted
+        warnings = []
+        if hdr.major < 4:
+            warnings.append(_KDBX3_WARNING)
+        if hdr.major == 4 and hdr.minor > 1:
+            warnings.append(
+                "this database is KDBX %s, newer than the 4.1 this backend "
+                "was written against" % hdr.version)
+        warnings.append(
+            "KDBX does not record whether a key file is needed, so this "
+            "cannot say; if the database needs one, supply it with the "
+            "passphrase.")
+        # The salt is dropped rather than reported: it is not secret, but it is
+        # key-derivation material with no meaning to an operator, and a summary
+        # that ships bytes invites a caller to render them.
+        params = {k: v for k, v in (hdr.kdf_params or {}).items()
+                  if k != "salt" and isinstance(v, int)}
+        return {
+            "format": "kdbx",
+            "version": hdr.version,
+            "cipher": hdr.cipher,
+            "kdf": hdr.kdf,
+            "kdf_params": params,
+            "needs_password": True,
+            "needs_keyfile": False,
+            # Outer-header cleartext like everything else here: the inner
+            # payload's compression flag lives in the inner header and is NOT
+            # this; `_read_header` reads the one byte the outer header carries.
+            "compressed": bool(hdr.compressed),
+            "warnings": warnings,
+        }
+
+    @classmethod
+    def open_candidate(cls, data, *, password, keyfile):
+        """`Backend.open_candidate` for KDBX: `_open_bytes`, and nothing else.
+
+        The instance it builds has an EMPTY path and `mode: "ro"`. That is not
+        decoration — it is the statement that this object can never write: it
+        was never opened from a file, it has no fingerprint to re-check, and
+        `require_writable()` refuses it. The only thing it does is run the
+        reader `unlock()` runs, on bytes somebody uploaded.
+
+        Routing through `_open_bytes` rather than a bespoke parse is the whole
+        design (I24/I41 one layer up), and it is what makes the error taxonomy
+        come out right for free: a malformed header is `Invalid` and names the
+        reason, because `_read_header` ran before any key material existed; a
+        wrong passphrase, a failed header HMAC, a failed block HMAC and every
+        structural failure on decrypted-but-unauthenticated bytes all answer
+        `BadCredential` with the one shared detail, because `_verify_kdbx4` and
+        `_map_pykeepass_error` already flatten them (I6).
+
+        `lock()` in the `finally` is what stops the transformed key outliving
+        the check — including on the refusal paths, which is where a forgotten
+        wipe usually lives.
+        """
+        probe = cls({"id": "(candidate)", "label": "candidate",
+                     "format": "kdbx", "path": "", "mode": "ro"})
+        try:
+            warnings = probe._open_bytes(data, password, keyfile,
+                                         what="checking this database")
+            hdr = probe._header
+            return {
+                "format": "kdbx",
+                "version": hdr.version,
+                "cipher": hdr.cipher,
+                "kdf": hdr.kdf,
+                "entries": len(probe._index),
+                "groups": len(probe._group_index),
+                "warnings": warnings,
+            }
+        finally:
+            probe.lock()
+
+    @classmethod
+    def build_new(cls, *, credential, options):
+        """`Backend.build_new` for KDBX. Returns the bytes of an empty 4.1 db.
+
+        **Touches no disk.** The one file it reads is `blank_database.kdbx`
+        inside the installed pykeepass package — a fixed, package-owned
+        constant, not a path anyone can name, exactly as `upgrade_to_kdbx4`
+        already reads it. I4 is about a path a browser can supply; this is a
+        module resource.
+
+        WHY A TEMPLATE AND NOT A DOCUMENT BUILT FROM NOTHING. A KDBX4 file is
+        an outer header, an inner header, a compressed XML document and a
+        protected-value stream, and pykeepass can only produce one by writing
+        one it already has. Hand-rolling the document would mean this module
+        owned a second, independent idea of what a valid KeePassFile looks
+        like — the exact reader/writer split I24 and I41 are both made of. So
+        the template supplies the SHAPE, and everything that must not be
+        inherited is replaced:
+
+          * every key and nonce — master seed, encryption IV, KDF salt, inner
+            protected-stream key. A template's seed is a published constant;
+            two safes created from it that shared one would share a keystream.
+          * the cipher, the KDF and its cost, per `options`.
+          * the format version, so the file says 4.1 rather than the template's
+            4.0. 4.1 adds fields; it removes none, so a document using none of
+            them is a valid 4.1 database, which is what KeePassXC writes too.
+          * every timestamp and the generator string, so a brand-new safe does
+            not claim to have been created in 2020 by KeePassXC.
+          * the root group's UUID, so two safes created here are not the same
+            group to a client that merges them.
+          * the template's `CustomData`, which is KeePassXC's own bookkeeping
+            (a decryption-time preference and a `_LAST_MODIFIED` string) and is
+            a claim about a program that did not write this file.
+
+        The database is seeded with an empty root group and NOTHING else — no
+        sample entry, no default password. A template credential in a password
+        manager is a thing operators leave behind, and one that looks real is a
+        thing they later mistake for real.
+
+        Before it returns it runs, in this order, both guarantees the ABC
+        requires of it: `_assert_lossless()` (I22 — a database that could not
+        be SAVED must never be CREATED, or the operator's first edit refuses)
+        and `_verify_own_output()` (I24/I41 — re-read what we built through the
+        reader a later unlock uses). `Backend.create_new` then re-opens the
+        result from cold with the passphrase, which is the part neither of
+        these can prove.
+        """
+        _install_xml_hardening()                     # idempotent; fail closed
+        opts = cls._new_options(options)
+        password = (credential or {}).get("password")
+        keyfile = (credential or {}).get("keyfile")
+
+        blank_path = os.path.join(os.path.dirname(pykeepass.__file__),
+                                  "blank_database.kdbx")
+        with open(blank_path, "rb") as fh:
+            blank = fh.read()
+        # The template's own passphrase is a published constant; opening it
+        # costs one Argon2 run at the template's cost and is the price of
+        # having pykeepass hand us a document it can serialise.
+        new = PyKeePass(io.BytesIO(blank), password="password")
+
+        head = new.kdbx.header.value
+        head.minor_version = 1 if opts["format_version"] == "4.1" else 0
+        dh = head.dynamic_header
+        dh.cipher_id.data = opts["cipher"]
+
+        salt = os.urandom(32)
+        master_seed = os.urandom(32)
+        kdfp = dh.kdf_parameters.data.dict
+        kdfp["$UUID"].value = (_KDF_ARGON2ID if opts["kdf"] == "argon2id"
+                               else _KDF_ARGON2D)
+        kdfp["S"].value = salt
+        kdfp["I"].value = opts["time"]
+        kdfp["M"].value = opts["memory_kib"] * 1024   # the file stores BYTES
+        kdfp["P"].value = opts["parallelism"]
+        kdfp["V"].value = 0x13                        # Argon2 1.3
+        dh.master_seed.data = master_seed
+        dh.encryption_iv.data = os.urandom(_CIPHER_IV_LEN[opts["cipher"]])
+        try:
+            new.kdbx.body.payload.inner_header.protected_stream_key.data = \
+                os.urandom(64)
+        except (AttributeError, KeyError):
+            # The template is KDBX4 and always has one; a KeyError here would
+            # mean the packaged template changed shape under us, and building a
+            # file whose inner stream key is a published constant is not an
+            # outcome worth continuing into.
+            raise Internal("the packaged KDBX template is not the shape this "
+                           "backend was written against")
+        # The header is a construct RawCopy: with `data` present the builder
+        # replays those bytes verbatim and ignores every edit above.
+        del new.kdbx.header["data"]
+
+        cls._seed_new_document(new.tree.getroot(), opts["name"])
+
+        # Derive under the parameters we just WROTE, described as a header of
+        # our own so the clamps run against them one more time. `_clamp_kdf` on
+        # our own file is not ceremony: `options` reached us from a request,
+        # and the check that a request cannot make this host spend four
+        # gigabytes belongs on every path that could, not only the one that
+        # reads a hostile file (I7).
+        want = KdbxHeader()
+        want.major, want.minor = 4, head.minor_version
+        want.kdf = opts["kdf"]
+        want.kdf_params = {"salt": salt, "time": opts["time"],
+                           "memory_kib": opts["memory_kib"],
+                           "parallelism": opts["parallelism"],
+                           "argon_version": 0x13}
+        want.master_seed = master_seed
+        _clamp_kdf(want)
+
+        composite = _composite_key(password, keyfile)
+        try:
+            transformed = _derive(want, composite)
+        finally:
+            composite = b"\x00" * 32
+
+        holder = cls({"id": "(new)", "label": "new safe", "format": "kdbx",
+                      "path": "", "mode": "rw"})
+        try:
+            buf = io.BytesIO()
+            try:
+                new.save(buf, transformed_key=transformed)
+            except Exception as exc:
+                raise holder._map_pykeepass_error(exc)
+            data = buf.getvalue()
+
+            out_hdr = _read_header(data)
+            # Clamped on the way OUT as well as on the way in: this is what the
+            # file actually says, read back by the same parser a later unlock
+            # will use, so a builder that wrote a parameter we would refuse to
+            # read is caught here rather than at the operator's next unlock.
+            _clamp_kdf(out_hdr)
+            if out_hdr.cipher != opts["cipher"] or out_hdr.kdf != opts["kdf"] \
+                    or out_hdr.version != opts["format_version"]:
+                raise Internal("the database we built does not describe the "
+                               "cipher, KDF and version that were asked for")
+
+            # A live, unlocked backend over the bytes we just built, so the two
+            # guarantees below are the SAME code the save path runs rather than
+            # a creation-flavoured imitation of them.
+            holder._kp = new
+            holder._tk = Secret(transformed)
+            holder._header = out_hdr
+            holder._data = data
+            holder.unlocked = True
+            holder._reindex()
+            holder._assert_lossless()                # I22, before it exists
+            holder._verify_own_output(data)          # I24/I41, on these bytes
+            return data
+        finally:
+            # Drops our copy of the transformed key on every path, refusals
+            # included. What it cannot reach is documented on `lock()` (I14).
+            holder.lock()
+
+    @staticmethod
+    def _new_options(options):
+        """Validate and default `create_new`'s KDBX options. Raises `Invalid`.
+
+        Fails closed on an unknown key, for the registry loader's reason: a
+        misspelt `cypher` that is quietly ignored gives the operator a database
+        that is not the one they asked for, and the half that survives a
+        half-applied request is always the default.
+
+        The costs are clamped with the WRITE floors applied, so a request
+        cannot talk this program into creating a safe weaker than it is willing
+        to write — the same asymmetry `Limits.PWS3_WRITE_MIN_ITER` has, for the
+        same reason: reading somebody else's weak file is not our decision, and
+        creating one is.
+        """
+        options = dict(options or {})
+        unknown = sorted(set(options) - _NEW_KDBX_OPTIONS)
+        if unknown:
+            # Echo the key only when it is plainly a key: an operator who
+            # mistyped `cypher` is helped by seeing it back, and an attacker
+            # who put a control sequence in a JSON key must not have it
+            # reflected into a log line or a banner (I15).
+            shown = str(unknown[0])
+            if not re.fullmatch(r"[A-Za-z0-9_-]{1,32}", shown):
+                shown = "an unrecognised key"
+            raise Invalid("unknown option %r for a new KDBX database" % shown)
+
+        version = str(options.get("format_version") or _NEW_KDBX_VERSIONS[0])
+        if version not in _NEW_KDBX_VERSIONS:
+            # `unsupported` and not `invalid`: the request was well formed and
+            # the answer will not change until the format does. KDBX 3.x lands
+            # here on purpose — this backend opens it read-only (I20), so
+            # creating one would hand the operator a safe they could not save.
+            raise Unsupported("this backend creates KDBX %s only; KDBX 3.x has "
+                              "no authenticated encryption and is never written"
+                              % " or ".join(_NEW_KDBX_VERSIONS))
+        cipher = str(options.get("cipher") or _NEW_KDBX_CIPHERS[0])
+        if cipher not in _NEW_KDBX_CIPHERS:
+            raise Unsupported("this backend creates KDBX databases with %s "
+                              "only" % " or ".join(_NEW_KDBX_CIPHERS))
+        kdf = str(options.get("kdf") or _NEW_KDBX_KDFS[0])
+        if kdf not in _NEW_KDBX_KDFS:
+            raise Unsupported("this backend creates KDBX databases with %s "
+                              "only" % " or ".join(_NEW_KDBX_KDFS))
+
+        def _int(key, default):
+            value = options.get(key)
+            if value is None:
+                return default
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise Invalid("%s must be an integer" % key)
+            return value
+
+        memory_kib = _int("memory_kib", Limits.ARGON2_DEFAULT_MEMORY_KIB)
+        time_cost = _int("time", Limits.ARGON2_DEFAULT_TIME)
+        parallelism = _int("parallelism", Limits.ARGON2_DEFAULT_PARALLELISM)
+        Limits.check_argon2(memory_kib, time_cost, parallelism, for_write=True)
+
+        name = options.get("name")
+        if name is not None:
+            if not isinstance(name, str):
+                raise Invalid("name must be a string")
+            if len(name.encode("utf-8", "surrogatepass")) > _MAX_DB_NAME_BYTES:
+                raise Invalid("name is longer than %d bytes"
+                              % _MAX_DB_NAME_BYTES)
+            if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in name):
+                # Control characters in an XML text node are either illegal
+                # (NUL, most C0) or invisible, and an invisible character in a
+                # database's own name is a display spoof waiting to happen.
+                raise Invalid("name contains a control character")
+        return {"format_version": version, "cipher": cipher, "kdf": kdf,
+                "memory_kib": memory_kib, "time": time_cost,
+                "parallelism": parallelism, "name": name or ""}
+
+    @staticmethod
+    def _seed_new_document(root, name):
+        """Turn the template's document into a NEW database's document.
+
+        Everything here is a fact the template asserts that would be false
+        about the file we are creating. See `build_new` for the list and the
+        reasoning; this function is only the mechanics.
+        """
+        stamp = _kdbx4_time()
+        meta = root.find("Meta")
+        if meta is None:
+            raise Internal("the packaged KDBX template has no Meta element")
+        for tag, text in (("Generator", "cockpit-secrets"),
+                          ("DatabaseName", name)):
+            el = meta.find(tag)
+            if el is None:
+                el = etree.SubElement(meta, tag)
+            el.text = text
+        for tag in ("DatabaseNameChanged", "DatabaseDescriptionChanged",
+                    "DefaultUserNameChanged", "MasterKeyChanged",
+                    "RecycleBinChanged", "EntryTemplatesGroupChanged",
+                    "SettingsChanged"):
+            el = meta.find(tag)
+            if el is not None:
+                el.text = stamp
+        custom = meta.find("CustomData")
+        if custom is not None:
+            for child in list(custom):
+                custom.remove(child)
+
+        group = root.find("Root/Group")
+        if group is None:
+            raise Internal("the packaged KDBX template has no root group")
+        uuid_el = group.find("UUID")
+        if uuid_el is not None:
+            uuid_el.text = base64.b64encode(os.urandom(16)).decode("ascii")
+        name_el = group.find("Name")
+        if name_el is not None:
+            name_el.text = name or "Root"
+        times = group.find("Times")
+        if times is not None:
+            for el in times:
+                if el.tag in ("LastModificationTime", "CreationTime",
+                              "LastAccessTime", "LocationChanged"):
+                    el.text = stamp
+        # The template ships an empty root group already; assert it rather than
+        # trust it, because "seeded with nothing else" is the property and a
+        # future template that carried a sample entry would break it silently.
+        if group.findall("Entry") or group.findall("Group"):
+            raise Internal("the packaged KDBX template is not empty")
+
     def _verify_own_output(self, data):
         """Prove we can READ what we are about to write, before we write it.
 
@@ -3876,6 +4350,80 @@ def _selfcheck():                                       # noqa: C901
             backend.lock()
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+
+    # -------------------------------- create_new / validate_candidate ------
+    #
+    # The FOREIGN oracle for these lives in tests/ — `keepassxc-cli db-info`
+    # against a database this created is the only thing that answers I19, and a
+    # self-check cannot be it, because a reader and a writer that share a bug
+    # round-trip perfectly. What this section proves is the half a self-check
+    # CAN prove: that the refusals refuse, that the defaults are the defaults,
+    # and that a created database comes back through our own reader.
+    print("\n== create_new / validate_candidate (C1, C5, C7, I7) ==")
+    new_pass = "selfcheck-create-pass-not-a-real-secret"
+    made = KdbxBackend.create_new(credential=new_pass)
+    hdr = _read_header(made)
+    ok("create_new produces KDBX 4.1", hdr.version == "4.1")
+    ok("...AES-256 with Argon2id by default",
+       hdr.cipher == "aes256" and hdr.kdf == "argon2id")
+    ok("...at the documented default cost",
+       hdr.kdf_params["memory_kib"] == Limits.ARGON2_DEFAULT_MEMORY_KIB
+       and hdr.kdf_params["time"] == Limits.ARGON2_DEFAULT_TIME
+       and hdr.kdf_params["parallelism"] == Limits.ARGON2_DEFAULT_PARALLELISM)
+    summary = KdbxBackend.validate_candidate(made, credential=new_pass)
+    ok("...and it opens with the credential it was created with",
+       summary["entries"] == 0 and summary["groups"] == 1)
+    ok("...seeded with an empty root group and nothing else",
+       summary["entries"] == 0)
+    facts = KdbxBackend.inspect_bytes(made)
+    ok("inspect_bytes reads the header with no credential",
+       facts["cipher"] == "aes256" and facts["kdf"] == "argon2id"
+       and facts["version"] == "4.1")
+    # Two creates must not share a seed. This is the one property a template
+    # makes easy to get wrong, and the consequence is a shared keystream.
+    made2 = KdbxBackend.create_new(credential=new_pass)
+    ok("two creates share no master seed",
+       _read_header(made2).master_seed != hdr.master_seed)
+    ok("...and no KDF salt",
+       _read_header(made2).kdf_params["salt"] != hdr.kdf_params["salt"])
+    ok("...and no root group uuid", made2 != made)
+    cc = KdbxBackend.create_new(credential=new_pass,
+                                options={"cipher": "chacha20",
+                                         "kdf": "argon2d"})
+    cc_hdr = _read_header(cc)
+    ok("ChaCha20 + Argon2d are selectable",
+       cc_hdr.cipher == "chacha20" and cc_hdr.kdf == "argon2d")
+    ok("...with a 12-byte ChaCha20 nonce, not a 16-byte one",
+       len(cc_hdr.encryption_iv) == _CIPHER_IV_LEN["chacha20"])
+    raises("a wrong passphrase on a candidate -> BadCredential", BadCredential,
+           lambda: KdbxBackend.validate_candidate(made,
+                                                  credential=new_pass + "!"))
+    raises("bytes that are not a KDBX database -> Invalid", Invalid,
+           lambda: KdbxBackend.validate_candidate(b"not a database" * 32,
+                                                  credential=new_pass))
+    raises("...and inspect_bytes refuses them without a credential", Invalid,
+           lambda: KdbxBackend.inspect_bytes(b"not a database" * 32))
+    raises("an unknown create option -> Invalid", Invalid,
+           lambda: KdbxBackend.create_new(credential=new_pass,
+                                          options={"cypher": "aes256"}))
+    raises("KDBX 3.x is never created (I20) -> Unsupported", Unsupported,
+           lambda: KdbxBackend.create_new(credential=new_pass,
+                                          options={"format_version": "3.1"}))
+    raises("Twofish is not offered -> Unsupported", Unsupported,
+           lambda: KdbxBackend.create_new(credential=new_pass,
+                                          options={"cipher": "twofish"}))
+    raises("an Argon2 cost below the write floor -> Invalid", Invalid,
+           lambda: KdbxBackend.create_new(credential=new_pass,
+                                          options={"memory_kib": 1024}))
+    raises("an Argon2 cost above the ceiling -> Invalid (I7)", Invalid,
+           lambda: KdbxBackend.create_new(
+               credential=new_pass,
+               options={"memory_kib": Limits.ARGON2_MAX_MEMORY_KIB + 1}))
+    raises("a control character in the name -> Invalid", Invalid,
+           lambda: KdbxBackend.create_new(credential=new_pass,
+                                          options={"name": "a\x00b"}))
+    raises("an empty passphrase -> Invalid (C7)", Invalid,
+           lambda: KdbxBackend.create_new(credential=""))
 
     print()
     if failures:

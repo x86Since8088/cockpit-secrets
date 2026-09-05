@@ -946,3 +946,394 @@ This supersedes §7.
   constant in it was left anywhere on this host.
 
 ---
+
+---
+
+# Round 5 — the 0.4.0 registry-write feature
+
+**What was attacked.** The code that lets an operator create a safe and adopt an
+existing one: `safe-create`, `import-begin` / `-chunk` / `-inspect` / `-commit` /
+`-abort`, `safe-forget`, `safe-delete`, and the per-user registry those verbs
+made necessary. This is the first release in which a **browser request writes
+into the registry**, and the registry is the trust root: it says which files are
+safes, where they live, and what access class each one has.
+
+**Result: twelve confirmed defects, all fixed** (I43–I54) — plus a thirteenth, I55, which the
+round did not find and this release's own host cleanup did. Two of the twelve —
+`safe-delete` shredding any file a registry entry named, and `safe-delete`
+destroying the file before it unregistered it and then reporting the whole thing
+refused — are High. This section is the record of the round, and it includes
+what bounced off, because a stress report with no failures in it is a list of
+things somebody remembered to test.
+
+## The shape of the twelve
+
+Ten of them are the OLD code being asked a question it had never been asked.
+`open_safe_fd` had never been pointed at a FIFO by an unprivileged user;
+`_shred` had never been handed a path that was not a safe; the staging sweep had
+never seen a name it did not create; `_KNOWN_KEYS` had never had to agree with
+an example somebody would copy. Handing a browser a write into the registry did
+not break those functions — it *reached* them.
+
+The two exceptions are new code, and they are the same mistake twice: **an
+invariant stated in a docstring that the code did not enforce.**
+`v_import_commit`'s docstring said "the only bytes that can ever become a safe
+are bytes that are demonstrably a safe the uploader can already open" while it
+read the staged file twice (I43); `_staging_destroy`'s comment argued that its
+flat two-unlink form was safer than a tree walk *because* nothing unexpected
+could be in the directory, while the sweep above it accepted a symlink (I53).
+A docstring is not a control.
+
+## What the round could NOT break — this is evidence, and it is kept
+
+### C1 / C2 — path minting and the id allow-list. The strongest part of the change.
+
+39 ids driven through `safe-create` against the real helper. Every one refused
+as `invalid` **before any filesystem call**: `../evil`, `/etc/shadow`,
+`..\evil`, `lab\x00/etc/shadow`, `lab-dc\n`, `lab-dc\r`, `LAB`, `-lead`,
+`lab.dc`, `lab_dc`, `a/b`, `.hidden`, `..`, `.`, `a` (too short), 64 chars,
+`lab dc`, the Cyrillic homoglyph `lаb-dc`, fullwidth `ｌａｂ`, the NFKC ligature
+`ﬁle`, the NFKC roman numeral `ⅰab`, `Klab` with a KELVIN SIGN, a soft hyphen, a
+ZWJ, U+202E, `lab\tdc`, `lab\x7fdc`, BOM-prefixed, `lab%2fdc`, empty, null, an
+int, a list, a dict, a bool, a float. Accepted, correctly: 63 chars, `lab-`,
+`lab--dc`, `1ab`. JSON `\u` escapes decode before the regex sees them so they
+buy nothing; `re.fullmatch` closes the trailing-newline corner (Python's `$`
+also matches before one); an explicit NUL check closes the str-vs-C mismatch.
+`_mint` reads nothing from the request — its only inputs are a validated id, the
+format suffix and the access class.
+
+**Overwriting, attacked three ways and none of them worked.** A 4000-iteration
+`ln -sfn <victim> <minted>.kdbx` loop against a live `safe-create` through its
+~1.4 s KDF window: `conflict`, victim byte-identical afterwards
+(`_refuse_conflict` uses `lexists`, so a dangling symlink is still a taken
+name, and `validate_new_path` re-checks after the KDF). Six rounds of twelve
+simultaneous creates for one id: exactly one OK and eleven conflicts, every
+round, never two winners — 72 attempts. And nothing landed outside the managed
+directories in any test, because no request field is path-like.
+
+The one thing that could not be closed and is reported as an attack that failed
+rather than as a proof: `atomic_replace` ends in an unconditional `os.replace`,
+and `validate_new_path`'s `lexists` is the only thing between it and an
+overwrite. The window is microseconds and 72 concurrent creates never produced
+two winners. A machine with different scheduling may behave differently.
+
+### C3 — class escalation. Refused every way it was asked.
+
+Unescalated `safe-create` with `access` = `"admin"`, `null`, omitted entirely,
+`"Admin"`, `"ADMIN"`, `"admin "`, `" admin"`, `["admin"]`, `{"access":"admin"}`.
+The first three are `access-denied` (admin IS the default); the rest are
+`invalid`. Same for `import-begin` with no access field. Duplicate JSON keys
+(`{"access":"user","access":"admin"}` and the reverse) resolve last-wins and
+both outcomes are safe. `import-commit` re-derives the class gate from kernel
+identity rather than trusting the staging meta. The system registry gained
+nothing in any run.
+
+### C4 — the per-user registry. All five rules held under attack.
+
+**Rule 1 was proved two ways rather than taken on the code's word**, because it
+is the rule the whole trust argument rests on.
+
+*An instrumented-open shim* — a `sitecustomize` wrapping `os.open`, `listdir`,
+`stat`, `lstat`, `mkdir`, `makedirs`, `unlink` and `builtins.open`, logging by
+path, reopening its log by path on each write so `harden_process`'s fd-close
+cannot silence it:
+
+```
+unescalated               -> 3 references to .config/cockpit-secrets   <- THE POSITIVE CONTROL
+unshare --map-root-user   -> 0 references, while still opening etc/safes.d twice
+```
+
+The positive control is the point: without it, "0 references" is also what a
+broken check looks like.
+
+*And `strace` at a REAL euid 0* through `/srv/jobs`, against a real
+`/home/cptest/.config/cockpit-secrets/safes.d` containing a planted entry: no
+syscall named that path, the system registry was read, and "planted" never
+appeared in the safe list. Noted in the code: `strace` cannot read the tracee's
+memory unescalated because `harden_process()` sets `PR_SET_DUMPABLE 0`, so paths
+come back as pointers — only the euid-0 trace is readable, and a grep over the
+unescalated one would have PASSED FOR THE WRONG REASON. The shim covers that
+side.
+
+Rule 2: an entry declaring `access:"admin"` is DROPPED, not downgraded. Rule 3:
+entries pointing at `/etc/shadow`, `/etc/ssh/ssh_host_ed25519_key` and a symlink
+to `/etc/shadow` were all dropped; a hardlink to the user's own file is accepted,
+which is correct — same inode, same owner, same 0600. Rule 5: a per-user
+`lab-one` colliding with a system `lab-one` is reported as shadowed and `list`
+serves the system one.
+
+**Not an existence oracle:** `registry_errors` distinguishes "does not exist"
+from "not accessible" only where the caller can already stat the parent. Under
+`/root` both answer "not accessible", because `_check_ancestor_dirs` fails first.
+
+### C5 — the import pipeline. No credential reached the pre-commit steps, and nothing landed that was not a safe.
+
+A SHA-256 mismatch is `invalid` at inspect AND the staging is destroyed. Garbage
+bytes: "this file is not a KeePass database", no credential involved, staging
+destroyed. Commit before inspect: `conflict`. A chunk that overruns the declared
+total: "nothing was written". `total_bytes = 2**40`: refused before a byte
+arrived. Wrong passphrase at commit: `bad-credential` AND the staging survives
+(verified by a successful inspect afterwards). Attempts 1–5 `bad-credential`,
+the 6th `not-found` with the staging destroyed, the 7th `access-denied`.
+Staging tokens `../../../etc`, `..`, `/etc/passwd`, 32 non-hex characters, `123`
+and `null` are all `invalid`; a well-formed but unknown token is `access-denied`
+rather than `not-found`, so there is no enumeration oracle.
+
+**The corpus differential — the headline negative result.** All 67 files in
+`tests/corpus/files/` were driven through BOTH paths and compared, not assumed:
+import (begin → chunk → inspect → commit with the sidecar's own credential) and
+unlock (the same file registered as a user-class safe).
+
+```
+total 67, differing 1     import over budget: []     import outside acceptable set: []
+```
+
+The single difference is `kdbx41-blocklen-zero.kdbx`: unlock answers
+`bad-credential`, import answers `invalid` at inspect ("this KDBX file carries
+4308 bytes after the end of its payload"). That is inside the sidecar's own
+acceptable set AND it is the STRICTER of the two — import refuses it before
+spending a credential. Every KDF bomb (Argon2 m=4 GiB, t=1e6, p=255, all-max;
+AES-KDF 1e9 rounds; PWS3 ITER 0 / 1 / 2047 / 2^31-1 / 2^32-1) is refused at
+`import-inspect` with no credential in 0.17–0.30 s. Both compression bombs and
+all four XML hazards are refused at commit inside the same reader `unlock` uses.
+**So there is no second, laxer parse path** — the I24/I41 mistake the lens was
+hunting for is not present.
+
+### Resource and arithmetic abuse — every one refused cleanly
+
+Negative `chunk_offset` → invalid; an offset ahead of `received` (a hole) →
+conflict; offset 2^63 → conflict; float 1.5 → invalid; bool `True` → invalid;
+empty `chunk_b64` → invalid; a 600 KiB chunk → invalid, refused by arithmetic on
+the base64 length *before decoding*; a chunk overrunning the declared total →
+"nothing was written"; a replayed offset → conflict; an overlapping chunk →
+conflict; `total_bytes` 0 / -5 / "1024" / 2^64 / MAX+1 → invalid before a byte
+arrives; a declared total 10 bytes SHORT → caught at inspect by the SHA-256,
+staging destroyed; 10 bytes LONG → `conflict` "incomplete", staging correctly
+KEPT and resumable. `IMPORT_MAX_STAGINGS` is enforced (the 7th–10th
+`import-begin` returned conflict). Two stagings for the same id committed
+concurrently: one ok, one conflict, one file, one entry.
+
+Chunk arrival is self-throttling and was measured rather than assumed: 4,333
+one-byte round trips/s inside one `open` session on tmpfs, 400/s with the state
+directory on real ext4 (~3 fsyncs per chunk) — 3.9 days to move 128 MiB one byte
+at a time.
+
+**ENOSPC, on a purpose-built 32 MiB ext4 loop filesystem at euid 0**: the upload
+stopped at 26,214,400 of 29,360,128 bytes with `internal` / "the chunk could not
+be staged: ENOSPC"; the filesystem was 100 % full; `meta.received` and the actual
+blob size still agreed exactly; inspect and commit both refused with `conflict`
+"incomplete"; NOTHING partial landed, the registry was untouched, and
+`import-abort` cleaned up. The one nit: a full disk is reported as `internal`
+rather than as a typed refusal.
+
+### Staging permissions, and disclosure
+
+Directory 0700, blob 0600, meta.json 0600, all owned by the euid — verified as
+an ordinary user and, through `/srv/jobs`, at a real euid 0 (0700/0600 root:root
+under `/var/lib/cockpit-secrets/state`). `cptest` (uid 1005, not in `sudo`) was
+denied `ls`, `cat` and `listdir` of a root-owned staging. A hypothesis that
+`harden_process`'s `umask(0o077)` came too late, or that `os.makedirs`' 0o777
+default for intermediates would leave `~/.config/cockpit-secrets` group-writable
+under this host's umask 0002, was WRONG and is disproved by measurement: all
+four directories 0o700, safe 0600, per-user registry file 0600, system registry
+file 0644.
+
+`import-inspect`'s response was dumped in full. It contains only
+format / version / cipher / kdf / kdf_params / iterations / compressed /
+needs_password / needs_keyfile / bytes / sha256_ok / authenticated:false, plus
+the operator's own id and label — every one of which is readable from the
+unauthenticated header by whoever holds the file. Nothing that needs the key.
+
+### Audit (I15)
+
+The whole audit log was grepped for `pw-attack`, `fixture-pass`, "correct horse",
+`/home/`, `/etc/` and `.kdbx` across every new verb: **0 hits**. `artifact` is
+null on every line; no `internal` outcome leaked a traceback. All eight new verbs
+were then driven again with a canary passphrase in every field, and the log
+carries verb / safe / uid / euid / outcome / note / duration / pid and nothing
+else.
+
+That absence is also what makes I47 unforensic, which is why it is cited there:
+the verb was audited by id, so nothing anywhere recorded which file it destroyed.
+
+## Re-proved after the fixes: the guarantees that predate 0.4.0
+
+The new write path could have broken any of these, so they were re-driven against the fixed
+helper rather than assumed. 27 checks, 0 failures.
+
+| property | how it was re-proved |
+|---|---|
+| **`entries` carries no sentinel** (I6, I15) | the fixture was ADOPTED through the import flow, then `entries` was dumped in full: the manifest's sentinel string appears nowhere in it, nor does the passphrase — and `reveal` DOES return a value, which is the positive control that the reader works |
+| **a live helper's `/proc` leaks no passphrase** (I10, I14) | an `open` session was unlocked and its `/proc/<pid>/cmdline` and `environ` read: the passphrase is in neither, argv is exactly the script and the verb, and `/proc/<pid>/mem` is `EACCES` **to its own owner** because `harden_process()` sets `PR_SET_DUMPABLE 0` |
+| **non-root is refused an admin safe, on the NEW verbs too** (I3) | `safe-create` with `access` absent, `safe-create` with `access:"admin"`, and `import-begin` with `access` absent are all `access-denied` unescalated — and the system registry and system safes directory gained nothing in any of the three |
+| **SIGKILL between the write and the rename** (I12) | twelve real saves killed at spreading offsets from 2 ms to 46 ms: the safe file is always either the old bytes or a complete new safe, it always still unlocks, and no temp file is left in the managed directory |
+| **the wrong-passphrase path is not faster** (I6) | four pairs, lockout cleared between each: the fastest WRONG answer was 1.009 s and the fastest RIGHT one 0.559 s, so a failure is slower, and every failure met the published `fail_floor_seconds` (0.75) |
+| **the lockout counter is exact under concurrency and per real uid** (I39, I40) | 30 simultaneous guesses against one safe: every one answered with a taxonomy code, `failures` equalled the number actually evaluated exactly, and the counter file is `fail.<REAL uid>.<safe>.json` |
+| **every save re-opens its own bytes** (I24, I41) | `Backend.create_new` re-opens what `build_new` returned through `validate_candidate` before it returns anything; `verify_own_output` is still required of `save`; the helper no longer builds a KDBX itself, so there is no second, unchecked writer; and a created PWS3 opens through the reader a later unlock uses |
+
+One thing that assertion set found, and it was the TEST rather than the program: the check
+"cmdline is exactly the two words it should be" failed because the lab invokes the helper by
+its shebang, so argv is `python3 <script> open` — three words. The property being asserted is
+that no third argument can carry a credential, and that is what it asserts now.
+
+## What this round did not cover, plainly
+
+* **A genuinely VALID 128 MiB safe.** Every large file pushed through the chunker
+  was noise, or a small safe with a garbage tail. So the sustained half of I54 —
+  a valid large staging survives a successful inspect and can be re-inspected
+  without limit — is two measured facts joined by inference, not one measured
+  attack. `MAX_ATTACHMENT_BYTES` (32 MiB) against `MAX_REQUEST_BYTES` (1 MiB)
+  made building one too slow to be worth it.
+* **A second unprivileged user racing the I43 window.** `cptest` was proved
+  unable to open the root staging directory at all, which is why it was not
+  pursued; the race was won as the OWNER of the staging in both the user-path
+  and the euid-0 case.
+* **`import-inspect`'s own internal double read** (SHA-256 over one read,
+  `probe()` over a second) was found by code reading and by the RSS measurement
+  that exposed it. No race was built to demonstrate a divergence between those
+  two reads; the fix removes the second read entirely.
+* **KDF-bomb behaviour** was checked against the committed corpus files only. No
+  new header parameter combinations were fuzzed.
+* **The `atomic_replace` race** described under C1 above.
+
+## Host hygiene
+
+The attack lab (`~/.cs-attack-lab`), the scratch shim and its logs, the 32 MiB
+loop filesystem and its image, `/opt/cs-audit`, and every safe landed during the
+round were all removed and the removal verified (`losetup` and `mount` both
+report 0 matches; `/var/lib/cockpit-secrets` holds only `state/` and `exports/`,
+both 0700 root, with no `import/` subdirectory).
+
+Two things were found that the round did NOT create and could not clean, and
+they are recorded because somebody should notice them:
+
+* `/home/eddie/.local/state/cockpit-secrets/audit.log` gained lines from a
+  `health` run before the hermetic tree was set up. It is append-only and it
+  predates the round.
+* `~/.config/cockpit-secrets/safes.d` and `~/.local/share/cockpit-secrets/safes`
+  held four `im-cf-pws--fieldlen-zero` / `im-cf-pws--non-utf` entries and safes
+  left in the DEVELOPER'S REAL HOME by an earlier corpus run. A test run writing
+  registry entries and safe files into a real home directory is a finding in its
+  own right, independent of this feature. They were removed during the 0.4.0
+  integration and the directories are now empty.
+
+## The gates, at the final state of the 0.4.0 tree
+
+Every one run from the source root after the last code change, against VERSION **0.4.0**.
+
+```
+./check.sh                                    secrets.js  syntax OK
+./validate.sh                                 validate.sh: OK
+                                              (JSON: 8 files including the per-user example)
+                                              (31 standing bans, 9 of them new to 0.4.0)
+                                              (unittest: 38 tests, OK)
+./run_tests.sh                                run_tests.sh: OK — 20/20 stages
+python3 backends/base.py                      163 checks, 0 failure(s)
+python3 -m backends.kdbx                      kdbx self-check: OK
+python3 -m backends.psafe3                    psafe3 self-check: OK
+python3 agent/secrets_agent.py --selfcheck    61 checks, 0 failure(s)
+python3 tests/corpus/gen_corpus.py --check    67 cases checked, 0 disagreed with their sidecar
+bash tests/oracle/build.sh                    build.sh: OK  pws3_oracle (3581529 bytes)
+node tests/browser/storage-check.selftest.js  6 checks, 0 failure(s)
+node tests/browser/ui.spec.js                 342 passed, 0 failed
+python3 tests/ban_registry_vocabulary.py      19 registry keys, agreed by both gates
+python3 tests/ban_undeclared_fields.py        40 verb functions checked against the live schema
+```
+
+`run_tests.sh`'s twenty stages, in the order it runs them:
+
+```
+PASS  syntax and standing bans (validate.sh)             7s
+PASS  javascript syntax (check.sh)                       0s
+PASS  backends/base.py self-check                        1s
+PASS  backends/psafe3 self-check                         3s
+PASS  backends/kdbx self-check                           5s
+PASS  agent self-check                                   0s
+PASS  twofish ECB vectors, both providers                1s
+PASS  integration: contract flow, both formats          47s
+PASS  integration: cross-backend conformance             3s
+PASS  integration: load-bearing properties              18s
+PASS  integration: the second-wave verbs                13s
+PASS  integration: the unlock agent, end to end          7s
+PASS  integration: the lockout — concurrency, identity, reach  62s
+PASS  integration: the adversarial findings             15s
+PASS  integration: the registry write path              62s
+PASS  integration: corpus vs the helper                 84s
+PASS  oracles: build and known-answer vectors            1s
+PASS  fixtures: verify against keepassxc-cli             3s
+PASS  ui: headless browser driver                       29s
+PASS  ui: item 4's storage oracle (I11, I42)             0s
+run_tests.sh: OK
+```
+
+### The lockout stage: it was failing at HEAD, and the test was wrong
+
+`integration: the lockout` had been reporting FAIL for three separate agents, all of whom
+correctly proved it was **not their regression** — it reproduced with a scratch tree at HEAD.
+Nobody had established which side was wrong, and "a known flake" is how a real defect
+eventually gets waved through, so it was chased down here.
+
+**The test was wrong, and it was wrong in the way that looks strongest.** Section A asserted
+that "exactly one of eight sequential wrong guesses was evaluated", which is only true while
+eight helper invocations fit inside the 2 s window the first failure opens. On a loaded machine
+they take 2.42 s, the eighth guess falls legitimately outside the window, the counter correctly
+records two failures — and the test reported a defect that was not there.
+
+It now **replays the escalating schedule** (2 s, 4 s, 8 s …) against the observed request
+timings, bracketing each check between the instant the helper was spawned and the instant it
+answered, and refusing any outcome that no instant inside that bracket could have produced. And
+a new section A0 **measures the first two windows against `LOCKOUT_BASE_SECONDS`** directly:
+
+```
+A0 — the backoff schedule, measured against the constants
+  ok   it opened a window of LOCKOUT_BASE_SECONDS (2.0 s)  -> measured 1.90 s, want 2.0 s
+  ok   a guess after the window is evaluated again  -> bad-credential
+  ok   and it opened a DOUBLED window (4.0 s), so the escalation is real  -> measured 3.91 s
+A — the sequential control
+  ok   every outcome is consistent with the helper's own backoff schedule, replayed against
+       the observed timings  -> {'bad-credential': 2, 'locked-out': 6} over 2.42s
+  ok   no more were evaluated than the clock allows  -> evaluated=2 ceiling=2 over 2.42s
+  ok   the counter records EXACTLY the evaluated attempts  -> failures=2 evaluated=2
+B — I39: 50 helper PROCESSES fired at once
+  ok   concurrency bought no attempt the clock did not allow  -> concurrent evaluated 1 over
+       1.57s, ceiling 1 (sequential evaluated 2 over 2.42s)
+63 checks, 0 failure(s)
+```
+
+**And the replacement is stronger, proved rather than asserted.** The first version of the
+replay called the helper's OWN `_backoff_for`, which made it self-referential: a scratch copy
+with `delay = 0.0 * LOCKOUT_BASE_SECONDS * ...` passed all 57 checks. The replay now spells the
+rule out a second time from the published constants, and the same broken copy fails **five**
+checks — including the two that measure the window directly.
+
+## The 0.4.0 integration's own honesty log
+
+Four defects were found in the TEST SUITE while proving the twelve fixes, and each one is the
+same class of problem: a check that could not fail.
+
+1. **A `waitForFunction` with a string body is `eval`,** and the live Cockpit CSP forbids it —
+   so the predicate was refused by the browser, the wait rejected, and a `.catch(() => null)`
+   turned that into "the assertion read a stale dialog". Two full live runs reported a create
+   that had plainly succeeded as a failure.
+2. **A predicate that was true before the button was clicked.** Matching the dialog's TEXT for
+   `created|invalid|refused` returned instantly, because the create form's own help text
+   contains those words.
+3. **`Recorder.item()` defaulted a null state to PASS,** so an item whose function threw
+   reported green. `live-registry`'s R2 was reported PASS on a run where it had aborted.
+4. **`input[type=checkbox]` is not "the confirmation boxes"** — a `toggle` FIELD renders as one
+   too, so ticking them all switched on `make_keyfile`.
+
+**And one defect was found by cleaning up.** After the live walkthrough every safe it had made
+was destroyed with `safe-delete` — the first time in this project's history that an id was
+freed from inside the program — and the next `safe-create` at the same id was `locked-out` on
+its first unlock, with the passphrase the operator had just chosen. I16's counter outlived the
+safe it counted for. That is not something any of the six adversarial lenses or the red-team
+round would have found, because none of them deletes a safe and then reuses its id; it took
+running the thing end to end and then tidying up. It is I55, it is fixed at both routes, and it
+is the argument for doing the cleanup as a step rather than as an afterthought.
+
+And three of the eight new `validate.sh` bans did not fire the first time they were tested
+against a deliberate violation, all for the same reason: they grepped for a NAME that also
+appears in a definition or a second call site. Counting occurrences, and anchoring each one to
+the line that does the work, is what makes them bans rather than decoration. **Every ban in
+this release was watched failing on a deliberate violation before it was kept.**

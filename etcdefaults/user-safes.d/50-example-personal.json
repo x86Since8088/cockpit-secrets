@@ -1,0 +1,28 @@
+{
+  "id": "example-personal",
+  "label": "EXAMPLE - copy this file, do not use it (per-user registry)",
+  "format": "kdbx",
+  "path": "/home/example/.local/share/cockpit-secrets/example-personal.kdbx",
+  "access": "user",
+  "owner": null,
+  "groups": [],
+  "mode": "ro",
+  "password_required": true,
+  "keyfile": null,
+  "yubikey_slot": null,
+  "agent": {
+    "enabled": false,
+    "idle_seconds": 300,
+    "max_seconds": 3600
+  },
+  "export_allowed": false,
+  "export_dir": null,
+  "breach_corpus": null,
+  "backup": {
+    "keep": 10,
+    "dir": null
+  },
+  "origin": "created",
+  "created_utc": "2026-09-04T09:31:07Z",
+  "source": null
+}

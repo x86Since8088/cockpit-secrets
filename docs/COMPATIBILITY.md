@@ -95,6 +95,38 @@ with nothing to detect it. Measured refusal detail:
 That is a *different* code from the registry's `mode: "ro"` (`access-denied`)
 and from the losslessness guard (`conflict`) — see §6.
 
+### 2.1a Formats this program CREATES (0.4.0)
+
+`safe-create` is new, and creating a file is a stronger claim than reading one:
+a safe only this program can open is the I19 failure with a new name. So the
+row is measured against the foreign oracle, not against our own reader.
+
+| Format created | Cipher | KDF | Foreign reader | Evidence |
+|---|---|---|---|---|
+| **KDBX 4.1** (the default) | AES-256 | Argon2id | **`keepassxc-cli` 2.7.10** | `db-info` on a database created by `KdbxBackend.create_new` reports `Cipher: AES 256-bit`, `KDF: Argon2id`, 1 group, 0 entries; `ls` reports `[empty]`; the version bytes at offset 8 are `01 00 04 00` = KDBX **4.1**; the database name is the operator's label |
+| KDBX 4.1 | ChaCha20 | Argon2d | `keepassxc-cli` 2.7.10 | `db-info` reports `Cipher: ChaCha20 256-bit`, `KDF: Argon2d` |
+| **PWS3** | Twofish-CBC | PWS3 stretch | `tests/oracle/pws3_oracle` | `read` reports `hmac_ok: true`, `iter 262144` (the format's own write floor), header Version `0x030D`, `WhatPerformedLastSave "cockpit-secrets 1.0.0"`, `records: []` |
+
+And the round trip, which is the part that matters: create → unlock → add an
+entry → save → **read it in the foreign oracle**, on all three variants.
+`keepassxc-cli ls` lists the entry and `keepassxc-cli show -a Password` returns
+the value that was set; the PWS3 oracle reports `hmac_ok=True` with the same
+title and password.
+
+**The write floors are ours, and they are stated rather than inherited.** A KDBX
+this program creates uses Argon2id at m=64 MiB / t=8 / p=2 by default, and an
+operator may raise but not lower the cost past OWASP's Argon2id minimum
+(m=19 MiB, t=2, p=1) — `Limits.ARGON2_WRITE_MIN_*`. A PWS3 it creates uses at
+least 262 144 iterations, which is Password Safe's own default. Reading somebody
+else's weaker file is not this program's decision; creating one is.
+
+**A created PWS3 declares 0x030D and therefore refuses attachments** — see §8, and
+`safe-create` says so in its response rather than leaving the operator to find out at first
+use. **KDBX 3.x is never created** (`unsupported`, naming the reason): the format has
+no authenticated encryption, so creating one would hand the operator a safe this
+program opens read-only. Twofish is never created either — `create_new` refuses
+it — because the read path for Twofish KDBX is the one §8 says is thinnest.
+
 ### 2.2 The interop matrix
 
 Seven operations, both directions — the six the interop question asks for, plus
@@ -390,19 +422,21 @@ corrupt file by timing either.
 `install.sh` copies), stubs only `cockpit.spawn`, and drives **Chromium 151**
 through Playwright 1.62.1. Result on this host:
 
-    124 passed, 0 failed
+    342 passed, 0 failed
 
 The rows that belong in a compatibility record rather than a test log:
 
 | Claim | Measured |
 |---|---|
-| the page draws everything the helper declares | **all 14 declared control types render**, 14 fields for 14 controls; **all 32 declared verbs are reachable** through the UI |
+| the page draws everything the helper declares | **all 15 declared control types render**; **all 41 declared verbs are reachable** through the UI, the eight registry-writing ones included — the sweep that asserts it reads the LIVE schema, so a verb added without a route fails it |
 | nothing persists in the browser (I11) | `localStorage` 0 keys, `sessionStorage` 0 keys, no cookie set, after a real unlock |
 | the passphrase path (I10) | the passphrase **never appeared on argv** and **did** travel in a request body on stdin — checked against what the stub actually received, not against what the page meant to send |
 | the passphrase field | no `name`, `autocomplete="off"`, not inside a `<form>` |
 | no CSP relaxation (I9) | no `eval`, no `Function`, no `WebAssembly`, no inline `<style>`/`<script>`, and `secrets.js` **names no browser storage API at all** |
 | YubiKey UI | the touch prompt, the declared slot and the full challenge are shown; an `unsupported` backend is reported as exactly that, the page states it will **not** fall back to passphrase-only, and exactly **one** unlock is attempted — never a silent retry |
-| accessibility | labelled `aria-modal` dialog, focus moves in on open, the trap holds for 30 tabs, Escape closes, status region polite / error region assertive, **0 px horizontal overflow at 640 px** |
+| accessibility | labelled `aria-modal` dialog, focus moves in on open, the trap holds for 30 tabs, Escape closes, status region polite / error region assertive, **0 px horizontal overflow at 640 px** — including inside the multi-step upload wizard, where each step moves focus into itself so a keyboard user is not stranded and Escape keeps working |
+| the upload ordering (C5) | asserted against the REQUEST BODIES the stub recorded: **no credential in any of the seven pre-commit requests**, the chunks reassemble byte-for-byte into the file that was picked, offsets are contiguous, each chunk is within the cap the helper named, and the SHA-256 the page computed matches node's own digest of the same bytes |
+| the destructive gate | ticking both confirmation boxes is **not** enough: `lab-d`, `mine` and `LAB-DC` all leave Run disabled, and only the exact id enables it. The request carries the id and `delete-safe:<id>` and **no path-shaped key** |
 | console | no uncaught page error and no console error anywhere in the walkthrough |
 
 What this does **not** cover is in §8: the stub records `superuser: "require"`
@@ -487,6 +521,9 @@ should be quoted as compatibility.
 | **A `.psafe3` this program wrote is one a FOREIGN reader can read back** | that **this** program can read it back: verified, both formats, on every save — see §8a. Every save re-opens the exact bytes through the reader a later unlock uses, before they replace a working file | **a foreign reader's view is still unknown.** No `.psafe3` this program wrote has ever been opened by anything but this program: `keepassxc-cli` cannot read PWS3 at all, and the Password Safe GUI cannot be driven on this host (§3.3). So "our reader accepts our writer" is the whole of the claim. The refusals at least now agree with themselves — a field this program refuses to read is one it refuses to write — but whether real Password Safe would have accepted it is unclaimed |
 | **A `.psafe3` written by the real Password Safe GUI** | nothing | see §3.3. `pwsafe` maps no window headlessly (proved against an `xmessage` control on the same Xvfb) and `--validate` never returns. This needs a human at a GUI |
 | **KeePass 2.x (the C# implementation) reading our files** | nothing | not installed here, and not installable offline. `keepassxc-cli` is a different implementation of the same format, not the reference one |
+| **A safe this program CREATED, read by anything other than `keepassxc-cli` 2.7.10 and our own PWS3 oracle** | that both of those read it — see §2.1a, including the create → add → save → foreign-read round trip on all three variants | the PWS3 oracle is a **second implementation, not a third party**: it was written for this project. There is still no Password Safe CLI on this host. So a created `.psafe3` has been read by exactly two readers, both of them ours in the sense that matters |
+| **A KDBX created here WITH A KEY FILE, opened by a foreign reader** | the key file this program generates is a KeePass 2.0 XML key file, and a safe created with one opens with it here and answers `bad-credential` without it | no database created here with a key file has been handed to `keepassxc-cli`. The key file is returned once and stored nowhere, so driving the oracle against one needs the operator's copy |
+| **A `.psafe3` created here holding an ATTACHMENT** | nothing, and it is refused rather than untested: `build_new` writes format 0x030D and the attachment fields need 0x030F, so `attach-add` answers `unsupported` naming the version. `safe-create` says so in its `warnings` at creation time | raising the version would make every safe created here unreadable by Password Safe before 3.68, and **there is no Password Safe on this host to check either choice against** (§3.3). So neither the current choice nor the alternative can be measured, and the conservative one is what ships |
 
 ### 8a. What moved OUT of §8 on 2026-09-04, and the evidence that moved it
 

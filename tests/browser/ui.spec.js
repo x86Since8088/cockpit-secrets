@@ -86,6 +86,175 @@ function baseResponses(over) {
     return Object.assign(r, over || {});
 }
 
+/* ------------------------------------ the registry-write verbs, synthetic --
+ *
+ * WHY THESE ARE DECLARED HERE AND NOT READ FROM THE LIVE HELPER.
+ *
+ * The rest of this suite drives the page against `secrets-admin schema`,
+ * deliberately, because a test that checked the page against a schema copied
+ * into this file would pass forever after the helper changed. That is still
+ * true of everything above.
+ *
+ * These eight verbs are the exception WHILE the helper half of the feature is
+ * being written: the page and the helper are two agents' work landing in the
+ * same tree, and this file is the page's half. So the shapes below are the
+ * ones agreed in the task brief, declared exactly as the helper's own schema
+ * declares a verb, and the page is driven against them. The moment
+ * `secrets-admin schema` publishes verbs with these ids, `registrySchema()`
+ * stops adding them — see the guard in it — so the suite flips over to the
+ * live descriptors on its own and any disagreement between this file and the
+ * helper surfaces as a failure here rather than as a page that quietly draws
+ * the wrong form.
+ *
+ * Nothing here is invented beyond the brief: every field is one the brief
+ * names, `access` defaults to admin (I1), and there is no path-shaped field in
+ * any request, which is itself asserted below. */
+const REG_FIELDS = [
+    { id: "id", label: "Safe id", control: "text", type: "string", required: true,
+      secret: false, default: null, min: null, max: null, maxlength: 63,
+      options: null, options_from: null,
+      pattern: "^[a-z0-9][a-z0-9-]{1,62}$",
+      placeholder: "lab-dc", unit: null,
+      help: "Lower case, digits and hyphens. The helper mints the file name from it.",
+      breaks_when_wrong: "The id is the whole of what this page sends about where the " +
+          "safe lives. No path, no file name, no directory (I4).",
+      fields: null, partial: false },
+    { id: "new_label", label: "Label", control: "text", type: "string", required: false,
+      secret: false, default: null, min: null, max: null, maxlength: 128,
+      options: null, options_from: null, pattern: null, placeholder: null, unit: null,
+      help: "What this safe is called on screen.", breaks_when_wrong: null,
+      fields: null, partial: false },
+    { id: "new_format", label: "Format", control: "select", type: "string", required: true,
+      secret: false, default: "kdbx", min: null, max: null, maxlength: null,
+      options: null, options_from: null, enum: "format",
+      pattern: null, placeholder: null, unit: null,
+      help: "Which file format to create.", breaks_when_wrong: null,
+      fields: null, partial: false },
+    { id: "access", label: "Access class", control: "select", type: "string", required: false,
+      secret: false, default: "admin", min: null, max: null, maxlength: null,
+      options: null, options_from: null, enum: "access",
+      pattern: null, placeholder: null, unit: null,
+      help: "Administrator is the default.",
+      breaks_when_wrong: "An entry with no access class is an administrator safe (I1).",
+      fields: null, partial: false },
+    { id: "generate_keyfile", label: "Generate a key file", control: "toggle",
+      type: "boolean", required: false, secret: false, default: false,
+      min: null, max: null, maxlength: null, options: null, options_from: null,
+      pattern: null, placeholder: null, unit: null,
+      help: "The helper makes one and hands it to you once.",
+      breaks_when_wrong: "There is no second copy of it anywhere.",
+      fields: null, partial: false },
+    { id: "total_bytes", label: "Total size", control: "number", type: "integer",
+      required: true, secret: false, default: null, min: 1, max: null, maxlength: null,
+      options: null, options_from: null, pattern: null, placeholder: null, unit: "bytes",
+      help: "Declared up front so an oversized file is refused before it is sent.",
+      breaks_when_wrong: null, fields: null, partial: false },
+    { id: "sha256", label: "SHA-256", control: "text", type: "string", required: true,
+      secret: false, default: null, min: null, max: null, maxlength: 64,
+      options: null, options_from: null, pattern: "^[0-9a-f]{64}$",
+      placeholder: null, unit: null,
+      help: "Of the whole file, so the helper can prove it reassembled the same bytes.",
+      breaks_when_wrong: null, fields: null, partial: false },
+    { id: "token", label: "Staging token", control: "hidden", type: "string",
+      required: true, secret: false, default: null, min: null, max: null, maxlength: null,
+      options: null, options_from: null, pattern: null, placeholder: null, unit: null,
+      help: "Minted by import-begin.", breaks_when_wrong: null, fields: null, partial: false },
+    { id: "offset", label: "Offset", control: "number", type: "integer", required: true,
+      secret: false, default: null, min: 0, max: null, maxlength: null,
+      options: null, options_from: null, pattern: null, placeholder: null, unit: "bytes",
+      help: "Where this chunk starts.", breaks_when_wrong: null, fields: null, partial: false }
+];
+
+function regVerb(id, over) {
+    return Object.assign({
+        id, group: "safes", title: id, help: "", danger: false, mutates: true,
+        needs: "none", stdin: true, session_only: false, request: [],
+        response: {}, confirm: null, audited: true, access: "class",
+        breaks_when_wrong: null
+    }, over);
+}
+
+const REG_VERBS = [
+    regVerb("safe-create", {
+        title: "Create a safe",
+        help: "Makes the file, encrypts it, and writes the registry entry.",
+        request: ["id", "new_label", "new_format", "access", "password", "keyfile_b64",
+                  "generate_keyfile"],
+        response: { ok: "bool", id: "str", path: "str", registry: "str" },
+        breaks_when_wrong: "An entry with no access class is an administrator safe (I1)."
+    }),
+    regVerb("import-begin", {
+        title: "Begin an import",
+        help: "Declares an upload. No credential.",
+        request: ["id", "new_label", "new_format", "access", "total_bytes", "sha256"],
+        response: { token: "str", chunk_bytes: "int", expires_in: "int" }
+    }),
+    regVerb("import-chunk", {
+        title: "Upload a chunk",
+        help: "One piece of the staged file. No credential.",
+        request: ["token", "offset", "data_b64"],
+        response: { ok: "bool" }
+    }),
+    regVerb("import-inspect", {
+        title: "Inspect the staged file",
+        help: "Reads the unauthenticated header. No credential.",
+        request: ["token"],
+        response: { format: "str", version: "str", cipher: "str", kdf: "str" }
+    }),
+    regVerb("import-commit", {
+        title: "Commit the import",
+        help: "Opens the staged file with the credential and registers it.",
+        request: ["token", "password", "keyfile_b64"],
+        response: { ok: "bool", id: "str", path: "str" }
+    }),
+    regVerb("import-abort", {
+        title: "Abort an import",
+        help: "Destroys the staging.",
+        request: ["token"], response: { ok: "bool" }
+    }),
+    regVerb("safe-forget", {
+        title: "Forget a safe", needs: "safe",
+        help: "Removes the registry entry and leaves the file alone.",
+        request: ["safe"], response: { ok: "bool", id: "str", path: "str" }
+    }),
+    regVerb("safe-delete", {
+        title: "Delete a safe", needs: "safe", danger: true,
+        help: "Destroys the file and its backup ring.",
+        request: ["safe", "confirm"],
+        response: { ok: "bool", id: "str", backups_removed: "int" },
+        confirm: "This destroys the encrypted file and every backup of it."
+    })
+];
+
+const REG_IDS = REG_VERBS.map((v) => v.id);
+
+/* The live schema with every registry-write verb REMOVED.
+ *
+ * "The page draws no control for a verb the helper does not publish" is a
+ * claim about a helper that lacks them, and once the helper HAS them the only
+ * way to keep testing it is to take them away again. Doing it by subtraction
+ * from the live document (rather than by using an old schema) means the
+ * negative case keeps testing the shipped page against the shipped schema. */
+function withoutRegistryVerbs(live) {
+    const s = JSON.parse(JSON.stringify(live));
+    s.verbs = s.verbs.filter((v) => REG_IDS.indexOf(v.id) < 0);
+    return s;
+}
+
+/* Add them to a copy of the live schema — unless the live schema already has
+ * them, in which case the helper is the authority and this fixture gets out of
+ * the way. */
+function registrySchema(live) {
+    const s = JSON.parse(JSON.stringify(live));
+    const have = new Set(s.verbs.map((v) => v.id));
+    if (REG_VERBS.every((v) => have.has(v.id))) { s.__fromHelper = true; return s; }
+    const haveF = new Set(s.fields.map((f) => f.id));
+    REG_FIELDS.forEach((f) => { if (!haveF.has(f.id)) s.fields.push(f); });
+    REG_VERBS.forEach((v) => { if (!have.has(v.id)) s.verbs.push(v); });
+    s.constants.user_registry_dir = "/home/tester/.config/cockpit-secrets/safes.d";
+    return s;
+}
+
 /* --------------------------------------------------------------- helpers -- */
 async function bootToSafes(browser, scenario) {
     const page = await H.openPage(browser, scenario);
@@ -269,7 +438,21 @@ async function main() {
                 "export": "Export…",
                 "generate": "Generate password…",
                 "health": "Backend health",
-                "audit-tail": "Audit log"
+                "audit-tail": "Audit log",
+                /* The registry-write verbs. The five import ones share ONE
+                 * entry point on purpose: they are four steps of a single
+                 * wizard plus its cancel, and a page that offered five separate
+                 * buttons would be offering half an upload — a chunk with
+                 * nothing staged, a commit with nothing to open. The route for
+                 * each is therefore the wizard that drives all of them. */
+                "safe-create": "New safe…",
+                "import-begin": "Add an existing safe…",
+                "import-chunk": "Add an existing safe…",
+                "import-inspect": "Add an existing safe…",
+                "import-commit": "Add an existing safe…",
+                "import-abort": "Add an existing safe…",
+                "safe-forget": "Forget…",
+                "safe-delete": "Delete…"
             };
 
             const undeclared = schema.verbs.map((v) => v.id).filter((id) => !(id in ROUTES));
@@ -1873,6 +2056,709 @@ async function main() {
             ok(groups.length === 2 && /row 1 of 2/.test(groups[0]) && /row 2 of 2/.test(groups[1]),
                `each row is a labelled group and the numbering is rewritten on removal ` +
                `(${groups.join(" | ")})`);
+            await page.close();
+        }
+
+        /* ================================ making a safe exist ============ */
+        /* The registry is this program's trust root (I1, I4) and these are the
+         * first flows that let a browser request write into it. What is being
+         * checked here is not that the buttons look right — it is that the
+         * page cannot become an arbitrary-write primitive from the browser
+         * side: no path is ever sent, the credential arrives only at the very
+         * last step, and a cancelled or failed upload leaves nothing staged. */
+        head("Making a safe exist — create, upload, forget, delete");
+
+        /* A scenario carrying the registry-write verbs. Everything else about
+         * it is the ordinary one, so any difference is attributable. */
+        const regScen = (over) => {
+            const s = scen(over);
+            s.responses.schema = registrySchema(schema);
+            s.responses.schema.constants.agent_poll_seconds = 1;
+            s.responses.schema.constants.delete_confirm_prefix = "delete-safe:";
+            return s;
+        };
+        ok(!registrySchema(schema).__fromHelper === true ||
+           registrySchema(schema).__fromHelper === true,
+           "the registry verbs come from the helper's schema when it publishes them, " +
+           "and from the brief's shapes until then" +
+           (registrySchema(schema).__fromHelper ? " (LIVE: from the helper)"
+                                                : " (from the brief — the helper has not " +
+                                                  "published them yet)"));
+
+        /* ---- the controls exist only when the helper publishes the verbs -- */
+        /* A scenario whose helper publishes NONE of the registry verbs. */
+        const bareScen = (over) => {
+            const s = scen(over);
+            s.responses.schema = withoutRegistryVerbs(s.responses.schema);
+            return s;
+        };
+        {
+            const page = await bootToSafes(browser, bareScen());
+            const labels = await page.$$eval("#sec-safes .sec-tools button",
+                (ns) => ns.map((n) => n.textContent));
+            ok(!labels.some((t) => /New safe/.test(t)),
+               "with no create verb published there is NO New-safe button");
+            ok(!labels.some((t) => /Add an existing safe/.test(t)),
+               "and no upload button either");
+            const card = await page.$$eval(".sec-safe .sec-safe-actions button",
+                (ns) => ns.map((n) => n.textContent));
+            ok(!card.some((t) => /Forget|Delete/.test(t)),
+               "and a safe card offers neither Forget nor Delete");
+            await page.close();
+        }
+        {
+            const page = await bootToSafes(browser, regScen());
+            const labels = await page.$$eval("#sec-safes .sec-tools button",
+                (ns) => ns.map((n) => n.textContent.trim()));
+            ok(labels.filter((t) => /^New safe/.test(t)).length === 1,
+               `exactly one New-safe button once the verb is published (${labels.join(" | ")})`);
+            ok(labels.filter((t) => /^Add an existing safe/.test(t)).length === 1,
+               "exactly one upload button");
+            /* The generic "every unhandled global verb gets a button" loop must
+             * not put a second, unlabelled button next to each purpose-built
+             * one — a raw import-chunk button would be a chunk upload with no
+             * wizard around it. */
+            ok(!labels.some((t) => /^Upload a chunk$|^Begin an import$|^Abort an import$|^Commit the import$|^Inspect the staged file$/.test(t)),
+               `no raw button for any import verb (${labels.join(" | ")})`);
+            const card = await page.$$eval(
+                '.sec-safe:has(.sec-safe-id:text-is("lab-dc")) .sec-safe-actions button',
+                (ns) => ns.map((n) => n.textContent.trim()));
+            ok(card.indexOf("Forget…") >= 0 && card.indexOf("Delete…") >= 0,
+               `the card gains Forget and Delete (${card.join(" | ")})`);
+            ok(card.indexOf("Delete…") === card.length - 1,
+               "and Delete is the LAST control on the card, not beside Unlock");
+            await page.close();
+        }
+
+        /* ---- the empty state offers the way out of itself ---------------- */
+        {
+            const page = await H.openPage(browser, regScen({ list: { safes: [] } }));
+            await page.goto(url);
+            await page.waitForSelector("#sec-safes .sec-empty", { timeout: 10000 });
+            const labels = await page.$$eval("#sec-safes .sec-empty button",
+                (ns) => ns.map((n) => n.textContent.trim()));
+            ok(labels.some((t) => /^New safe/.test(t)) &&
+               labels.some((t) => /^Add an existing safe/.test(t)),
+               `the EMPTY safe list offers both ways to fill it (${labels.join(" | ")})`);
+            await page.close();
+        }
+        {
+            const page = await H.openPage(browser, bareScen({ list: { safes: [] } }));
+            await page.goto(url);
+            await page.waitForSelector("#sec-safes .sec-empty", { timeout: 10000 });
+            const t = await page.textContent("#sec-safes .sec-empty");
+            ok(/publishes no verb for creating or importing/.test(t),
+               "and with no such verbs it says so rather than leaving a dead end");
+            await page.close();
+        }
+
+        /* ---- create a new safe ------------------------------------------ */
+        {
+            const page = await bootToSafes(browser, regScen({
+                "safe-create": { ok: true, id: "fresh", path: "/etc/cockpit-secrets/safes/fresh.kdbx",
+                                 registry: "/etc/cockpit-secrets/safes.d/fresh.json" }
+            }));
+            await page.click('#sec-safes .sec-tools button:text-is("New safe…")');
+            await page.waitForSelector(".sec-modal");
+            /* The id control carries the helper's own allow-list, so the
+             * validator that enforces it is the generic one — this page writes
+             * no pattern of its own (C2). */
+            /* Address the controls the way an operator does — by their labels
+             * — because the create form now draws several text boxes and "the
+             * first input" is not a stable way to mean "the id". */
+            const byLabel = async (re) => {
+                const id = await page.evaluate((src) => {
+                    const l = Array.prototype.find.call(
+                        document.querySelectorAll(".sec-modal label"),
+                        (n) => new RegExp(src).test(n.textContent));
+                    return l ? l.getAttribute("for") : null;
+                }, re.source);
+                return id ? "#" + id : null;
+            };
+            const idSel = await byLabel(/^Id/);
+            const labelSel = await byLabel(/^Label/);
+            ok(!!idSel && !!labelSel, "the create dialog draws the id and label controls");
+            /* An id outside the allow-list is refused before anything spawns. */
+            const before = await page.evaluate(() => window.__CALLS.length);
+            await page.fill(idSel, "../etc/passwd");
+            await page.fill(labelSel, "A fresh safe");
+            await page.click('.sec-modal button:text-is("Create the safe")');
+            const errTxt = await page.textContent(".sec-modal");
+            ok(/not in the required form/.test(errTxt),
+               "an id outside the allow-list is refused in the form");
+            ok(await page.evaluate(() => window.__CALLS.length) === before,
+               "and nothing was spawned for it");
+
+            /* The registry note follows the access control, live. */
+            let note = await page.textContent(".sec-modal .sec-alert.warn");
+            ok(/administrator safe/i.test(note),
+               "with the default access class the note says ADMINISTRATOR safe (I1)");
+            ok(/\/etc\/cockpit-secrets\/safes\.d/.test(await page.textContent(".sec-modal")),
+               "and names the system registry directory the helper published");
+            const sel = await page.$(".sec-modal select");
+            await page.selectOption(".sec-modal select >> nth=-1", "user");
+            note = await page.textContent(".sec-modal");
+            ok(/your own safe/i.test(note),
+               "choosing the user class changes the note to YOUR OWN safe");
+            ok(/\.config\/cockpit-secrets\/safes\.d/.test(note),
+               "and names the per-user registry (C4)");
+            ok(!!sel, "the access control is a select drawn from the schema's enum");
+
+            /* Nothing to encrypt with: the advisory says so, and it is an
+             * advisory — the helper is the gate (C7). */
+            await page.fill(idSel, "fresh");
+            {
+                /* VISIBLE ones only. The advisory is hidden with the `hidden`
+                 * attribute rather than removed, so a test that read
+                 * textContent would pass whether or not the operator can see
+                 * it — which is the whole of what is being asserted. */
+                const adv = await page.$$eval(".sec-modal .sec-alert.warn",
+                    (ns) => ns.filter((n) => n.getClientRects().length > 0)
+                              .map((n) => n.textContent).join(" | "));
+                ok(/nothing to encrypt this safe with/.test(adv),
+                   "with neither a passphrase nor a key file the dialog says the helper " +
+                   "will refuse it");
+            }
+
+            /* The live strength meter is wired to the passphrase box, and it
+             * does not block. */
+            await page.fill(".sec-modal input[type=password]", "password1");
+            await page.waitForSelector(".sec-modal .sec-strength");
+            ok(!!(await page.$(".sec-modal .sec-strength")),
+               "the create dialog carries the live strength meter");
+            {
+                const adv = await page.$$eval(".sec-modal .sec-alert.warn",
+                    (ns) => ns.filter((n) => n.getClientRects().length > 0)
+                              .map((n) => n.textContent).join(" | "));
+                ok(!/nothing to encrypt this safe with/.test(adv),
+                   "and the advisory goes away once there is a passphrase");
+            }
+            await page.click('.sec-modal button:text-is("Create the safe")');
+            await page.waitForSelector('.sec-modal h2:text-is("The safe was created")',
+                                       { timeout: 10000 });
+            ok(true, "a weak passphrase is reported, not refused — creating still succeeds (C7)");
+            const calls = await page.evaluate(() => window.__CALLS);
+            const create = calls.filter((c) => c.verb === "safe-create");
+            ok(create.length === 1 && create[0].argv.length === 2,
+               `safe-create is spawned with the verb and nothing else on argv (${JSON.stringify(create[0] && create[0].argv)})`);
+            ok(create[0].superuser === null,
+               "a USER-class create is spawned with no escalation at all");
+            const bodies = await page.evaluate(() => window.__BODIES);
+            const ci = calls.findIndex((c) => c.verb === "safe-create");
+            const cb = bodies[ci];
+            /* Whichever field the verb marks secret is the one it must have
+             * arrived in — the helper calls it `new_password`, deliberately
+             * distinct from `password`, and this asserts the page followed the
+             * schema rather than a name it remembered. */
+            const secretField = schema.verbs.find((v) => v.id === "safe-create")
+                .request.find((f) => (schema.fields.find((x) => x.id === f) || {}).secret);
+            ok(cb && cb[secretField] === "password1",
+               `the passphrase went on stdin in the verb's own secret field ` +
+               `“${secretField}” (I10)`);
+            ok(Object.keys(cb).every((k) =>
+                   !/^(path|dir|dest|destination|filename|file|target_path)$/.test(k)),
+               `the create request contains no path-shaped key (${Object.keys(cb).join(",")})`);
+            ok(await page.evaluate(() => {
+                   try { return localStorage.length === 0 && sessionStorage.length === 0; }
+                   catch (e) { return true; }
+               }), "nothing was put in browser storage by creating a safe (I11)");
+            await page.close();
+        }
+        {
+            /* The other half of the escalation pair: the DEFAULT class is
+             * admin, and it is spawned with superuser:"require" (I1, I2). */
+            const page = await bootToSafes(browser, regScen({
+                "safe-create": { ok: true, id: "fresh" }
+            }));
+            await page.click('#sec-safes .sec-tools button:text-is("New safe…")');
+            await page.waitForSelector(".sec-modal");
+            await page.fill('.sec-modal input[type=text] >> nth=0', "fresh");
+            await page.fill('.sec-modal input[type=text] >> nth=1', "A fresh safe");
+            await page.fill(".sec-modal input[type=password]", "a passphrase");
+            await page.click('.sec-modal button:text-is("Create the safe")');
+            await page.waitForSelector('.sec-modal h2:text-is("The safe was created")',
+                                       { timeout: 10000 });
+            const create = (await page.evaluate(() => window.__CALLS))
+                .filter((c) => c.verb === "safe-create");
+            ok(create.length === 1 && create[0].superuser === "require",
+               "an admin-class create — the DEFAULT — is spawned with superuser:require");
+            await page.close();
+        }
+        {
+            /* A generated key file is handed over ONCE, behind a warning that
+             * says it is the only copy. */
+            const page = await bootToSafes(browser, regScen({
+                "safe-create": { ok: true, id: "fresh",
+                                 keyfile_b64: Buffer.from("not a real key").toString("base64"),
+                                 keyfile_name: "fresh.keyx" }
+            }));
+            await page.click('#sec-safes .sec-tools button:text-is("New safe…")');
+            await page.waitForSelector(".sec-modal");
+            await page.fill('.sec-modal input[type=text] >> nth=0', "fresh");
+            await page.fill('.sec-modal input[type=text] >> nth=1', "A fresh safe");
+            await page.fill(".sec-modal input[type=password]", "a passphrase");
+            await page.click('.sec-modal button:text-is("Create the safe")');
+            await page.waitForSelector(".sec-modal .sec-danger-block", { timeout: 10000 });
+            const warn = await page.textContent(".sec-modal .sec-danger-block");
+            ok(/only copy/i.test(warn),
+               "a generated key file is presented with “the only copy” stated outright");
+            ok(/no recovery|losing the key material means losing the safe/i.test(warn),
+               "and says plainly that losing it loses the safe");
+            ok(!!(await page.$('.sec-modal button:text-is("Download the key file")')),
+               "with a download control beside it");
+            await page.close();
+        }
+
+        /* ---- upload: encrypted file FIRST, passphrase AFTERWARDS (C5) ---- */
+        const FILE_BYTES = Buffer.alloc(5000);
+        for (let i = 0; i < FILE_BYTES.length; i++) FILE_BYTES[i] = (i * 37 + 11) & 0xff;
+        const FILE_SHA = require("crypto").createHash("sha256")
+            .update(FILE_BYTES).digest("hex");
+        const INSPECT = { ok: true, format: "kdbx", version: "4.1", cipher: "AES-256-CBC",
+                          kdf: "argon2id",
+                          kdf_params: { memory_kib: 65536, time: 2, parallelism: 4 },
+                          iterations: null, needs_password: true, needs_keyfile: false,
+                          bytes: 5000, sha256_ok: true, authenticated: false,
+                          warnings: ["This file declares KDBX 4.1."],
+                          note: "Nothing here has been verified against a passphrase.",
+                          expires_in: 300 };
+
+        async function fillImportForm(page) {
+            /* Whatever text controls the begin verb declares, filled in order:
+             * the page draws what the schema says, so the driver fills what the
+             * page drew rather than a list of names copied from the helper. */
+            const boxes = await page.$$(".sec-modal .sec-form input[type=text]");
+            const vals = ["uploaded", "An uploaded safe"];
+            for (let i = 0; i < boxes.length; i++) await boxes[i].fill(vals[i] || "x");
+        }
+        async function startUpload(page, bytes) {
+            await page.click('#sec-safes .sec-tools button:text-is("Add an existing safe…")');
+            await page.waitForSelector(".sec-modal .sec-steps");
+            await fillImportForm(page);
+            await page.setInputFiles("#sec-import-file", {
+                name: "uploaded.kdbx", mimeType: "application/octet-stream",
+                buffer: bytes || FILE_BYTES
+            });
+            await page.click('.sec-modal button:text-is("Upload the file")');
+        }
+
+        {
+            const page = await bootToSafes(browser, regScen({
+                "import-begin": { ok: true, staging: "stg-1", chunk_bytes: 1024,
+                                 total_bytes: 5000, received: 0, expires_in: 300 },
+                "import-chunk": { ok: true },
+                "import-inspect": INSPECT,
+                "import-abort": { ok: true }
+            }));
+            await page.click('#sec-safes .sec-tools button:text-is("Add an existing safe…")');
+            await page.waitForSelector(".sec-modal .sec-steps");
+            /* THE ORDERING IS THE REQUIREMENT. There is no passphrase box in
+             * the file-picker step, and there is no credential in any request
+             * before the commit. */
+            ok((await page.$$(".sec-modal input[type=password]")).length === 0,
+               "the file-picker step has NO passphrase field anywhere on it (C5)");
+            ok(!!(await page.$("#sec-import-file")), "it has a file picker");
+            const stepNow = await page.textContent(".sec-modal .sec-steps li.now");
+            ok(/Choose the file/.test(stepNow),
+               `the wizard says which step it is on (${stepNow})`);
+            ok(await page.getAttribute(".sec-modal .sec-steps li.now", "aria-current") === "step",
+               "and marks it with aria-current=step");
+            ok(/administrator safe/i.test(await page.textContent(".sec-modal")),
+               "the upload step says which registry the safe will land in");
+
+            await fillImportForm(page);
+            await page.setInputFiles("#sec-import-file", {
+                name: "uploaded.kdbx", mimeType: "application/octet-stream",
+                buffer: FILE_BYTES
+            });
+            await page.click('.sec-modal button:text-is("Upload the file")');
+            await page.waitForSelector(".sec-modal .sec-kv", { timeout: 20000 });
+
+            const bodies = await page.evaluate(() => window.__BODIES);
+            const calls = await page.evaluate(() => window.__CALLS);
+            const begin = bodies[calls.findIndex((c) => c.verb === "import-begin")];
+            ok(begin && begin.total_bytes === FILE_BYTES.length,
+               `import-begin declares the total size up front (${begin && begin.total_bytes})`);
+            ok(begin && begin.sha256 === FILE_SHA,
+               "and the SHA-256 the page computed matches the file's real digest");
+            const credKeys = ["password", "new_password", "passphrase", "keyfile_b64",
+                              "secret", "value"];
+            const preCommit = calls.map((c, i) => ({ verb: c.verb, body: bodies[i] }))
+                .filter((x) => /^import-(begin|chunk|inspect)$/.test(x.verb));
+            ok(preCommit.length > 1 &&
+               preCommit.every((x) => credKeys.every((k) => x.body[k] === undefined)),
+               `NO credential in any of the ${preCommit.length} pre-commit requests (C5)`);
+            ok(preCommit.every((x) => Object.keys(x.body).every((k) =>
+                   !/^(path|dir|dest|destination|filename|file|target_path)$/.test(k))),
+               "and no path-shaped key in any of them (I4)");
+
+            /* The chunking itself: contiguous, capped at the size the helper
+             * named, and reassembling to exactly the file that was picked. */
+            const chunks = calls.map((c, i) => ({ verb: c.verb, body: bodies[i] }))
+                .filter((x) => x.verb === "import-chunk").map((x) => x.body);
+            /* The field names come from the verb's own descriptor, so the
+             * driver reads them the same way the page wrote them. */
+            const chunkReq = schema.verbs.find((v) => v.id === "import-chunk").request;
+            const TOK = chunkReq.find((f) => /^(staging|token)/.test(f));
+            const OFF = chunkReq.find((f) => /offset/.test(f));
+            const DAT = chunkReq.find((f) => /_b64$/.test(f));
+            ok(!!TOK && !!OFF && !!DAT,
+               `import-chunk's request names a token, an offset and a payload ` +
+               `(${chunkReq.join(", ")})`);
+            ok(chunks.length === Math.ceil(FILE_BYTES.length / 1024),
+               `the file went up in ${chunks.length} chunks of the size the helper named ` +
+               `(expected ${Math.ceil(FILE_BYTES.length / 1024)})`);
+            let off = 0, joined = [];
+            let contiguous = true;
+            for (const c of chunks) {
+                if (c[OFF] !== off) contiguous = false;
+                const raw = Buffer.from(c[DAT], "base64");
+                if (raw.length > 1024) contiguous = false;
+                joined.push(raw);
+                off += raw.length;
+            }
+            ok(contiguous, "every chunk is at the offset after the last and none exceeds the cap");
+            ok(Buffer.concat(joined).equals(FILE_BYTES),
+               "and the chunks reassemble byte-for-byte into the file that was picked");
+            ok(chunks.every((c) => c[TOK] === "stg-1"),
+               "every chunk carries the staging token the helper minted, not a path");
+
+            /* Step 3: the header, labelled as unauthenticated. */
+            const s3 = await page.textContent(".sec-modal");
+            ok(/NOT authenticated/.test(s3),
+               "the header summary is labelled NOT authenticated");
+            ok(/read from the file's header/i.test(s3),
+               "and says it was read from the header");
+            ok(/argon2id/.test(s3) && /AES-256-CBC/.test(s3) && /4\.1/.test(s3),
+               "and shows the format, version, cipher and KDF the helper reported");
+            ok(/This file declares KDBX 4\.1\./.test(s3),
+               "the helper's own warnings are rendered verbatim");
+            ok((await page.$$(".sec-modal input[type=password]")).length === 0,
+               "and there is STILL no passphrase box at this point (C5)");
+
+            /* Step 4: now, and only now, the credential. */
+            await page.click('.sec-modal button:has-text("This is the right file")');
+            await page.waitForSelector(".sec-modal input[type=password]");
+            ok(true, "the passphrase is asked for only after the header has been shown");
+            ok(await page.$eval(".sec-modal input[type=password]",
+                                (n) => !n.getAttribute("name") && !n.closest("form")),
+               "the passphrase box has no name attribute and is not inside a <form> (I11)");
+            ok(await page.$eval(".sec-modal input[type=password]",
+                                (n) => n.getAttribute("autocomplete") === "off"),
+               "and autocomplete is off");
+            ok((await page.$$(".sec-modal .sec-strength")).length === 0,
+               "the strength meter is OFF here — this passphrase is not being chosen");
+            /* The whole wizard, start to finish, with no uncaught exception and
+             * nothing on the console. The upload loop is the one place in this
+             * page that runs a long chain of promises over binary data, which
+             * is exactly where a rejection gets swallowed. */
+            ok(page.__errors.length === 0,
+               "no page error anywhere in the upload wizard" +
+               (page.__errors.length ? ": " + page.__errors.join(" | ") : ""));
+            await page.close();
+        }
+
+        {
+            /* A wrong passphrase must NOT throw the upload away, and the
+             * remaining-attempts figure shown must be the HELPER'S. */
+            const page = await bootToSafes(browser, regScen({
+                "import-begin": { ok: true, staging: "stg-2", chunk_bytes: 4096, expires_in: 300 },
+                "import-chunk": { ok: true },
+                "import-inspect": INSPECT,
+                "import-abort": { ok: true },
+                "import-commit": { __seq: [
+                    { error: "bad-credential",
+                      detail: "That passphrase did not open the staged file.",
+                      attempts_remaining: 2, expires_in: 300 },
+                    { ok: true, id: "uploaded", path: "/etc/cockpit-secrets/safes/uploaded.kdbx" }
+                ] }
+            }));
+            await startUpload(page);
+            await page.waitForSelector(".sec-modal .sec-kv", { timeout: 20000 });
+            await page.click('.sec-modal button:has-text("This is the right file")');
+            await page.waitForSelector(".sec-modal input[type=password]");
+            const chunksBefore = await page.evaluate(() =>
+                window.__CALLS.filter((c) => c.verb === "import-chunk").length);
+            await page.fill(".sec-modal input[type=password]", "wrong");
+            await page.click('.sec-modal button:text-is("Unlock and register the safe")');
+            await page.waitForSelector(".sec-modal .sec-alert.err");
+            const t = await page.textContent(".sec-modal");
+            ok(/did not open the staged file/.test(t),
+               "a wrong passphrase shows the helper's own sentence");
+            ok(/2 attempts left/.test(t),
+               `the remaining-attempts figure is the helper's, not one this page invented (${/(\d+) attempts left/.exec(t) || ""})`);
+            ok(/not a limit on guessing/.test(t),
+               "and it is described as a resource control rather than a credential control");
+            ok(/no need to re-upload/.test(t),
+               "the operator is told the upload is still staged");
+            ok(await page.evaluate(() =>
+                   window.__CALLS.every((c) => c.verb !== "import-abort")),
+               "a wrong passphrase does NOT abort the staging");
+            /* And the retry goes through with no second upload. */
+            await page.fill(".sec-modal input[type=password]", "right");
+            await page.click('.sec-modal button:text-is("Unlock and register the safe")');
+            await page.waitForSelector('.sec-modal h2:text-is("The safe was registered")',
+                                       { timeout: 10000 });
+            const chunksAfter = await page.evaluate(() =>
+                window.__CALLS.filter((c) => c.verb === "import-chunk").length);
+            ok(chunksAfter === chunksBefore,
+               `the retry re-uploaded nothing (${chunksBefore} chunks before, ${chunksAfter} after)`);
+            const commits = await page.evaluate(() => window.__CALLS
+                .map((c, i) => [c.verb, window.__BODIES[i]])
+                .filter((x) => x[0] === "import-commit").map((x) => x[1]));
+            ok(commits.length === 2 && commits[0].staging === "stg-2" &&
+               commits[1].staging === "stg-2",
+               "both attempts named the same staging token");
+            ok(commits.every((b) => Object.keys(b).every((k) =>
+                   !/^(path|dir|dest|destination|filename|file)$/.test(k))),
+               "and neither carried a path");
+            ok(await page.evaluate(() => {
+                   try { return localStorage.length === 0 && sessionStorage.length === 0; }
+                   catch (e) { return true; }
+               }), "nothing about the uploaded file is in browser storage (I11)");
+            await page.close();
+        }
+
+        {
+            /* Discarding from the header step aborts the staging. */
+            const page = await bootToSafes(browser, regScen({
+                "import-begin": { ok: true, staging: "stg-3", chunk_bytes: 4096 },
+                "import-chunk": { ok: true },
+                "import-inspect": INSPECT,
+                "import-abort": { ok: true }
+            }));
+            await startUpload(page);
+            await page.waitForSelector(".sec-modal .sec-kv", { timeout: 20000 });
+            await page.click('.sec-modal button:has-text("Wrong file")');
+            await page.waitForSelector("#sec-import-file");
+            const ab = await page.evaluate(() => window.__CALLS
+                .map((c, i) => [c.verb, window.__BODIES[i]])
+                .filter((x) => x[0] === "import-abort"));
+            ok(ab.length === 1 && ab[0][1].staging === "stg-3",
+               "discarding the wrong file aborts the staging by its token");
+            ok((await page.$$(".sec-modal input[type=password]")).length === 0,
+               "and drops back to the file picker, with no passphrase box");
+            await page.close();
+        }
+        {
+            /* Closing the dialog mid-wizard aborts too — staging must not be
+             * orphaned by an Escape key. */
+            const page = await bootToSafes(browser, regScen({
+                "import-begin": { ok: true, staging: "stg-4", chunk_bytes: 4096 },
+                "import-chunk": { ok: true },
+                "import-inspect": INSPECT,
+                "import-abort": { ok: true }
+            }));
+            await startUpload(page);
+            await page.waitForSelector(".sec-modal .sec-kv", { timeout: 20000 });
+            await page.keyboard.press("Escape");
+            await page.waitForFunction(() =>
+                window.__CALLS.some((c) => c.verb === "import-abort"), null,
+                { timeout: 5000 }).catch(() => {});
+            const ab = await page.evaluate(() => window.__CALLS
+                .map((c, i) => [c.verb, window.__BODIES[i]])
+                .filter((x) => x[0] === "import-abort"));
+            ok(ab.length === 1 && ab[0][1].staging === "stg-4",
+               "closing the wizard aborts the staging rather than orphaning it");
+            await page.close();
+        }
+
+        {
+            /* CANCELLING MID-UPLOAD. The file is large enough and the chunks
+             * small enough that the transfer is still running when Cancel is
+             * pressed; what is being checked is that the partial staging is
+             * destroyed rather than left on the host, and that the operator is
+             * put back where they can start again. */
+            const BIG = Buffer.alloc(1024 * 1024);
+            for (let i = 0; i < BIG.length; i++) BIG[i] = (i * 91 + 7) & 0xff;
+            const page = await bootToSafes(browser, regScen({
+                "import-begin": { ok: true, staging: "stg-9", chunk_bytes: 512 },
+                "import-chunk": { ok: true },
+                "import-inspect": INSPECT,
+                "import-abort": { ok: true }
+            }));
+            await startUpload(page, BIG);
+            await page.waitForSelector(".sec-modal .sec-progress");
+            await page.click('.sec-modal button:text-is("Cancel the upload")');
+            await page.waitForSelector('.sec-modal button:text-is("Start again")',
+                                       { timeout: 20000 });
+            const sent = await page.evaluate(() =>
+                window.__CALLS.filter((c) => c.verb === "import-chunk").length);
+            ok(sent > 0 && sent < Math.ceil((1024 * 1024) / 512),
+               `the upload stopped part-way through (${sent} of ` +
+               `${Math.ceil((1024 * 1024) / 512)} chunks)`);
+            const ab = await page.evaluate(() => window.__CALLS
+                .map((c, i) => [c.verb, window.__BODIES[i]])
+                .filter((x) => x[0] === "import-abort"));
+            ok(ab.length === 1 && ab[0][1].staging === "stg-9",
+               "and the partial staging was aborted by its token");
+            const t = await page.textContent(".sec-modal");
+            ok(/partial staging was discarded/.test(t) &&
+               /Nothing was written and no registry entry was made/.test(t),
+               "the operator is told nothing was written and no entry was made");
+            ok(await page.evaluate(() =>
+                   window.__CALLS.every((c) => c.verb !== "import-inspect")),
+               "and a cancelled upload never reaches inspect");
+            await page.close();
+        }
+        {
+            /* A file over the helper's own cap is refused BEFORE a byte moves. */
+            const page = await bootToSafes(browser, (() => {
+                const s = regScen({ "import-begin": { ok: true, staging: "stg-5" } });
+                s.responses.schema.constants.max_safe_bytes = 1024;
+                return s;
+            })());
+            await page.click('#sec-safes .sec-tools button:text-is("Add an existing safe…")');
+            await page.waitForSelector("#sec-import-file");
+            await page.setInputFiles("#sec-import-file", {
+                name: "big.kdbx", mimeType: "application/octet-stream", buffer: FILE_BYTES
+            });
+            const note = await page.textContent(".sec-modal .hint[aria-live]");
+            ok(/accepts at most/.test(note) && /has not been uploaded/.test(note),
+               `an oversized file is refused at the picker (${note.trim().slice(0, 60)})`);
+            ok(await page.evaluate(() =>
+                   window.__CALLS.every((c) => !/^import-/.test(c.verb))),
+               "and no import verb was spawned at all");
+            await page.close();
+        }
+
+        {
+            /* The helper disagreeing about how much it has staged stops the
+             * upload rather than finishing it wrongly. */
+            const page = await bootToSafes(browser, regScen({
+                "import-begin": { ok: true, staging: "stg-6", chunk_bytes: 1024 },
+                "import-chunk": { ok: true, received: 99, total_bytes: 5000 },
+                "import-inspect": INSPECT,
+                "import-abort": { ok: true }
+            }));
+            await startUpload(page);
+            await page.waitForSelector(".sec-modal .sec-alert.err", { timeout: 20000 });
+            const t = await page.textContent(".sec-modal");
+            ok(/stopped rather than finished wrongly/.test(t),
+               "a cumulative byte count that disagrees stops the upload");
+            ok(await page.evaluate(() =>
+                   window.__CALLS.some((c) => c.verb === "import-abort")),
+               "and the partial staging is destroyed");
+            ok(await page.evaluate(() =>
+                   window.__CALLS.filter((c) => c.verb === "import-inspect").length === 0),
+               "and it never reached the inspect step");
+            await page.close();
+        }
+
+        {
+            /* Progress is visible and announced coarsely: a 128 MiB upload with
+             * a silent UI reads as a hang, and one that announces every chunk
+             * is a screen reader talking over itself. */
+            const page = await bootToSafes(browser, regScen({
+                "import-begin": { ok: true, staging: "stg-7", chunk_bytes: 256 },
+                "import-chunk": { ok: true },
+                "import-inspect": INSPECT,
+                "import-abort": { ok: true }
+            }));
+            await startUpload(page);
+            await page.waitForSelector(".sec-modal .sec-progress");
+            const role = await page.getAttribute(".sec-modal .sec-progress", "role");
+            ok(role === "progressbar", "the upload draws a real progressbar");
+            await page.waitForSelector(".sec-modal .sec-kv", { timeout: 20000 });
+            ok(true, "and the upload completes through it");
+            await page.close();
+        }
+
+        /* ---- forget and delete ------------------------------------------ */
+        {
+            const page = await bootToSafes(browser, regScen({
+                "safe-forget": { ok: true, id: "lab-dc",
+                                 path: "/etc/cockpit-secrets/safes/lab-dc.kdbx" }
+            }));
+            await page.click('.sec-safe:has(.sec-safe-id:text-is("lab-dc")) button:text-is("Forget…")');
+            await page.waitForSelector(".sec-modal");
+            const t = await page.textContent(".sec-modal");
+            ok(/file stays on disk/i.test(t),
+               "Forget says plainly that the file stays on disk");
+            ok(/registering it again/i.test(t) || /Add an existing safe/.test(t),
+               "and that it can be registered again");
+            const run = await page.$('.sec-modal button:text-is("Remove the registry entry")');
+            ok(await run.isDisabled(), "Run is disabled until the sentence is ticked");
+            await page.click(".sec-modal .sec-alert.warn input[type=checkbox]");
+            ok(!(await run.isDisabled()), "and enabled once it is");
+            await run.click();
+            await page.waitForSelector("#sec-alerts .sec-alert.ok", { timeout: 10000 });
+            const body = await page.evaluate(() => {
+                const i = window.__CALLS.findIndex((c) => c.verb === "safe-forget");
+                return window.__BODIES[i];
+            });
+            ok(body && body.safe === "lab-dc" && Object.keys(body).length === 1,
+               `forget sends the registry id and nothing else (${JSON.stringify(body)})`);
+            await page.close();
+        }
+        {
+            const page = await bootToSafes(browser, regScen({
+                "safe-delete": { ok: true, id: "lab-dc", backups_removed: 3 }
+            }));
+            await page.click('.sec-safe:has(.sec-safe-id:text-is("lab-dc")) button:text-is("Delete…")');
+            await page.waitForSelector(".sec-modal");
+            const t = await page.textContent(".sec-modal");
+            ok(/backup ring/i.test(t),
+               "Delete states that the file AND its backup ring are destroyed");
+            ok(/best effort|BEST EFFORT/i.test(t) && /wear levelling|snapshot/i.test(t),
+               "and says honestly that shredding is best-effort on modern storage");
+            ok(/use Forget instead/i.test(t),
+               "and points at Forget as the non-destructive option");
+            const run = await page.$('.sec-modal button:text-is("Destroy this safe and its backups")');
+            ok(await run.isDisabled(), "Run starts disabled");
+            /* The helper's own confirm sentence and this page's are AND-ed,
+             * never replaced: a page-side warning must not be able to swallow
+             * the one the helper attached. */
+            const ticks = await page.$$(".sec-modal .sec-alert.warn input[type=checkbox]");
+            ok(ticks.length === 2 &&
+               /every backup of it/.test(t) && /cannot be undone/.test(t),
+               `both the helper's confirm and the page's are shown and must both be ticked ` +
+               `(${ticks.length} boxes)`);
+            for (const c of ticks) await c.click();
+            ok(await run.isDisabled(),
+               "ticking every sentence is NOT enough — the id must be typed too");
+            await page.fill(".sec-modal .sec-field input[type=text]", "lab-d");
+            ok(await run.isDisabled(), "a partly-typed id does not open the gate");
+            await page.fill(".sec-modal .sec-field input[type=text]", "mine");
+            ok(await run.isDisabled(), "and neither does ANOTHER safe's id");
+            await page.fill(".sec-modal .sec-field input[type=text]", "LAB-DC");
+            ok(await run.isDisabled(), "and neither does the id in the wrong case");
+            await page.fill(".sec-modal .sec-field input[type=text]", "lab-dc");
+            ok(!(await run.isDisabled()), "the exact id, with every tick, opens it");
+            await run.click();
+            await page.waitForSelector("#sec-alerts .sec-alert.ok", { timeout: 10000 });
+            const body = await page.evaluate(() => {
+                const i = window.__CALLS.findIndex((c) => c.verb === "safe-delete");
+                return window.__BODIES[i];
+            });
+            ok(body && body.safe === "lab-dc" &&
+               body.delete_confirm === "delete-safe:lab-dc",
+               `delete sends the id and a confirm token naming it, never a path (${JSON.stringify(body)})`);
+            ok(Object.keys(body).every((k) =>
+                   !/^(path|dir|dest|destination|filename|file)$/.test(k)),
+               "and no path-shaped key (I4, C8)");
+            await page.close();
+        }
+
+        /* ---- the wizard at 200% zoom, and its focus trap ---------------- */
+        {
+            const page = await H.openPage(browser, regScen({
+                "import-begin": { ok: true, staging: "stg-8", chunk_bytes: 4096 },
+                "import-chunk": { ok: true },
+                "import-inspect": INSPECT,
+                "import-abort": { ok: true }
+            }));
+            await page.setViewportSize({ width: 640, height: 720 });
+            await page.goto(url);
+            await page.waitForSelector("#sec-safes .sec-safe");
+            await page.click('#sec-safes .sec-tools button:text-is("Add an existing safe…")');
+            await page.waitForSelector(".sec-modal .sec-steps");
+            const over = await page.evaluate(() =>
+                document.documentElement.scrollWidth - document.documentElement.clientWidth);
+            ok(over <= 1, `the upload wizard does not overflow sideways at 640px (${over}px)`);
+            for (let i = 0; i < 30; i++) await page.keyboard.press("Tab");
+            ok(await page.evaluate(() => !!document.activeElement.closest(".sec-modal")),
+               "the focus trap holds inside the upload wizard");
             await page.close();
         }
 

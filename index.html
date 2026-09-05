@@ -103,6 +103,25 @@
             how big it is &#8212; and deleting it afterwards is the operator&#8217;s job, not this
             page&#8217;s. An attachment downloaded from an entry, by contrast, is streamed through
             the Cockpit channel straight to this browser and never lands on the server&#8217;s disk.</p>
+            <p><strong>Uploading a safe sends the encrypted file first and asks for the
+            passphrase last.</strong> The file is staged, its header is read back to you
+            &#8212; format, version, cipher and KDF, which are not secret and are readable
+            by anyone holding the file &#8212; and only then are you asked to unlock it. That
+            summary is read from the header and is <em>not</em> authenticated: nothing has
+            been checked against a passphrase at the point you see it. A file that does not
+            open with the passphrase you give is never registered and never lands anywhere,
+            and a wrong passphrase does not throw the upload away.</p>
+            <p><strong>This page never sends a path.</strong> Creating or uploading a safe
+            supplies an <em>id</em>; the helper mints the filename and chooses the directory
+            from the access class. There is no control here, on any dialog, for a path, a
+            filename or a directory.</p>
+            <p><strong>Forget leaves the file; Delete destroys it.</strong> Forgetting a safe
+            removes its registry entry and nothing else &#8212; the encrypted file and its
+            backups stay exactly where they are, and registering it again brings it back.
+            Deleting destroys the file and its whole backup ring, is behind typing the safe&#8217;s
+            id, and cannot be undone. Overwriting a file before unlinking it is best-effort:
+            on an SSD, a copy-on-write filesystem, or anything already in a snapshot or a
+            backup, the old bytes may still be recoverable.</p>
             <p><strong>A safe held open by the agent is announced, always.</strong> When a safe is
             unlocked through <code>secrets-agent</code>, the banner at the top of this page names
             it and counts down to its automatic lock, from every view. If that banner is not

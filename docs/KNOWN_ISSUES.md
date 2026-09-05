@@ -5,6 +5,15 @@ and Password Safe v3 safes, with severity, root cause, the mitigation that close
 task that owns it. Tasks cite these ids; a task is not done until its cited ids are either
 MITIGATED or explicitly re-classified with a reason.
 
+**55 entries as of 0.4.0.** I43–I54 are the twelve the red-team round against the
+registry-write feature found, and I55 is a thirteenth found by this release's own cleanup —
+the first thing in the project's history to delete a safe and then reuse its id. Every one is
+FIXED, every one has a regression check in
+`tests/integration/registry_writes.py` that was watched going red with its fix reverted, and
+every one has a standing ban in `validate.sh` that was watched firing on a deliberate
+violation. Three items remain genuinely open and are tracked rather than closed (I36, I37,
+I38); one is argued and left standing with a runtime warning (I35).
+
 Legend — Sev: **C**ritical / **H**igh / **M**edium / **L**ow.
 Status: OPEN / MITIGATED / BY-DESIGN / WONTFIX. **FIXED** appears on entries added after the
 adversarial pass and means the same as MITIGATED — the hazard is closed and the evidence is in
@@ -1137,3 +1146,487 @@ PASS  the unlock added NOTHING to either storage area and wrote nothing of ours 
 PASS  no storage value in either area contains the passphrase, a revealed password, the safe's
       id or this package's name — the tolerated keys included ([])
 ```
+
+---
+
+## Found by the red-team round on the 0.4.0 registry-write feature
+
+Twelve findings, all in the code that lets an operator **create** a safe and **adopt** an existing
+one — `safe-create`, `import-begin` / `-chunk` / `-inspect` / `-commit` / `-abort`, `safe-forget`
+and `safe-delete`, plus the per-user registry C4 introduced. Every one was reproduced before it
+was fixed, every one has a regression check in `tests/integration/registry_writes.py` that was
+**watched going red with the fix reverted**, and the greppable half of each is a standing ban in
+`validate.sh` that was **watched firing on a deliberate violation**.
+
+The pattern across all twelve is worth stating once, because it is not "somebody was careless".
+This feature let a browser request write into the registry — the program's trust root — for the
+first time. Ten of the twelve are the *old* code being asked a question it had never been asked:
+`open_safe_fd` had never been pointed at a FIFO by an unprivileged user, `_shred` had never been
+handed a path that was not a safe, the staging sweep had never seen a name it did not create. The
+two exceptions (I43 and I50) are new code, and both are the same mistake: an invariant stated in
+a docstring that the code did not enforce.
+
+### I43 · `import-commit` proved one read of the staged file and landed a different one · Sev M · FIXED 2026-09-04
+`v_import_commit` addressed the staged blob **by path, twice**: `_open_candidate(fmt, blob, …)`
+opened and validated it, and `sf.read_all()` then re-opened the same path for the bytes
+`_place_new_safe` wrote. No descriptor was held across the two and no digest tied them together,
+and the window between them is a full KDF derivation. So the verb's entire security argument —
+its own docstring says *"the only bytes that can ever become a safe are bytes that are
+demonstrably a safe the uploader can already open"* — was false.
+
+Reproduced as a real race in the hermetic lab, at uid 1000 and again at euid 0 through
+`/srv/jobs`: a safe created with a deliberately expensive KDF
+(`{"memory_kib":262144,"time":24,"parallelism":2}`) was uploaded, inspected, and committed with
+the CORRECT passphrase in a thread; 1.2 s later — inside the derivation — the staged `blob` was
+overwritten with `os.urandom(len)`.
+
+```
+commit ok=True   landed == unvalidated noise: True   landed == the validated safe: False
+registry entry written: True     unlock of the registered 'safe': invalid
+```
+
+**Reach, stated honestly:** the staging directory is 0700 and owned by the euid, so on the user
+path only that user can win the race (a self-attack with nothing to gain) and on the admin path
+only root can — `cptest` was verified unable to `ls` a root-owned staging. The browser alone
+cannot win it. What is true regardless of an adversary is that an import which reports success
+could register a file that is not a safe, and that every future reader of this code would have
+relied on an invariant that did not hold.
+
+**FIXED STRUCTURALLY, not by adding a third check.** `_open_candidate` no longer accepts a path —
+the signature is `(fmt, data, password, keyfile, *, mine)` — so there is nothing left to re-read
+and no path to re-read it from. `v_import_commit` reads the blob **once** into `data` and hands
+that same object to the validator and to `_land_new_safe`. `_header_facts` got the same treatment
+(it took a path and called `probe()`, which re-opened the file a second time for facts already in
+memory) and now delegates to `Backend.inspect_bytes(data)` — which also removed the `getattr`
+reach into `backends.kdbx._read_header` / `_clamp_kdf` and its silently-degrading clamp. As a
+belt, the digest declared at `import-begin` is re-verified at commit against the bytes that are
+about to land, so "what landed is what was declared and inspected" is a statement about one array
+of bytes rather than about three reads that were probably the same.
+
+**Regression:** `registry_writes.py::section_single_read` drives the same race and asserts the
+landed bytes are the validated ones, plus both signatures. Reverted (`_open_candidate` re-reading
+by path), it goes red: `2 failed checks`. **Ban:** `validate.sh` requires both signatures and
+allows at most ONE `read_all(` inside `_commit_staged`; both halves were watched firing.
+
+### I44 · A registry entry naming a FIFO hung every helper invocation, forever · Sev H · FIXED 2026-09-04
+`open_safe_fd`'s own docstring says step 4 is *"Regular file, or refuse. A FIFO would block the
+helper forever."* That check runs **after** the `os.open`, and `open(2)` on a FIFO with no writer
+blocks indefinitely — so the check that was supposed to make a FIFO safe could never run.
+
+It became reachable when C4 handed every unprivileged user a registry they can write and the
+loader started probing every per-user `path` at load time, on every verb.
+
+```
+mkfifo ~/fifo2 && chmod 600 ~/fifo2
+~/.config/cockpit-secrets/safes.d/pu-fifo.json -> {"id":"pu-fifo",...,"path":"<HOME>/fifo2"}
+
+health rc=124 elapsed=20s    list rc=124 elapsed=20s    schema rc=124 elapsed=20s   (124 = timeout)
+strace: openat(AT_FDCWD, <fifo>, O_RDONLY|O_NOCTTY|O_NOFOLLOW|O_CLOEXEC) = ? ERESTARTSYS
+```
+
+`schema` is the verb the page needs to render anything at all, and `health.registry_errors` is the
+supported way to find out why a safe is missing — so the plugin became permanently unusable for
+that user and could not explain why, while every reload accumulated stuck processes and held
+Cockpit channels. Self-inflicted today (only the user can write their own registry), which is why
+it is a robustness finding and not an escalation; trivially reachable by accident.
+
+**FIXED with one flag, in the one place every safe is opened.** `open_safe_fd` adds `O_NONBLOCK`
+to the open so the call RETURNS and step 4 gets to run — and clears it with `fcntl` the moment
+`S_ISREG` passes, because `read_all` and `write_all` are written against blocking semantics and
+leaving the flag set would make that assumption depend on the filesystem rather than on one line.
+
+```
+health ANSWERED in 0.30s   list ANSWERED in 0.20s   schema ANSWERED in 0.21s
+registry_errors: [{"file":"pu-fifo.json","error":"... (safe path is not a regular file); the entry
+                   is dropped — remove <path> to clean it up"}]
+```
+
+**Regression:** `registry_writes.py::section_fifo` times out at 20 s per verb and asserts all
+three answer, that the entry is dropped with a reason, and that the FIFO is untouched. Reverted,
+it goes red. **Ban:** `validate.sh` requires `flags |= os.O_NONBLOCK` inside `open_safe_fd`;
+watched firing when the line is deleted.
+
+### I45 · A failed registry write left an orphan safe file and burned the id forever · Sev M · FIXED 2026-09-04
+`v_safe_create` and `v_import_commit` both called `_place_new_safe` and then `_publish_entry` as
+two independent statements with no `try` around the pair. Any failure of the second — a read-only
+`/etc`, ENOSPC, a registry directory somebody chmodded, a `SIGKILL` in the window — left the file
+on disk with nothing pointing at it.
+
+```
+chmod 500 ~/.config/cockpit-secrets/safes.d
+safe-create id=orphan-one  -> {"error":"internal","detail":"the registry entry could not be written: EACCES"}
+ls ~/.local/share/cockpit-secrets/safes/  -> -rw------- 1269 orphan-one.kdbx     <- it stayed
+retry the same id -> conflict ("a file for that id already exists")
+list -> []       safe-forget -> not-found       safe-delete -> not-found
+```
+
+The id was burned **from inside the program**: create refused it, `list` did not show it, and the
+two verbs that could clean it up both need a registry entry that does not exist. For the admin
+class the orphan lands in `/etc/cockpit-secrets/safes/` where only root can remove it; for an
+import it is up to 128 MiB of the operator's uploaded safe. C5 rule 6 explicitly asks for the
+`SIGKILL` case to be survivable, and `_atomic_json_file`'s own docstring says an operator who
+created a safe and cannot find it must never have to guess whether the write tore.
+
+**FIXED by making the pair one operation.** `_land_new_safe(ctx, safe_path, data, doc, reg_dir,
+reg_name, access)` is now the ONLY function that may create a safe: it places the file, publishes
+the entry, and **unlinks the file again on any failure of the publish**. It is safe to unlink
+unconditionally there and nowhere else — the path was minted seconds earlier, `_refuse_conflict`
+proved nothing was at it, and `_place_new_safe` created it, so the only thing that can be there is
+what we just wrote. The one case that cannot be made clean is the rollback itself failing, and
+that is the single place this program names a path in an error: an operator who cannot see the
+orphan cannot remove it, and `health.registry_errors` will not mention it either because there is
+no entry to fail to load. **The audit line still carries no path** (I15); `registry_writes.py`
+asserts both halves.
+
+**Regression:** `section_orphan` runs the failure for BOTH `safe-create` and `import-commit` and
+asserts nothing is left, the id is reusable, and the retry is listed. Reverted, it goes red:
+`6 failed checks`. **Ban:** `_place_new_safe` must appear exactly twice in `secrets-admin` (its
+definition and one call, inside `_land_new_safe`); watched firing.
+
+### I46 · `_KNOWN_KEYS` omitted the three provenance keys, so the shipped examples were silently dropped · Sev M · FIXED 2026-09-04
+`origin`, `created_utc` and `source` were declared in `schema/safe-registry.schema.json`,
+documented in `docs/CONTRACT.md` as the record a created or imported safe carries, and shipped in
+`etcdefaults/30-example-created.json`, `40-example-imported.json` and
+`user-safes.d/50-example-personal.json` — and `validate_entry`'s `_KNOWN_KEYS` did not list them.
+`validate_entry` runs BEFORE the jsonschema gate and drops an entry with an unknown key.
+
+```
+cp etcdefaults/30-example-created.json <etc>/safes.d/
+health.registry_errors -> [{"file":"30-example-created.json","error":"unknown key 'created_utc'"}]
+list -> []
+```
+
+So an operator following the shipped documentation and the shipped examples wrote an entry that
+`jsonschema` accepted, `install.sh`'s validation loop passed, and the helper discarded — the exact
+outcome the code's own comments say must never happen. The second half was worse: **nothing ever
+wrote them**, so `CONTRACT.md`'s account of provenance described a record that did not exist, and
+the "this program made this file" reassurance that makes a `safe-delete` confirmation feel
+reasonable had no data behind it.
+
+**FIXED in one change, both halves.** `_KNOWN_KEYS` gained the three names with full type checks
+(`_sub_source` validates the `source` block to the same shape the schema declares, including the
+`additionalProperties:false` on `kdf_params` — a parameter the writer has no key for is DROPPED
+rather than written, because writing one makes the whole entry fail its next load). `_registry_doc`
+now writes `origin: "created"|"imported"` and an RFC-3339 `created_utc`, and `import-commit`
+writes a `source` block built from what `import-inspect` actually SHOWED the operator before they
+typed a passphrase — not from a fresh parse — carrying `sha256_at_import`, `cipher`, `kdf`,
+`format_version`, `kdf_params` and `bytes`.
+
+**Regression:** `section_provenance` copies the shipped examples in and asserts zero registry
+errors, then asserts what create and import write, then plants four malformed provenance keys and
+asserts each drops the entry. **Ban:** `tests/ban_registry_vocabulary.py` compares `_KNOWN_KEYS`
+with the schema file's `properties` in BOTH directions and is run by `validate.sh`; watched firing
+when the three names are removed. That gate is what makes this a class of bug that cannot recur.
+
+### I47 · `safe-delete` shredded any file a registry entry named, and swept any directory `backup.dir` named · Sev H · FIXED 2026-09-04
+`docs/CONTRACT.md` stated the gate in two places — *"the entry's `path` must equal the path this
+program would mint for this id and access class today"* and *"a hand-registered safe can only be
+forgotten"* — and the code did not have it. `v_safe_delete` resolved the registry `path` and
+shredded whatever was there, without ever opening it through a backend.
+
+C4 deliberately gives every unprivileged user a registry they can write, so the entry is a thing
+they can produce with `cat >`:
+
+```
+512 bytes of /dev/urandom at ~/.gnupg/trustdb.gpg, declared {"format":"psafe3","path":...}
+safe-delete -> {"ok":true,"file_removed":true,"bytes":512,"overwritten":true}
+the file was overwritten with random bytes and unlinked. It was never a safe of any format.
+```
+
+And the ring sweep amplified it: a REAL safe whose entry pointed `backup.dir` at `~/docs` had
+`taxes.pdf`, `keys.txt` and `notes.md` all shredded by one delete, with the confirmation token
+naming only the safe id and the swept directory never shown to the operator. Because the audit
+line is by id — correctly (I15) — nothing anywhere recorded what was destroyed.
+
+**FIXED with the gate the contract already specified, plus the same derivation for the ring.**
+`_minted_path_or_refuse()` asks `_mint` what path this id and access class would produce TODAY and
+requires the entry's own path to equal it exactly. It reads the **id**, not `origin`: a hand-edited
+provenance key must not be able to talk the helper into an unlink, so `origin` corroborates and
+does not authorise. `_delete_ring()` derives the ring from the minted path
+(`backup_dir_for(path, None)`) and removes only files named like a generation
+(`<basename>.<stamp>.<pid>.bak`); a ring at a registry-supplied `backup.dir` is **not** swept and
+the response says so in a warning, because leaving copies quietly would be the other half of the
+same lie.
+
+The intended consequence: **a hand-registered safe can only be forgotten.** Its file is somewhere
+an administrator chose, this program did not put it there, and removing it is `rm`.
+
+**Regression:** `section_delete_gate` — a hand-registered file survives a delete byte-for-byte and
+is still forgettable; a registry `backup.dir` is not swept and the warning says so; the derived
+ring's own generations ARE destroyed and the two foreign files beside them are not. Reverted, it
+goes red: `5 failed checks`. **Bans:** `validate.sh` requires
+`path = _minted_path_or_refuse(entry, ctx)` and `backup_dir_for(safe_path, None)` inside
+`_delete_ring`; both watched firing.
+
+### I48 · `safe-delete` destroyed the file BEFORE unregistering it, and reported the whole thing refused · Sev H · FIXED 2026-09-04
+The order was: shred the safe, shred the ring, then unlink the registry entry. When the registry
+unlink failed — a normal root-owned `safes.d` an unprivileged caller cannot write, which is the
+documented per-user `%u` pattern — the caller was told `access-denied` **after** everything was
+already gone.
+
+```
+<etc>/safes.d/uclass.json with access:"user" pointing at a file the caller owns 0600
+chmod 555 <etc>/safes.d
+safe-delete -> {"error":"access-denied","detail":"this caller may not write to the registry directory"}
+<HOME>/mysafes/ is EMPTY                 <- already shredded and unlinked
+<etc>/safes.d/uclass.json untouched      <- still registered
+list -> ('uclass', usable=True, reason='')
+```
+
+The most destructive verb in the program reported the operation as REFUSED after it had
+irreversibly destroyed the safe and its entire backup ring — the only undo the program has (I12).
+The operator believed nothing had happened, `list` still said usable, and the loss surfaced at the
+next unlock with the ring already gone. That is the worst direction for a partial failure to fail
+in.
+
+**FIXED by reversing the order.** `v_safe_forget` runs FIRST; only after the registry edit has
+committed does anything get shredded. Past that line a failure can only leave MORE of the safe
+than the operator asked for, never less than they were told — which is `safe-forget`'s outcome and
+a state the operator can act on.
+
+**Regression:** `section_delete_order` makes the registry unwritable, asserts the refusal, and then
+asserts the safe file is byte-identical, still unlocks, and is still listed as usable — which is
+now a TRUE statement. Reverted, it goes red: `3 failed checks`. **Ban:** `validate.sh` requires
+the `v_safe_forget(` call to appear before the first `_shred(path)` inside `v_safe_delete`;
+watched firing.
+
+### I49 · `safe-delete` checked a confirmation field its own schema does not declare · Sev M · FIXED 2026-09-04
+`v_safe_delete` read `req.get("confirm")` — the `export` verb's field name — while the `schema`
+verb published `delete_confirm`, `docs/CONTRACT.md` documented `delete_confirm`, and `secrets.js`
+sent `delete_confirm`.
+
+```
+schema: safe-delete request = ['safe', 'delete_confirm']    "is 'confirm' declared?" -> False
+delete_confirm (schema-declared) -> access-denied, file still present
+confirm        (undeclared)      -> ok:true,      file gone
+```
+
+Through the interface the schema publishes — the only one `secrets.js` builds its form from and
+the only one `CONTRACT.md` documents — `safe-delete` could **never succeed**. C8's destructive half
+was dead on arrival, so the trap C8 exists to close was only half shut. It is fail-closed, so not
+an escalation; but the gate an operator types was not the gate the code checked, and the obvious
+fix at the caller would have left the two permanently out of sync.
+
+**FIXED at the code (`delete_confirm`), because the schema and the contract are the authority for
+request fields.** The generalisation matters more than the one-line change:
+`tests/ban_undeclared_fields.py` is a new standing gate that walks `secrets-admin`'s AST, builds a
+call graph, and refuses any verb that can reach a `req.get("x")` its own published request does not
+declare. It found four more, all real: `backups`, `breach-check`, `restore-backup` and `export`
+all accept a session `handle` through `_entry_for` and none of them declared it — a working
+capability no conforming client could use. All four now declare `handle`, and the capability was
+verified working inside a real `open` session afterwards.
+
+**Regression:** `section_confirm_field` asserts the schema's declaration, that the declared field
+deletes, that the old spelling does not, and that eight malformed confirms are refused with the
+safe intact. Reverted, it goes red: `13 failed checks`. **Bans:** the exact
+`confirm = req.get("delete_confirm")` line, and `ban_undeclared_fields.py`; both watched firing —
+the AST ban was tested by adding a `req.get("undeclared_field_xyz")` to a verb.
+
+### I50 · The pre-commit import steps ACCEPTED a credential and silently ignored it · Sev M · FIXED 2026-09-04
+C5 makes the ordering — bytes first, passphrase last — a requirement of the **helper**, not of the
+UI. `import-begin`, `import-chunk` and `import-inspect` never READ a credential, which is not the
+same as refusing one: they accepted `password`, `new_password`, `keyfile_b64` and `passphrase` and
+answered `ok`. The shipped `ui_rules` string told clients a rule the server did not enforce.
+
+```
+import-begin  + {"password":"CANARY","new_password":"CANARY","keyfile_b64":"..."} -> ok:true
+import-chunk  + {"new_password":"CANARY"}                                          -> ok:true
+import-inspect+ {"new_password":"CANARY","password":"CANARY"}                      -> ok:true
+```
+
+So the one guarantee the brief calls *"a requirement, not a preference"* lived entirely in
+`secrets.js`. Any other client — or a regression in the page's step ordering, or a future generic
+request serializer — could collect the passphrase in the file-picker step and ship it with
+`import-begin` and with all 256 chunk frames of a 128 MiB upload. That is exactly the browser-memory
+window I11 and I14 exist to shrink, re-opened with nothing on the server side saying no.
+
+**FIXED IN THE DISPATCHER, not in the three verbs.** `_refuse_undeclared_credential(verb, req)`
+runs inside `run_verb` for every verb, and its allow-list is **each verb's own declared request in
+the `schema` document** — so a new verb that declares no secret field gets the refusal without
+anybody adding a line, which is the same reasoning that put `verify_own_output` where it is. The
+refusal is `invalid` and names the field, because the caller is a program and naming a key it sent
+is not a disclosure. `_CREDENTIAL_ALIASES` covers spellings this program does not publish
+(`passphrase`, `keyfile`, …) so "the helper did not recognise the key" is never the reason a
+credential is accepted somewhere it must not be.
+
+Two consequences worth recording. The guard exposed that `backups`, `breach-check`,
+`restore-backup` and `export` accepted an undeclared `handle` (see I49) — they now declare it, and
+the capability still works. And `tests/integration/flow.py`'s class-gate sweep was sending
+`password` to every verb; it now builds each request from that verb's own declared fields, which
+is the stronger version of the same check and took it from 88 to 115 passing assertions.
+
+**Regression:** `section_precommit_credentials` asserts all four credential spellings are refused
+by name on all three verbs, that a clean flow still works end to end, that the guard is generic
+(`probe` + `password` is refused too), and that a verb which DOES declare one still accepts it.
+Reverted, it goes red: `13 failed checks`. **Ban:** `_refuse_undeclared_credential(verb, req)` must
+appear exactly twice (definition plus the call inside `run_verb`) — the first version of this ban
+grepped for the name alone and PASSED with the call replaced by `pass`, because the definition
+line spells it the same way; that was caught by running the control and is why the ban counts.
+
+### I51 · `safe-forget` reported success while the safe stayed registered · Sev L · FIXED 2026-09-04
+With two registry files in one directory declaring the same id, `v_safe_forget` unlinked the
+`registry_file` the winning entry came from and returned `{"ok":true,"forgotten":…}`. The loser was
+promoted on the next load.
+
+```
+list before -> ['esc-e']    safe-forget -> {"ok":true,"forgotten":"esc-e"}
+directory after -> 00-alias.json still present
+list after -> STILL LISTED: ['esc-e']
+```
+
+The verb C8 exists to provide reported that it had done its job and had not. The operator believes
+a safe is unregistered while it remains fully reachable — including by `unlock`, and with whatever
+`path`, `access` and `mode` the surviving duplicate declares, which need not match the one they
+inspected. Reachable in the system registry too.
+
+**FIXED by making the loader carry the whole list.** `_read_registry_dir` records
+`entry["registry_files"]` — every file that declared this id, not just the winner — and
+`safe-forget` REFUSES with a `conflict` naming all of them. Refusing is the only honest answer:
+unlinking one of two would report success and leave the safe registered, and unlinking both would
+destroy a second entry the operator never named. `safe-delete` inherits the refusal through
+`safe-forget`, so a duplicated id cannot be destroyed either.
+
+**Regression:** `section_forget_duplicates`. Reverted (`dupes = []`), it goes red: `5 failed
+checks`. **Ban:** the loader's recording line and forget's reading line, both pinned exactly — the
+first version of this ban passed with the recording line replaced by `pass`, because the same key
+appears again in the duplicate branch.
+
+### I52 · `safe-create` accepted bidi-override and zero-width characters in `label` · Sev L · FIXED 2026-09-04
+`_new_label` rejected only C0 controls and `0x7f`. `schema/safe-registry.schema.json` says of
+`label`: *"Set it wrong and an operator picks the wrong safe out of the list, which is how a
+passphrase gets typed into the wrong prompt."* Labels reach the DOM via `textContent`, so U+202E is
+applied by the browser's bidi algorithm and the visible string is not the stored one.
+
+**Reach, stated plainly:** a per-user label is shown only in that user's own list (a root helper
+never reads the per-user registry — verified), and an admin-class label requires already being an
+administrator, so this is not a cross-privilege spoof. It matters because 0.4.0 is the first
+release in which a label reaches the registry from a browser form at all.
+
+**FIXED by refusing, not stripping** — silently altering an operator's label means the name in the
+list is not the name they typed. `_LABEL_SPOOF_CHARS` names the bidi overrides and isolates
+(U+202A–202E, U+2066–2069) and the zero-width set (U+200B–200F, U+FEFF), and a `unicodedata`
+category `Cf` sweep catches the ones nobody thought of — naming only the known ones is how the
+next one gets through.
+
+**Regression:** `section_label_spoofing` refuses seven hostile labels (written as `\u` escapes in
+the test source, because a file carrying a literal U+202E reverses itself in the reviewer's editor)
+and accepts five legitimate ones including accents, an en dash and Japanese — a refusal that
+catches everything is an outage, not a fix. Reverted, it goes red: `12 failed checks`. **Ban:** the
+`Cf` sweep line; watched firing.
+
+### I53 · The start-up staging sweep followed a symlink named like a staging token · Sev L · FIXED 2026-09-04
+`_sweep_staging` accepted any name matching `^[0-9a-f]{32}$`, aged it with `os.stat` — which
+follows symlinks — and `_staging_destroy` then unlinked `blob` and `meta.json` **by path**. So a
+symlink named like a token had its TARGET's two files removed, on every helper invocation,
+including at euid 0.
+
+```
+<state>/import/bbbb…bb -> a directory outside the staging root
+before: ['blob','keepme','meta.json']   after: ['keepme']
+the symlink itself survives (rmdir on a symlink fails), so the attempt repeats every invocation
+```
+
+This is a real deviation from `_staging_destroy`'s own stated discipline — it argues the flat
+two-unlink form is safer than a tree walk *because* "the only thing that should be in it is what we
+put there". Not reachable by an adversary the threat model cares about: the staging root is 0700
+and owned by the euid (verified 0700 root:root on the admin path, with `cptest` denied `ls`), so
+planting the symlink is a self-attack. It is a hardening gap in the one function that runs as root
+on every single invocation and deletes by path.
+
+**FIXED in both places.** `_sweep_staging` uses `os.lstat` and skips anything that is not a
+directory — and leaves it alone rather than removing it, because this function's remit is stale
+stagings and "something unexpected is in here" must not become "delete whatever is in here".
+`_staging_destroy` opens the token directory `O_NOFOLLOW|O_DIRECTORY` and unlinks **through that
+dirfd**, so a symlink is the thing that is refused rather than the thing that is traversed.
+
+**Regression:** `section_sweep_symlink` plants the symlink, ages it ten days, runs an unrelated
+verb, and asserts the target is intact — with a positive control that a REAL stale staging in the
+same directory IS swept. Reverted, it goes red. **Bans:** `os.lstat(d)` in the sweep and
+`dir_fd=dirfd` in the destroy; both watched firing.
+
+### I54 · Nothing bounded how many `import-inspect` / `import-commit` calls ran at once · Sev M · FIXED 2026-09-04
+Every other import limit counts things a caller may HOLD — `IMPORT_MAX_STAGINGS`,
+`IMPORT_MAX_ATTEMPTS`, `MAX_SAFE_BYTES`. None counted things RUNNING, and each helper invocation is
+its own process.
+
+```
+single import-inspect on a 128 MiB staging : wall 0.57 s, peak RSS 299 MiB  (2.33x the file)
+8 stagings x 128 MiB, 8 concurrent inspects: 1.05 s, aggregate secrets-admin RSS 2,329 MiB
+32 concurrent inspects against ONE staging : 2.89 s, peak aggregate RSS 7,576 MiB
+```
+
+7.58 GiB of resident memory across 32 helper processes — every one of them euid 0 on the admin
+path — from a single 128 MiB file, in under three seconds, with no error and no throttle. What
+`import` adds over `unlock`, which has the same per-request shape, is that the caller supplies the
+large input themselves and needs neither a registered safe nor an administrator to do it.
+
+**FIXED with a non-blocking work slot.** `_ImportWorkSlot` takes `flock(LOCK_EX|LOCK_NB)` on one of
+`IMPORT_MAX_CONCURRENT` (2) slot files inside the staging root — which is already 0700 and owned by
+the euid, so the slots are per-identity by construction and one user cannot exhaust another's. It
+**refuses rather than queues**: a caller queued behind two 128 MiB inspections is a Cockpit channel
+held open for the duration, and `conflict` is a retryable code the UI already knows. The lock dies
+with the process, so a SIGKILLed helper does not leak a slot the way a counter file would.
+
+The per-request factor also halved as a side effect of I43's single read: after the fix a repeat
+inspect of the same 128 MiB staging measures **42–44 MiB peak RSS** against a ~40 MiB baseline,
+because the second full read that `probe()` was doing is gone.
+
+`secrets.js` retries a `conflict` at the inspect step up to four times with a short wait before it
+gives up, because the wizard's failure path destroys the staging — and re-uploading 128 MiB because
+two operators clicked at the same moment is the same class of bug as re-uploading it because of a
+typed passphrase.
+
+**Still not bounded, and recorded rather than fixed:** `unlock` on a large REGISTERED safe has the
+same per-request shape and never had a cap either. See `docs/RESIDUAL-RISK.md`.
+
+**Regression:** `section_concurrency` fires `import_max_concurrent + 6` simultaneous inspects and
+asserts some are refused, every refusal is a retryable `conflict` and never an `internal`, the
+staging SURVIVES a refusal (it is a throttle, not a destroy), and the commit still works
+afterwards. Reverted, it goes red. **Ban:** `with _ImportWorkSlot(` must appear in BOTH
+`v_import_inspect` and `v_import_commit` — the first version grepped the whole file and passed with
+one of the two removed.
+
+### I55 · A safe created at a reused id inherited the deleted one's lockout · Sev L · FIXED 2026-09-04
+Found while cleaning the host after the live walkthrough, and only because that was the first
+thing in this project's history to delete a safe and then reuse its id.
+
+I16's counter is keyed on **(real uid, safe id)** — correctly (I40) — and until 0.4.0 an id was
+never freed from inside this program, so a counter and the safe it counted for had the same
+lifetime and nothing had to say so. `safe-delete` broke that silently:
+
+```
+safe-create id=reuse                       ok
+six wrong guesses                          bad-credential ×2, locked-out ×4
+  fail.1000.reuse.json -> failures 2, locked_until in the future
+safe-delete reuse                          ok  (file and ring destroyed)
+  fail.1000.reuse.json -> failures 2, STILL ARMED
+safe-create id=reuse                       ok
+unlock reuse WITH THE PASSPHRASE JUST CHOSEN
+  -> {"error": "locked-out",
+      "detail": "too many failed unlock attempts for this safe; try again in 2 seconds"}
+```
+
+An operator makes a safe, types the passphrase they chose ten seconds ago, and is told there
+have been too many failed attempts on it. It is a self-inflicted denial of service and its
+worst case is bounded by `LOCKOUT_MAX_SECONDS` — hence Low — but it is the kind of message that
+makes somebody distrust the whole program.
+
+The same state is reachable without `safe-delete`: forget the entry, remove the file by hand,
+create the id again.
+
+**FIXED at both routes, in `_land_new_safe` and in `v_safe_delete`.** Putting it in
+`_land_new_safe` rather than in `safe-create` and `import-commit` separately is the usual rule
+here — an import cannot get it and a create forget it. It is safe to clear at that point
+because reaching it means the class gate passed and `_refuse_conflict` proved the id was free,
+so any counter under it is about a safe that no longer exists.
+
+`lockout_reset` **zeroes rather than unlinks**, which is its own documented discipline and not a
+compromise: `flock` is held on an inode, and unlinking a counter other helpers are queued on
+hands the next arrival a different inode with the same name — I39 reached from the one code
+path allowed to make the counter smaller. So a 60-byte zeroed file remains, deliberately.
+
+**Regression:** `registry_writes.py::section_reused_id` drives BOTH routes —
+delete-then-create and forget-remove-create — and requires the brand-new safe to open with the
+passphrase just chosen. Reverted, both go red with `locked-out`. **Ban:** `validate.sh` requires
+the `lockout_reset` call in `_land_new_safe` AND in `v_safe_delete`; reverting either fires it,
+watched.

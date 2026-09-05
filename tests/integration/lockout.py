@@ -134,29 +134,186 @@ def _files(env):
 
 def _guess(env, i):
     """ONE wrong passphrase, in its own helper process."""
+    return _timed_guess(env, i)[0]
+
+
+def _timed_guess(env, i):
+    """ONE wrong passphrase -> (outcome, spawned_at, answered_at).
+
+    The two wall-clock stamps bracket the moment the helper actually consulted
+    the counter: it is somewhere inside [spawned, answered], and process
+    start-up is most of that interval. Nothing here can observe the exact
+    instant, so the checks below assert what the interval makes POSSIBLE rather
+    than assuming the middle of it — see `_replay_windows`.
+    """
+    started = time.time()
     out, _rc, _err = env.run("unlock",
                              {"safe": SAFE, "password": "wrong-%d" % i},
                              extra_env=FAST_FLOOR)
-    return out.get("error") or ("ok" if out.get("handle") else "unexpected")
+    return (out.get("error") or ("ok" if out.get("handle") else "unexpected"),
+            started, time.time())
+
+
+def _replay_windows(spans, outcomes):
+    """Is this sequence of outcomes CONSISTENT with the helper's own backoff?
+
+    THIS REPLACED A WALL-CLOCK COINCIDENCE WITH THE ACTUAL INVARIANT, and the
+    reason is worth recording because the old assertion looked stronger than it
+    was. Section A used to assert "exactly one of eight guesses was evaluated",
+    which is only true while eight helper invocations fit inside the 2 s window
+    the first failure opens. On a loaded machine they take 2.4 s, the eighth
+    guess legitimately falls OUTSIDE the window, the counter correctly records
+    two failures — and the test failed, reporting a defect that was not there.
+    It had been failing at HEAD, on this host, for three separate agents.
+
+    So this replays the ESCALATING SCHEDULE against the observed timings and
+    refuses an outcome that no check-time inside its bracket could have
+    produced. It is stronger than the count it replaces: it checks the whole
+    schedule (2 s, 4 s, 8 s, …) rather than one number, and it is deterministic
+    under any load.
+
+    **`_backoff_spec` below is deliberately a SECOND implementation, spelled
+    out from the published constants, and NOT a call to the helper's own
+    `_backoff_for`.** Calling the helper's function would make the replay
+    self-referential: a build whose backoff was zeroed would agree with itself
+    perfectly and every check here would pass. That was measured, not assumed —
+    a scratch copy with `delay = 0.0 * ...` passed all 57 checks against the
+    version of this file that used `mod._backoff_for`. Two implementations of
+    one rule is the whole point of a test.
+
+    Returns (consistent, evaluated, why).
+    """
+    lo = hi = float("-inf")          # bounds on when the open window ends
+    fails = 0
+    evaluated = 0
+    for i, ((start, end), outcome) in enumerate(zip(spans, outcomes)):
+        if outcome == "bad-credential":
+            # It was evaluated, so the check happened at or after the window
+            # end. Possible iff even the LATEST it could have run is not before
+            # the earliest that window could have ended.
+            if end < lo:
+                return (False, evaluated,
+                        "guess %d was evaluated but every instant it could "
+                        "have run was inside an open window" % i)
+            fails += 1
+            evaluated += 1
+            back = _backoff_spec(fails)
+            lo, hi = start + back, end + back
+        elif outcome == "locked-out":
+            # It was refused, so the check happened before the window end.
+            # Possible iff the EARLIEST it could have run is before the latest
+            # that window could have ended.
+            if start >= hi:
+                return (False, evaluated,
+                        "guess %d was refused but no instant it could have "
+                        "run was inside an open window" % i)
+        else:
+            return (False, evaluated,
+                    "guess %d answered %r, which is neither outcome"
+                    % (i, outcome))
+    return True, evaluated, ""
+
+
+def _backoff_spec(fails):
+    """The window the Nth consecutive failure opens, FROM THE SPEC.
+
+    docs/KNOWN_ISSUES.md I16: `LOCKOUT_BASE_SECONDS * 2**(failures-1)`, at
+    least `LOCKOUT_HARD_SECONDS` once `LOCKOUT_THRESHOLD` is reached, capped at
+    `LOCKOUT_MAX_SECONDS`. Written out here rather than imported for the reason
+    in `_replay_windows`: this is the independent half of the comparison, and
+    only the CONSTANTS come from the helper.
+    """
+    mod = _load_helper_module()
+    delay = mod.LOCKOUT_BASE_SECONDS * (2 ** max(0, min(fails - 1, 20)))
+    if fails >= mod.LOCKOUT_THRESHOLD:
+        delay = max(delay, mod.LOCKOUT_HARD_SECONDS)
+    return min(delay, mod.LOCKOUT_MAX_SECONDS)
+
+
+def _max_evaluable(span):
+    """The most attempts the escalating window can admit in `span` seconds.
+
+    The first is free; the k-th needs 2+4+...+2^(k-1) seconds to have elapsed.
+    Used as a CEILING on the concurrent run: 50 processes firing at once must
+    not buy more evaluated guesses than the clock allows, which is I39 stated
+    without reference to how fast this host happens to be today.
+    """
+    total = 0.0
+    n = 1
+    while True:
+        total += _backoff_spec(n)
+        if total > span:
+            return n
+        n += 1
 
 
 # ------------------------------------------------------------ A: control ---
 
+def measured_schedule(env, r):
+    """The window a failure opens is MEASURED against the constant. (I16)
+
+    `_replay_windows` proves the outcomes are consistent with a schedule; this
+    proves the schedule is the one the constants declare. Without it a build
+    whose backoff was zeroed would pass every other check in this file, because
+    every other check compares the helper against itself.
+    """
+    r.section("A0 — the backoff schedule, measured against the constants")
+    mod = _load_helper_module()
+    env.clear_lockout()
+    outcome, _start, answered = _timed_guess(env, 0)
+    r.check("the first guess is evaluated", outcome == "bad-credential",
+            outcome)
+    doc = _counter(env)
+    opened = float(doc.get("locked_until") or 0) - answered
+    want = _backoff_spec(1)
+    r.check("it opened a window of LOCKOUT_BASE_SECONDS (%.1f s)" % want,
+            want - 1.5 <= opened <= want + 0.5,
+            "measured %.2f s, want %.1f s" % (opened, want))
+    r.check("failures is 1", doc.get("failures") == 1, doc)
+    time.sleep(max(0.0, opened) + 0.6)
+    outcome, _start, answered = _timed_guess(env, 1)
+    r.check("a guess after the window is evaluated again",
+            outcome == "bad-credential", outcome)
+    doc = _counter(env)
+    opened = float(doc.get("locked_until") or 0) - answered
+    want = _backoff_spec(2)
+    r.check("and it opened a DOUBLED window (%.1f s), so the escalation is "
+            "real" % want,
+            want - 1.5 <= opened <= want + 0.5,
+            "measured %.2f s, want %.1f s" % (opened, want))
+    r.check("the hard floor is declared above the escalating window",
+            mod.LOCKOUT_HARD_SECONDS >= _backoff_spec(mod.LOCKOUT_THRESHOLD - 1),
+            "hard=%.0f base-at-threshold-1=%.0f"
+            % (mod.LOCKOUT_HARD_SECONDS,
+               _backoff_spec(mod.LOCKOUT_THRESHOLD - 1)))
+
+
 def control(env, r):
     r.section("A — the sequential control: eight wrong guesses, one at a time")
     env.clear_lockout()
-    outcomes = [_guess(env, i) for i in range(8)]
+    results = [_timed_guess(env, i) for i in range(8)]
+    outcomes = [x[0] for x in results]
+    spans = [(x[1], x[2]) for x in results]
     counts = collections.Counter(outcomes)
+    elapsed = spans[-1][1] - spans[0][0]
     r.check("the first guess is evaluated (bad-credential)",
             outcomes[0] == "bad-credential", outcomes[0])
-    r.check("exactly one guess was evaluated",
-            counts.get("bad-credential") == 1, dict(counts))
-    r.check("the other seven were refused by the open window",
-            counts.get("locked-out") == 7, dict(counts))
+    consistent, evaluated, why = _replay_windows(spans, outcomes)
+    r.check("every outcome is consistent with the helper's own backoff "
+            "schedule, replayed against the observed timings",
+            consistent, why or "%s over %.2fs" % (dict(counts), elapsed))
+    r.check("no more were evaluated than the clock allows",
+            evaluated <= _max_evaluable(elapsed),
+            "evaluated=%d ceiling=%d over %.2fs"
+            % (evaluated, _max_evaluable(elapsed), elapsed))
+    r.check("at least one was refused by an open window (the mechanism ran "
+            "at all)", counts.get("locked-out", 0) >= 1, dict(counts))
     doc = _counter(env)
-    r.check("the counter records exactly the one evaluated attempt",
-            doc.get("failures") == 1, doc)
-    return dict(counts)
+    r.check("the counter records EXACTLY the evaluated attempts",
+            doc.get("failures") == evaluated,
+            "failures=%s evaluated=%d %s" % (doc.get("failures"), evaluated,
+                                             dict(counts)))
+    return {"evaluated": evaluated, "elapsed": elapsed, "counts": dict(counts)}
 
 
 # ------------------------------------------------- B: I39, the real race ---
@@ -164,9 +321,11 @@ def control(env, r):
 def concurrency(env, r, reference):
     r.section("B — I39: %d helper PROCESSES fired at once" % CONCURRENCY)
     env.clear_lockout()
+    started = time.time()
     with cf.ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
         outcomes = list(pool.map(lambda i: _guess(env, i),
                                  range(CONCURRENCY)))
+    elapsed = time.time() - started
     counts = collections.Counter(outcomes)
     evaluated = counts.get("bad-credential", 0)
     doc = _counter(env)
@@ -181,12 +340,23 @@ def concurrency(env, r, reference):
             doc.get("failures") == evaluated,
             "failures=%s evaluated=%d  %s"
             % (doc.get("failures"), evaluated, dict(counts)))
-    r.check("concurrent is indistinguishable from sequential",
-            evaluated == reference.get("bad-credential"),
-            "concurrent evaluated %d, sequential evaluated %s"
-            % (evaluated, reference.get("bad-credential")))
-    r.check("the threshold held: no more attempts than the sequential control",
-            evaluated <= reference.get("bad-credential", 0), evaluated)
+    # THE I39 PROPERTY, STATED WITHOUT REFERENCE TO HOW FAST THIS HOST IS.
+    # "Indistinguishable from sequential" used to be spelled as "the same COUNT
+    # as section A", which compared two timing coincidences and failed whenever
+    # the two runs straddled a window boundary differently. What concurrency
+    # must not buy is EXTRA evaluated guesses, so the assertion is against the
+    # ceiling the escalating window allows over this run's own elapsed time —
+    # the same ceiling section A is held to, computed from the helper's own
+    # backoff function.
+    ceiling = _max_evaluable(elapsed)
+    r.check("concurrency bought no attempt the clock did not allow",
+            evaluated <= ceiling,
+            "concurrent evaluated %d over %.2fs, ceiling %d (sequential "
+            "evaluated %s over %.2fs)"
+            % (evaluated, elapsed, ceiling, reference.get("evaluated"),
+               reference.get("elapsed", 0.0)))
+    r.check("and at least one did get through, so the run measured something",
+            evaluated >= 1, dict(counts))
     win = _window(env)
     r.check("the per-safe window counted the same attempts",
             win.get("window_count") == evaluated,
@@ -483,6 +653,7 @@ def main():
     env = Env().build()
     r = Report("I16's lockout: concurrency (I39), identity (I40), reach")
     try:
+        measured_schedule(env, r)
         reference = control(env, r)
         concurrency(env, r, reference)
         give_back(env, r)

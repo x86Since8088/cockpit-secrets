@@ -46,8 +46,11 @@ Read [`CONTRACT.md`](CONTRACT.md) for the verb interface,
   │                        umask 077 · mlockall(best effort, reported   │
   │                        honestly) · close inherited fds >2    (I14)  │
   │  2. read stdin, ≤1 MiB, parse ONE JSON object               (I10)   │
-  │  3. load /etc/cockpit-secrets/safes.d/*.json, validate each         │
-  │     against schema/safe-registry.schema.json; drop what fails (I1)  │
+  │  3. load the registry: /etc/cockpit-secrets/safes.d/*.json, and     │
+  │     — ONLY when euid != 0 — ~/.config/cockpit-secrets/safes.d/      │
+  │     Validate each against schema/safe-registry.schema.json and      │
+  │     drop what fails; force access:'user' on every per-user          │
+  │     entry; a system id always wins a collision       (I1, C4)       │
   │  4. resolve the request's `safe` ID to a path — the ONLY place a    │
   │     path is ever produced                                    (I4)   │
   │  5. access class gate, from KERNEL identity, on THIS verb     (I2,  │
@@ -199,7 +202,7 @@ property visible:
 | **Extra gate** | the safe file's `st_uid` must equal the caller | the real caller must be in one of the entry's `groups` (default: the host admin group, `sudo`/`wheel`) |
 | **Safe file** | `0600`, owned by that user | `0600 root:root` |
 | **Safe location** | a path that user owns, typically under `$HOME` | `/etc/cockpit-secrets/safes/`, dir `0700 root:root` |
-| **Registry entry** | `0644 root:root` — the *entry* is root-owned even for a user safe | `0644 root:root` |
+| **Registry entry** | `0644 root:root` in the system registry, **or** `0600 <user>` in that user's own `~/.config/cockpit-secrets/safes.d/`, which only an unescalated helper reads and which cannot declare anything but `access: "user"` | `0644 root:root`, always |
 | **Blast radius of a helper bug** | that one user's own files | root |
 
 `manifest.json` declares `"superuser": "try"`. The page is usable with no
@@ -266,6 +269,199 @@ clients' own lock files — `<name>.kdbx.lock` for KeePass/KeePassXC, `<name>.pl
 for Password Safe — and a foreign lock is a `conflict` naming the holder, never a
 forced write. We remove only a lock we created.
 
+## The registry is the trust root, and these are the first verbs that write it
+
+Everything above this line treats the registry as a given. It is not: **it is what every other
+control in this program is downstream of.**
+
+- It says which files are safes. Nothing inside a KDBX or `.psafe3` file records who may open
+  it, so if the access class is not imposed from outside the file it does not exist (I1).
+- It says where each safe lives — the one place a path is ever produced, because no verb takes
+  one (I4).
+- It says what class each safe is, which decides whether the helper runs as root or as the
+  user, which decides the blast radius of every bug below it (I2, I3).
+- It says whether a safe may be written, exported, or opened with no passphrase at all.
+
+Until 0.4.0 the only way to add a line to it was for root to open an editor. That was a real
+control — an unforgeable one — and giving it up is what makes `safe-create` and `safe-import`
+the most dangerous change in the project. Three things could have been built instead of what
+was built, and naming them is how the design stays honest:
+
+1. **An arbitrary-file-write primitive into a root-owned directory.** Closed by C1: the caller
+   sends an `id`, never a path or any component of one, and the helper mints
+   `<managed dir>/<id>.<ext>` itself. Closed again by C2: the id must match
+   `^[a-z0-9][a-z0-9-]{1,62}$` *before* it reaches a filesystem call.
+2. **A way for an unprivileged user to declare a root-owned file to be their own "user-class"
+   safe.** Closed by the per-user registry's rules: a root-mode helper never opens it, every
+   entry loaded from it is forced to `access: "user"`, and its `path` still has to survive
+   `open_safe_fd` — a regular file **the caller owns**, `0600`, `O_NOFOLLOW`, `fstat` on the
+   fd (I5). Declaring `/etc/shadow` a user safe produces `access-denied`, not a read.
+3. **A way to overwrite an existing safe and destroy every credential in it.** Closed by C2's
+   second half: an id already in the registry, a minted path that already exists, or a minted
+   entry file that already exists is `conflict`. **Nothing here ever overwrites.** The only
+   verb that destroys is `safe-delete`, which needs a token naming the safe and refuses unless
+   the entry's path is one this program itself minted.
+
+`docs/CONTRACT.md`, "The verbs that WRITE the registry", is the normative version of all of
+that. What follows is where the bytes are.
+
+### Creating a safe — `safe-create`
+
+```
+browser ─stdin JSON {id,label,format,access,new_password,keyfile_b64,make_keyfile,kdf}─▶
+   │                                    secrets-admin (one process, one operation)
+   │   1  validate id against new_id_pattern; label against the C0 and Cf bans
+   │                                                 ← before any filesystem call
+   │   2  access gate from kernel identity            ← admin unless the request says "user";
+   │                                                    "user" while euid==0 is refused
+   │   3  refuse a colliding id / minted path / minted entry file      → conflict
+   │   4  Backend.create_new: build the database IN MEMORY (KDBX 4.1 + Argon2id, or
+   │      PWS3 at the write floor), then RE-OPEN IT FROM COLD with the same
+   │      passphrase through the reader an unlock will use.  It is the BACKEND
+   │      that does both, so there is one implementation of "a created safe must
+   │      read back" and no way for this file to skip it
+   │   5  _land_new_safe:
+   │        a  <managed dir>/<id>.<ext>.tmp-<pid> → fsync → os.replace → fsync(dir)  0600
+   │        b  validate the entry against the schema → 50-<id>.json, same atomic path
+   │        c  if (b) fails, UNLINK (a) again — a create leaves both halves or neither
+   ▼
+one JSON object · one audit line naming the verb, the id, the uid and the outcome
+```
+
+Step 4 is I24/I41 applied to creation: *every save re-opens its own bytes through the reader a
+later unlock will use*, and a brand-new safe is a save with nothing before it. A safe nobody
+can unlock must never become a registry entry.
+
+Step 5c is I45, and it is why the two writes are one function rather than two statements. They
+used to be two, with no `try` around the pair — so a registry write that failed (a read-only
+`/etc`, ENOSPC, a `SIGKILL` in the window) left the file with nothing pointing at it, and that
+BURNED THE ID from inside the program: `safe-create` answered `conflict`, `list` did not show
+it, and `safe-forget` and `safe-delete` both needed an entry that did not exist. It is safe to
+unlink there and nowhere else, because the path was minted seconds earlier, `_refuse_conflict`
+proved nothing was at it, and step 5a created it.
+
+**`safe-create` builds nothing itself.** It used to edit pykeepass's blank template in this
+file, and doing so it inherited three published constants — the master seed, the encryption IV
+and the inner protected-stream key — into every safe it made. The last of those is the
+ChaCha20 key masking every protected value in the XML, so until the operator's first save it
+was a public constant and two safes created here shared a keystream. It also called
+`Secret.str_view()`, minting an unwipeable `str` of the new master passphrase — the exact hop
+`backends/kdbx.py`'s own docstring says never happens inside it (I14). `Backend.create_new`
+reseeds all three at the cipher's own nonce length and never touches `str_view`.
+
+### Adopting a safe — `safe-import`, and where the uploaded bytes live at each moment
+
+`safe-import` is **five ordinary verbs**, not a session: one `cockpit.spawn` per step, one
+JSON object out of each, tied together by a `staging` token that `begin` mints and binds to
+`(real uid, id, access class)`. The staging directory **outlives the helper process** — which
+is the whole reason the steps can be separate verbs, and the reason the idle timer below is
+load-bearing rather than decorative. **No credential travels before the commit step.**
+
+```
+  verb               bytes live here                              credential?
+  ─────────────────────────────────────────────────────────────────────────────
+  import-begin       nothing yet.  A staging directory is made:   NO
+                     <staging root>/<32 hex>/ 0700, holding
+                     `blob` and `meta.json`, each created
+                     O_CREAT|O_EXCL|O_NOFOLLOW 0600.
+                     NEVER the final path.  NEVER /tmp.
+                     A declared total over MAX_SAFE_BYTES is
+                     refused before one byte arrives.
+
+  ...-chunk  ×N      in that staged file, and nowhere else.       NO
+                     The cap is enforced INCREMENTALLY as each
+                     chunk lands, never after.
+
+  ...-inspect        same file.  sha256 of the whole thing is     NO
+                     verified, the 4-byte signature must be one
+                     of the two we know, the UNAUTHENTICATED
+                     header is parsed, and the Limits KDF clamps
+                     are applied to the DECLARED parameters —
+                     so a KDF bomb dies here, before anyone is
+                     asked for a passphrase.
+                     A failure here DESTROYS the staging.
+
+  ...-commit         the staged file is read ONCE into memory,     YES — first and
+                     its declared sha256 re-verified against       only time
+                     THOSE bytes, and THAT SAME ARRAY is what
+                     must open with the credential and what is
+                     then written.  There is no second read to
+                     diverge from the first (I43).  Landing is
+                     tmp → fsync → os.replace → fsync(dir), and
+                     the file is UNLINKED AGAIN if the registry
+                     entry cannot be written (I45).  Then the
+                     staging is destroyed.
+                     A WRONG PASSPHRASE KEEPS THE STAGING.
+
+  ...-abort          staging destroyed.                           n/a
+  idle 900 s         staging destroyed, counted from its LAST use  n/a
+  channel drops      NOTHING HAPPENS.  The staging outlives the
+                     process, so a closed tab leaves an encrypted
+                     blob until the idle timer reaps it.  The page
+                     calls abort on cancel; the timer covers the
+                     case where it cannot.
+  SIGKILL            same as a dropped channel, and swept the same
+                     way — on the next verb of ANY kind, because
+                     the sweep is in init_state.  Reported by
+                     health.import_staging as a COUNT, never as
+                     a token.
+```
+
+Two properties of that picture are the whole reason for its shape:
+
+- **The only bytes that can ever land are bytes that are demonstrably a safe the uploader can
+  already open.** That single sentence is what stops the verb being an arbitrary-write
+  primitive, and it is why the credential is required at commit even though the file is
+  already on the host by then.
+- **The passphrase exists for one request, not for the whole upload.** Collecting it in the
+  file picker would hold it in browser memory for as long as a 100 MiB transfer takes — the
+  window I11 and I14 exist to shrink. And it costs nothing to wait, because a KDBX/PWS3
+  header is *not secret*: anyone holding the file can read the format, version, cipher and KDF
+  out of it, so `import-inspect` answers with no credential at all. The page must label that
+  summary as read from an unauthenticated header, because on a tampered file it is what the
+  tamperer wrote.
+
+The staging root is `<state root>/import/`, `0700`, owned by the identity the helper is
+running as — `/var/lib/cockpit-secrets/state/import/` for an admin-class import,
+`~/.local/state/cockpit-secrets/state/import/` for a user-class one. One caller may hold at
+most eight stagings at once, which bounds "start ten thousand uploads" without bounding
+anything an honest operator does.
+
+**And at most two of the expensive verbs may RUN at once** (`IMPORT_MAX_CONCURRENT`), taken as
+a non-blocking `flock` on a slot file in that same root. The two bounds count different things
+and only the first existed before 0.4.0: every helper invocation is its own process, so
+`IMPORT_MAX_STAGINGS` did nothing at all about 32 simultaneous `import-inspect` calls against
+ONE staging — which measured 7.6 GiB of resident memory across 32 root-capable processes in
+under three seconds (I54). The (N+1)th caller is refused with `conflict`, never queued: a
+caller queued behind two 128 MiB reads is a Cockpit channel held open for the duration.
+
+One thing that directory does **not** buy, said here rather than left to be assumed: for the
+admin class the helper runs as root, so the staging root cannot tell two administrators apart
+— the same limitation `SO_PEERCRED` has on the agent. An admin-class staging is visible to any
+administrator who can list it. It holds an encrypted safe its uploader already possessed, and
+root is out of scope in THREAT-MODEL.md, but "only the operator who started it can see it" is
+not a claim this design makes for the admin class.
+
+Staging is **never** required to share a filesystem with the managed safe directory: the
+commit copies through a temp file *in the target directory*, so `os.replace` is always
+intra-filesystem and nothing here depends on how `/`, `/var` and `/home` are partitioned.
+
+Staged bytes are an **encrypted** safe file. An orphaned staging directory is therefore a
+disk-space problem rather than a disclosure — which is the reason the sweep is an idle timer
+and not an emergency.
+
+### Where the entry is written
+
+| access class | the entry | written by |
+|---|---|---|
+| `admin` | `/etc/cockpit-secrets/safes.d/50-<id>.json`, `0644 root:root` | the escalated helper |
+| `user` | `~/.config/cockpit-secrets/safes.d/50-<id>.json`, `0600 <user>` | the **unescalated** helper, running as that user |
+
+Both are serialized, validated against `schema/safe-registry.schema.json` **before they touch
+the filesystem**, and written by the same `atomic_replace` primitive as everything else
+(I12/I13). A half-written entry is dropped by the loader — correct, fail-closed, and *silent*,
+which is exactly why the rule is "never produce one" rather than "the loader copes".
+
 ## What crosses which boundary
 
 | Boundary | Crosses it | Never crosses it |
@@ -276,7 +472,10 @@ forced write. We remove only a lock we created.
 | backend → helper | metadata always; a decrypted value **only after the MAC verified** (I6) | a password in `entries()` output — `reveal` is the only door |
 | helper → stdout | exactly one JSON object | a traceback, a value, a path from the request (I15) |
 | helper → audit log | timestamp, verb, safe id, caller uid, outcome, duration | any value, any entry title, any traceback (I15) |
-| helper → disk | the safe (atomically), the backup ring, the lock file | a temp file containing a secret; anything in `/tmp` |
+| helper → disk | the safe (atomically), the backup ring, the lock file, a registry entry it minted | a temp file containing a secret; anything in `/tmp` |
+| browser → helper, during an import | the **encrypted** safe file, in 512 KiB base64 chunks on the session's stdin | any credential before the commit frame — `password`/`keyfile_b64` on a begin, chunk or inspect frame is `invalid`, not ignored |
+| helper → staging | encrypted uploaded bytes, in a `0700` helper-owned directory, `O_EXCL`, `0600` | the final path; `/tmp`; anything decrypted; the credential |
+| root helper → a user's home | **nothing.** It never opens `~/.config/cockpit-secrets/safes.d/`, never writes a user-class safe, and refuses `access: "user"` outright | a per-user registry read, an entry write, a safe write, an `unlink` |
 | helper → browser storage | **nothing** | `localStorage`, `sessionStorage`, IndexedDB, cookies (I11) |
 
 ## The property everything above serves
