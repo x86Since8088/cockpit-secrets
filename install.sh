@@ -104,8 +104,18 @@ EXAMPLEDIR="$DESTDIR/usr/local/share/cockpit-secrets/examples"
 USERUNITDIR="$DESTDIR/usr/local/lib/systemd/user"
 SYSUNITDIR="$DESTDIR/usr/local/lib/systemd/system"
 
-# The Cockpit package payload, flat, mirrored by the stale-file sweep below.
-PLUGIN=(manifest.json index.html secrets.js secrets.css)
+# The Cockpit package payload, flat. This ONE array is three things at once: the
+# copy list in section 1, the stale-file sweep immediately after it, and the
+# payload-present check in the pre-flight. They cannot disagree with each other
+# because they are all reading this line.
+#
+# What they CAN disagree with is index.html, and for a release they did.
+# `theme.js` was added to the page and not to this array, so section 1 copied
+# four files and then swept the fifth straight back off the installed host on
+# every single run. The pre-flight below now reads the page's own <script> and
+# <link> references and refuses an install where the page asks for a file this
+# array does not ship.
+PLUGIN=(manifest.json index.html secrets.js secrets.css theme.js)
 
 ACTION="install"
 WITH_AGENT=0
@@ -238,6 +248,92 @@ done
 [[ -f "$SRC/schema/safe-registry.schema.json" ]] || missing+=("schema/safe-registry.schema.json")
 ((${#missing[@]} == 0)) || die "missing source file(s): ${missing[*]}. Nothing was changed."
 note "payload complete (${#PLUGIN[@]} package files, helper, backends, schema)"
+
+# --- the page asks for exactly what we ship --------------------------------
+# The defect this exists to make impossible, by name. `theme.js` was added to
+# index.html and not to PLUGIN; section 1 copies PLUGIN and then sweeps $PKGDIR
+# down to PLUGIN, so the file was deleted from the installed host on every run
+# and the page shipped a reference to a resource that was not there.
+#
+# The cost was NOT the "404s silently" the page's own comment claimed. Cockpit
+# does not answer a missing package file with a bare 404: it serves an HTML
+# error page, and Chromium then logs
+#
+#   Refused to execute script from '.../theme.js' because its MIME type
+#   ('text/html') is not executable, and strict MIME type checking is enabled.
+#
+# on EVERY page load, which is a permanent console error on the one page in
+# this host that handles every passphrase we own, and a live browser assertion
+# that a clean console is what a clean CSP looks like.
+#
+# This REFUSES rather than warning. Nothing has been written at this point, the
+# fix is one word in one array, and a warning is exactly what the last round
+# produced - a true statement nobody acted on for a release.
+#
+# Only package-local references are considered. `../base1/cockpit.js` is
+# Cockpit's own file, served from Cockpit's own directory, and is deliberately
+# not ours to install.
+python3 - "$SRC/index.html" "${PLUGIN[@]}" <<'PY' \
+    || die "index.html references a file this installer does not ship (above). Nothing was changed."
+import html.parser, sys
+
+path, ship = sys.argv[1], set(sys.argv[2:])
+refs = []
+
+
+class Refs(html.parser.HTMLParser):
+    """Every attribute that makes the browser fetch a second file from this
+    package directory. Parsed, not grepped: a regex over HTML is how you miss
+    the one attribute that is spelled differently."""
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        if tag in ("script", "img", "iframe", "audio", "video", "source",
+                   "embed", "track") and a.get("src"):
+            refs.append((tag, a["src"]))
+        elif tag == "link" and a.get("href"):
+            refs.append((tag, a["href"]))
+        elif tag == "object" and a.get("data"):
+            refs.append((tag, a["data"]))
+
+
+try:
+    Refs().feed(open(path, encoding="utf-8").read())
+except Exception as e:
+    sys.exit("index.html could not be parsed: %s" % type(e).__name__)
+
+local, bad = [], []
+for tag, raw in refs:
+    u = raw.split("#")[0].split("?")[0].strip()
+    if not u:
+        continue
+    # A scheme, an authority, an absolute path or a parent segment all name
+    # something outside this package directory, which this installer neither
+    # ships nor sweeps.
+    low = u.lower()
+    if "://" in low or low.startswith(("//", "/", "data:", "mailto:", "../")):
+        continue
+    if "/" in u:
+        # The payload is FLAT - PLUGIN holds bare names and section 1 copies
+        # them into one directory - so a subdirectory reference cannot be
+        # shipped by this installer at all, however the array is edited.
+        bad.append("%s (<%s>: the Cockpit payload is flat, so no PLUGIN entry "
+                   "can ever satisfy this)" % (u, tag))
+        continue
+    local.append(u)
+    if u not in ship:
+        bad.append("%s (<%s>)" % (u, tag))
+
+if bad:
+    sys.exit("index.html references %s, which install.sh's PLUGIN array does not\n"
+             "  install - so section 1's stale-file sweep DELETES it from the installed\n"
+             "  package on every run and Cockpit answers the browser's request with an\n"
+             "  HTML error page. Add it to PLUGIN in install.sh, or make the page\n"
+             "  stop asking for it."
+             % ", ".join(sorted(set(bad))))
+print("  index.html: %d package-local reference(s), every one of them installed "
+      "(%s)" % (len(local), ", ".join(local)))
+PY
 
 # --- the manifest ----------------------------------------------------------
 # An invalid manifest makes Cockpit drop the package SILENTLY: no page, no menu
@@ -457,6 +553,14 @@ done
 
 # Drop anything a previous version left behind: an old file that is no longer in
 # the source tree must not keep being served.
+#
+# This sweep is the WHOLE invariant for $PKGDIR, unlike the one in section 2.
+# Nothing in this script writes into $PKGDIR after this loop - there is no
+# import, no smoke test and no verification step that touches it - so there is
+# nothing for section 5b to re-check here, which is why 5b is scoped to the
+# library root and says so. What could put this directory out of step with the
+# header is not a late writer but an edit to PLUGIN, and the pre-flight gate
+# above is what catches that.
 shopt -s nullglob
 for existing in "$PKGDIR"/*; do
     base="$(basename -- "$existing")"

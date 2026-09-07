@@ -1055,3 +1055,765 @@ is the intended asymmetry.
 * **A 128 MiB upload through the browser.** The fixture is 4,661 bytes. The
   chunker's cap, its incremental enforcement and the memory cost of a 128 MiB
   staging are measured against the helper directly (I54), not through a page.
+
+---
+
+# 0.5.0 · Installing the restyle, and judging it in the real browser
+
+> **SUPERSEDED IN PART BY THE 0.5.1 SECTION AT THE END OF THIS FILE.** Five
+> findings in this section — R5 unreachable, `theme.js` not served, the cramped
+> entries table, the three red live specs, and the non-hermetic integration
+> suite — are closed. This section is deliberately **not edited to match**: it
+> is the record of what was true when it was written, and a walkthrough that
+> silently updates its own findings is a walkthrough nobody can check. Where a
+> number below has moved, the 0.5.1 section gives the new one and says so.
+
+The restyle described in `docs/DESIGN.md` was implemented against a stubbed
+bridge and had **never been installed**. This round installed it on this host
+and drove the installed page against the live Cockpit 360 at
+`https://localhost:9090`. `cockpit.socket` was not stopped, started or reloaded.
+
+The operator's `pwsafe3` was never listed to a verb, never selected, never
+opened and never photographed. Its registry entry is byte-identical to the
+value recorded before this work began — `mtime 1788641512`, `size 830`,
+`sha256 fa0afcea4790f65425fd23fa2d3959660f7f298d9ebf2f647bf06d28dcde9fc8` —
+and `grep -rl pwsafe3 tests/browser/artifacts/` returns nothing.
+
+## The gates, before anything was installed
+
+| gate | result |
+|---|---|
+| `./check.sh` | **exit 0** |
+| `./validate.sh` | **exit 0** — every standing ban, 38 unit tests OK |
+| `./run_tests.sh` | **exit 1**, 12 PASS / 8 FAIL as inherited … and then **exit 0, 20/20**, see below |
+
+### The 8 inherited failures were environmental, and they ARE isolable
+
+All eight failed identically:
+
+```
+hermetic registry did not load: entries=10 errors=[]
+```
+
+`tests/integration/_env.py` seeds 9 fixture safes and asserts `health` reports
+9. It reports 10. The tenth is the caller's own per-user registry row — the
+operator's `pwsafe3` — which `secrets-admin` resolves through
+`pwd.getpwuid(euid).pw_dir`, a lookup `COCKPIT_SECRETS_ETC` does not touch.
+
+The previous round concluded this **could not** be isolated. It can. The helper
+already honours a `COCKPIT_SECRETS_HOME` override (`secrets-admin:1235`), which
+`_env.py` does not set — it sets only `COCKPIT_SECRETS_ETC` and
+`COCKPIT_SECRETS_VAR` (`_env.py:93`). Because `_env.py` builds its child
+environment with `dict(os.environ)`, exporting the override is enough to prove
+it:
+
+```sh
+$ echo '{}' | python3 secrets-admin health | ...      # registry_entries = 2
+$ echo '{}' | COCKPIT_SECRETS_HOME=<empty dir> python3 secrets-admin health | ...
+                                                       # registry_entries = 1
+$ COCKPIT_SECRETS_HOME=<empty dir> ./run_tests.sh
+  … 20 PASS, 0 FAIL, exit 0
+```
+
+**The whole suite is green with one line added to a file this task did not
+own.** The fix belongs to `tests/integration/_env.py`:
+
+```python
+self.env["COCKPIT_SECRETS_HOME"] = self.root      # beside the ETC/VAR lines
+```
+
+No Python was changed to obtain this; `git diff --name-only HEAD` over `*.py`,
+`secrets-admin`, `backends/` and `agent/` is empty. Nothing about the operator's
+safe was used except a **count** returned by `health`.
+
+## Installing
+
+Through `/srv/jobs`, as root, with `install.sh` unmodified. Exit 0, 3 changes,
+0 warnings, and `cockpit.socket` untouched. **Served bytes == source bytes** for
+every payload file:
+
+| file | sha256 (source == served) |
+|---|---|
+| `manifest.json` | `bb51d6b9956403a4cc03fb567a651a540e821d4be6acf74b2ceafb8a71561cd9` |
+| `index.html` | `01899df1bdce6594978357f0335a945c0faa70c2fe05b669d86164e68b9d036c` |
+| `secrets.js` | `1b7b6e4d7476c6ec8244c27230b4aa3b4ccbf34d8b53f1e0ad83564d5ee51ab0` |
+| `secrets.css` | `733040173311740224bfaa563cb95ddcab5e8f6a7ba8d968498bee3fdbc280a7` |
+
+### `theme.js` is NOT served, and the cost is not what the code comments claim
+
+`install.sh:108` is `PLUGIN=(manifest.json index.html secrets.js secrets.css)`
+and `:454-470` sweeps `$PKGDIR` down to exactly that list, so the installed
+`theme.js` is deleted on every run. Measured after a real install:
+
+```
+$ ls /usr/share/cockpit/secrets/theme.js
+ls: cannot access ...: No such file or directory
+```
+
+`install.sh` half-knows about the file: its pre-flight delegates to `check.sh`
+(`install.sh:301`), which globs the JS and prints `theme.js  syntax OK` — so the
+installer **gates** a file it then refuses to **ship**.
+
+`index.html:17-20` says the missing request "404s silently". **It does not.**
+Cockpit answers with an HTML error page, and Chromium refuses to execute it:
+
+```
+$ curl -sk -o /dev/null -w '%{http_code} %{content_type}\n' \
+    https://localhost:9090/cockpit/@localhost/secrets/theme.js
+401 text/html; charset=utf8              # 404 text/html inside a live session
+
+Refused to execute script from '…/secrets/theme.js' because its MIME type
+('text/html') is not executable, and strict MIME type checking is enabled.
+```
+
+That is **one console error on every single page load**, and it is what makes
+`live-ui.spec.js` item 1 fail. The theme itself is fine — the guarded second
+resolver in `secrets.js:151-181` runs and the page resolves correctly in both
+directions (below) — so the defect is noise and a wasted request, not a broken
+theme. One line in `install.sh` removes it, and the comment in `index.html`
+should be corrected to say "answers with an HTML error page and logs a console
+refusal" rather than "404s silently".
+
+## R1–R5, driven against the real page
+
+Every one of these was driven through the real shell. Nothing was stubbed.
+
+### R1 · visibility follows elevation — **holds**, by a mechanism that is not the one claimed
+
+* As **`cptest`** (uid 1005, not in `sudo`): the helper offers exactly one safe,
+  `dummy-fake-safe`, access `admin`. The page draws **zero** rows and says
+  *"Nothing is visible while access is limited · 1 administrator safe is
+  hidden."* No admin-class row is drawn at all.
+* As **`cptestadm`** unelevated: `dummy-fake-safe` is **absent** from the table
+  while the helper still lists it — hiding is cosmetic, exactly as designed —
+  and the count-only line reads *"1 administrator safe is hidden. Turn on
+  Administrative access in the Cockpit header to see them."* It is **not**
+  styled as an alert.
+* Turning **Administrative access ON** in the real header makes the row appear.
+* Turning it **OFF** again removes the row, clears the selection, and empties
+  the pane back to *"No safe selected"* — verified with the admin safe selected
+  first.
+
+**But it is not the `changed` listener doing it.** The task asked for "without a
+reload", so this was measured rather than assumed. Counting navigations of the
+plugin document only (`cockpit/@localhost/secrets/index.html`) across an
+escalation:
+
+```
+pluginDocNavsDuringEscalation: 1
+stampSurvived: false          # window.__stamp set before, gone after
+timeOriginChanged: true       # performance.timeOrigin moved
+```
+
+**Cockpit's shell reloads the plugin frame when superuser status changes.** The
+operator-visible outcome R1 asks for is delivered — the safe appears with no
+manual refresh — but `elevationChanged()` is not what delivers it in the
+escalation direction, and it remains **unexercised**. This does not weaken the
+security story: a frame reload destroys the page's session outright, which is a
+stronger guarantee than the listener's lock-and-wipe, not a weaker one.
+
+### R2 · the safes table — **holds**
+
+`TABLE`; every header cell is a `TH` with `scope="col"`; body cells are `TD`;
+the table carries a caption. Sorting moves `aria-sort` between columns
+(`ascending` → `descending`) and the row order really reverses. A row is
+activated by **Enter** and by **Space**, the selected row's door carries
+`aria-current="true"` (meaning without colour), and — the defect the
+implementer fixed — **focus is still on the same row button after the
+re-render**, not dropped to `<body>`.
+
+### R3 · the docked pane — **holds**, asserted as geometry
+
+At the ordinary 1400px window the frame is 1160px and the workspace grid is
+`728px 384px`. `pane.x = 760` is right of main's right edge (744), and the two
+share a row (`y = 199.19` for both) — docked, not stacked. It is an `<aside>`
+with `role="complementary"` and it **follows** `#sec-main` in the DOM, so
+reading order and tab order are the same thing.
+
+### R4 · the toggle — **holds**
+
+A real `<button type="button">` with `aria-controls="sec-pane"` and the
+accessible name *"Details pane"*. `aria-expanded` flips `true → false → true`.
+Collapsed means **gone**: width and height both 0, the grid falls to one column,
+and the table reclaims the space (728px → 1128px). Restoring returns the pane to
+the same width.
+
+### R5 · the Path column — **DOES NOT HOLD. It is unreachable.**
+
+This is the one requirement the implementation does not deliver, and the
+previous round reported it as landed.
+
+The negative half is true: **`path` is not a column on first load**, no header
+carries it, and no cell in the default table carries a filesystem path or a safe
+filename. But the positive half cannot happen:
+
+```
+$ echo '{}' | python3 secrets-admin schema | …    # the `list` verb's response
+"safes": "[{id,label,format,access,mode,locked,reason,usable,
+            password_required,needs_keyfile,agent_enabled,
+            export_allowed,registry,origin,manageable}]"
+```
+
+**`path` is not in it.** Live, every safe comes back with `path` absent, at both
+access levels:
+
+```
+[{"id":"dummy-fake-safe","path":"(absent)"},
+ {"id":"dummy-fake-user-kdbx","path":"(absent)"},
+ {"id":"dummy-fake-user-psafe3","path":"(absent)"}]
+```
+
+Both halves of R5 are guarded on that field:
+
+* `secrets.js:3660` — `optColAvailable()` offers the Path column only when
+  `rows.some(s => !!s.path)`. It never can, so the checkbox is **never offered**.
+  Measured, elevated and unelevated, the chooser offers only
+  `["col-registry","col-kdf","col-id"]`.
+* `secrets.js:4150` — the pane's Path section is behind `if (safe.path)`. It
+  never renders. Selecting each safe in turn, the pane's only section heading is
+  *"File header"*; there is no `Path` heading and no `code.sec-path` node.
+
+Grepping the schema, the only verbs that publish a path are `safe-forget`,
+`save-as` and `export` — a destructive verb and two that write files. **No
+read-only verb tells the page where a safe lives**, so R5 cannot be satisfied by
+the page alone. The column and the pane section are correctly written and are
+dead code against this helper.
+
+**The fix is in the helper, not the page**: add `path` to the `list` verb's
+declared response and populate it (gated on access class, since a path names a
+home directory and therefore an account — which is reason 1 of the three
+`secrets.js:3906` gives for the column being off by default). The page then
+works unchanged.
+
+### The narrow viewport, and I11
+
+Below the 60rem breakpoint the pane un-docks to a full-width panel below the
+table, `aria-expanded` is `false`, and there is no horizontal page scroll at
+480px or 360px. At 360px the table scrolls inside its own box
+(`overflow-x: auto`, scroller 480px wide in a 326px box), which is the
+`min-inline-size: 30rem` refinement doing its job.
+
+After exercising the column chooser and the pane, **both storage areas are
+byte-for-byte what they were before**: `localStorage` still
+`{superuser:cptestadm, superuser-key, standard-login}` (all Cockpit's own),
+`sessionStorage` still `{cockpit:page_status, cockpit:v2-machines.json}`, no
+cookie set from the frame, and `indexedDB.databases()` empty. The session-only
+trade holds.
+
+## Judged, not just captured
+
+### The theme follows the shell, live — with `theme.js` absent
+
+Driven through the shell's own Session → Style control:
+
+| shell setting | shell `<html>` | frame `<html>` |
+|---|---|---|
+| Light | `index-page` | `sec-light sec-theme-managed` |
+| Dark | `index-page pf-v6-theme-dark` | `sec-theme-managed sec-dark` |
+
+Both correct, with no reload, and with `theme.js` 404ing — so this is the
+guarded fallback in `secrets.js` carrying the whole feature on an installed
+host. The mitigation is real and it works.
+
+### Contrast, computed from the rendered page in both themes
+
+Every element with its own text was read out of the live DOM, its colour taken
+against its first opaque ancestor background, and the WCAG ratio computed —
+nothing was trusted from the plan.
+
+| theme | pairs | below threshold |
+|---|---|---|
+| light | 21 | **0** |
+| dark | 23 | **0** |
+
+Lowest actual ratios: **4.97** (light, a `<summary>` at 14px) and **6.66**
+(dark, the session chip at 12px). Both clear 4.5.
+
+A first pass reported 2 failures per theme — `Save` at 2.25/3.33 and `Previous`
+at 2.52/2.94. Both were measured again with the element's state read: they are
+`disabled: true`, colour `rgb(112,112,112)`. **WCAG 1.4.3 exempts inactive user
+interface components**, so they are not violations; the corrected measurement
+excludes `disabled`, `[disabled]` ancestors and `aria-disabled="true"`. Recorded
+because the first number was wrong and the reason it was wrong is the useful
+part.
+
+### Keyboard, zoom, motion
+
+* **18 tab stops** inside the frame, in DOM order, ending at the footer
+  disclosure. **Every one** is `:focus-visible` with a `2px solid` outline —
+  one distinct outline width across all 18.
+* **200% zoom** at the WCAG 1.4.10 viewport (700 × 480 CSS px):
+  `scrollWidth === clientWidth === 700`, **zero** elements overflowing the frame
+  outside their own scroller, and the pane un-docked to one column.
+* **`prefers-reduced-motion: reduce`**, emulated for real: zero animating
+  elements and zero transitioning elements on the whole page.
+* **Target size**: one stop is under 24 CSS px in one dimension — the footer's
+  `<summary>` at 960 × 21. Everything else clears 24 × 24.
+
+### CSP
+
+`securitypolicyviolation` events: **0**. The real policy on the package page is
+
+```
+default-src 'self'; connect-src wss://localhost:9090 'self'; form-action 'self';
+base-uri 'self'; object-src 'none'; font-src 'self' data:; img-src 'self' data:;
+block-all-mixed-content
+```
+
+The **one** console script refusal is the `theme.js` MIME refusal above, which
+is the missing installer line and not a policy relaxation anywhere.
+
+## The live suite, re-run: `exit 1`
+
+`./tests/browser/run-live.sh`, against the installed page:
+
+| spec | score | state |
+|---|---|---|
+| `live-registry.spec.js` | **13/15 checks** | R1 INCOMPLETE, R0 FAIL |
+| `live-ui.spec.js` | **4/8 checks** | items 1, 2 FAIL; 3 aborted; 4, 5, 6, 7, 10 NOT-ATTEMPTED |
+| `live-access.spec.js` | **9/10 checks** | item 8 PASS, item 9 FAIL |
+
+**All three live specs are broken by the restyle, not just `live-ui.spec.js`.**
+The previous round reported only `live-ui.spec.js` as needing migration; that is
+incomplete. The single dominant cause is one selector:
+
+```
+locator('.sec-safe').filter({has: locator('.sec-safe-id:text-is("…")')})
+       .locator('button:text-is("Unlock…")')
+```
+
+**Nothing in a row is an action any more** — `secrets.js:3969` says so
+deliberately, and every action moved into the pane. So `Unlock…` is no longer
+inside `.sec-safe`, and the click times out at 30s. That one timeout aborts
+`live-ui.spec.js` after item 3, which is what turns five further items into
+NOT-ATTEMPTED, and it aborts `live-access.spec.js` item 9.
+
+The other three failures:
+
+* `live-ui` item 1 — the `theme.js` MIME refusal (installer, above).
+* `live-ui` item 2 — *"class blocks in document order: []"*. The card grid that
+  grouped safes under class headings became one sortable table; there are no
+  class blocks to be in document order.
+* `live-access` item 9 — *"the admin-class card offers a 'Check this safe'
+  control while access is off"*. This is R1's **disclosed** cost: the control
+  exists only for an admin safe while access is off, and R1 hides the row that
+  carries it in exactly that state. It is genuinely unreachable there.
+
+None of these is a regression in what the page *does*; all are the suites
+describing the old markup. They are real failures all the same, and the suite is
+red until somebody who owns those files migrates them.
+
+## What was NOT verified
+
+* **`elevationChanged()`** — still unexercised, and in the escalation direction
+  it appears unreachable in this shell, because Cockpit reloads the frame first.
+  The de-escalation direction was observed to produce the right end state, but
+  by the same reload.
+* **Firefox and WebKit.** Chromium only.
+* **`live-ui.spec.js` items 3–7 and 10** — aborted, not run. Item 3's unlock
+  flow was driven by hand instead (below), but items 6 and 7 — full management
+  in both formats, and the conflict path — were not exercised at all this round.
+* **A real YubiKey, a real agent, a root-owned registry** — unchanged from 0.4.0.
+
+## Screenshots
+
+24 surfaces, light and dark, all `0600`, all in `tests/browser/artifacts/`, all
+of the three throw-away `dummy-fake-*` safes. Every capture asserts `pwsafe3` is
+absent from both the frame and the shell before the shutter opens.
+
+| surface | light | dark |
+|---|---|---|
+| safe list | `restyle-light-01-safelist.png` | `restyle-dark-01-safelist.png` |
+| pane, safe selected | `restyle-light-02-pane-safe-detail.png` | `restyle-dark-02-pane-safe-detail.png` |
+| unlock modal | `restyle-light-03-unlock-modal.png` | `restyle-dark-03-unlock-modal.png` |
+| unlock error | `restyle-light-04-unlock-error.png` | `restyle-dark-04-unlock-error.png` |
+| entry list | `restyle-light-05-entry-list.png` | `restyle-dark-05-entry-list.png` |
+| entry detail | `restyle-light-06-entry-detail.png` | `restyle-dark-06-entry-detail.png` |
+| revealed, mid-countdown | `restyle-light-07-revealed-midcountdown.png` | `restyle-dark-07-revealed-midcountdown.png` |
+| narrow, 480px | `restyle-light-08-narrow-480.png` | `restyle-dark-08-narrow-480.png` |
+| strength meter, weak | `restyle-light-09-strength-weak.png` | `restyle-dark-09-strength-weak.png` |
+| strength meter, strong | `restyle-light-10-strength-strong.png` | `restyle-dark-10-strength-strong.png` |
+| delete confirm | `restyle-light-11-delete-confirm.png` | `restyle-dark-11-delete-confirm.png` |
+| empty group | `restyle-light-12-empty-group.png` | `restyle-dark-12-empty-group.png` |
+| locked out | `restyle-light-13-locked-out.png` | `restyle-dark-13-locked-out.png` |
+
+Four more, light only, because they are not theme-dependent claims:
+`restyle-light-14-cptest-nonadmin.png`,
+`restyle-light-15-zoom200-700x480.png`,
+`restyle-light-16-reduced-motion.png`,
+`restyle-light-17-narrow-iframe-360.png`.
+
+### One trap this round fell into, recorded because the README already warned about it
+
+The first `04-unlock-error` pair was **byte-identical** to the `03-unlock-modal`
+pair. The predicate waited for `/did not|wrong|failed/` in the modal's text —
+and the modal's own explanatory copy contains those words, so it was true before
+the button was ever pressed. That is trap #2 in `tests/browser/README.md`,
+written down after the same mistake in `live-registry.spec.js`. The fix is to
+count the **alert nodes** before submitting and wait for that count to go up.
+The re-captured pair is distinct, and the alert reads *"the passphrase, key file
+or file integrity check did not match this safe · bad-credential"*.
+
+## Surfaces judged against what `docs/DESIGN.md` specified
+
+* **The strength meter (§13)** — the segments are **single-hue**: at
+  `password1`, one segment is lit in the same blue as all five at 289 bits.
+  Meaning is carried by the count and by the sentence
+  (*"15 bits of effective entropy (47 before its weaknesses) — Very weak: under
+  28 effective bits…"*), never by red/amber/green. §13's hero-number DOM
+  restructure was **not** done, as the implementer disclosed; the CSS half is
+  there.
+* **The empty state** — *"0 entries … No entries here."* with the header row and
+  the pager still drawn. That is why `Previous`/`Next` are the page's only
+  disabled controls, and why they were the two the first contrast pass tripped
+  over.
+* **The delete confirm** — two `id^="sec-confirm"` gates plus the safe's id
+  typed, matching §7's ladder. Opened and **cancelled**; nothing was deleted.
+* **Locked out** — reached deliberately on `dummy-fake-user-psafe3`:
+  *"too many failed unlock attempts for this safe; try again in 1 seconds ·
+  locked-out"*. Self-clearing, cap 900s.
+* **The entries table is cramped**, and this is the one defect that only
+  looking at a picture found. §5.5's scroll-in-its-own-box mechanism works
+  (`min-inline-size: 42rem` = 672px inside a 504px host, `overflow-x: auto`, no
+  page scroll) but 42rem is too small a floor for seven columns: every cell in
+  the first row wraps to **five lines**, and `ada.lovelace` is broken mid-word
+  in a 103px column. `docs/DESIGN.md` §18.9 has the measurements.
+* **`.sec-safe.unreachable` no longer dims** — confirmed, and it is why
+  `live-ui` item 2's "0 safes rendered unreachable" check fails. The chip and
+  the helper's sentence carry the state instead, which is the better design and
+  a real suite migration.
+
+## What remains on the host
+
+* The installed package at `/usr/share/cockpit/secrets/` — 4 files, **no
+  `theme.js`** (swept by `install.sh`), version 0.5.0.
+* The three `dummy-fake-*` testbed safes, **left in place as the operator asked**,
+  unchanged in content.
+* `/var/lib/cockpit-secrets/state/safe.dummy-fake-safe.json` and
+  `fail.1007.dummy-fake-safe.json` (34–38 bytes each), plus the equivalent
+  per-user counters in `~cptestadm`. These are ordinary self-expiring lockout and
+  rate-cap bookkeeping written by the helper whenever anybody unlocks anything.
+  **They were deliberately not deleted**: removing lockout state is tampering
+  with a security control, and they expire on their own.
+* 45 files in `tests/browser/artifacts/` (31 written this round), all `0600`, in
+  a git-ignored directory. `grep -rl pwsafe3` over them returns nothing.
+* Nothing else. No service was started, stopped or reloaded; no registry entry
+  was created, edited or removed; no safe was created or deleted.
+
+---
+
+# 0.5.1 · Closing the five, and proving R5 on the live page
+
+0.5.0 shipped the restyle and then said, in its own verification, exactly what it
+had not delivered. This round closed that list — and nothing else — then
+installed the result and drove it. `cockpit.socket` was **never** stopped,
+started or reloaded; its `ActiveEnterTimestamp` reads
+`Tue 2026-09-01 01:59:08 CDT` before and after every job.
+
+The operator's `pwsafe3` was never listed to a verb, never selected, never
+opened and never photographed. Its registry entry is byte-identical to the value
+recorded before this work began — `mtime 1788641512`, `size 830`,
+`sha256 fa0afcea4790f65425fd23fa2d3959660f7f298d9ebf2f647bf06d28dcde9fc8` —
+re-checked after every root job, and `grep -rl pwsafe3 tests/browser/artifacts/`
+returns nothing.
+
+## The gates
+
+`./check.sh` — exit 0 (`secrets.js`, `theme.js` syntax OK).
+`./validate.sh` — `validate.sh: OK`, every standing ban PASS, 38 unit tests OK.
+`python3 tests/corpus/gen_corpus.py --check` — `67 cases checked, 0 disagreed
+with their sidecar`, exit 0.
+
+`./run_tests.sh`, **with no environment override**, which is the point of I60:
+
+```
+  PASS  syntax and standing bans (validate.sh)             7s
+  PASS  javascript syntax (check.sh)                       0s
+  PASS  backends/base.py self-check                        1s
+  PASS  backends/psafe3 self-check                         3s
+  PASS  backends/kdbx self-check                           6s
+  PASS  agent self-check                                   0s
+  PASS  twofish ECB vectors, both providers                1s
+  PASS  integration: contract flow, both formats          11s
+  PASS  integration: cross-backend conformance             3s
+  PASS  integration: load-bearing properties              18s
+  PASS  integration: the second-wave verbs                14s
+  PASS  integration: the unlock agent, end to end          7s
+  PASS  integration: the lockout — concurrency, identity, reach    63s
+  PASS  integration: the adversarial findings             15s
+  PASS  integration: the registry write path              68s
+  PASS  integration: corpus vs the helper                101s
+  PASS  oracles: build and known-answer vectors            0s
+  PASS  fixtures: verify against keepassxc-cli             3s
+  PASS  ui: headless browser driver                       37s
+  PASS  ui: item 4's storage oracle (I11, I42)             0s
+
+run_tests.sh: OK
+```
+
+**20/20.** It was 12/20 before `_env.py` set `COCKPIT_SECRETS_HOME`, and the
+eight that failed aborted at build time with `hermetic registry did not load:
+entries=10 errors=[]` — the tenth entry being the operator's own safe, read
+straight out of the caller's real home into what the suite called hermetic.
+
+## Installing
+
+Three root jobs through `/srv/jobs`, never `sudo`. A staged `DESTDIR` dry run
+first (32 changes, 0 warnings, `theme.js` in the staged package), then the real
+install, then a second run to prove the copy list and the sweep now agree:
+
+```
+=== 2. real install ===
+  Summary
+    1 change(s), 31 unchanged, 0 warning(s)
+
+=== 3. idempotence ===
+  index.html: 3 package-local reference(s), every one of them installed (theme.js, secrets.css, secrets.js)
+  = unchanged /usr/share/cockpit/secrets/theme.js
+  library root holds exactly the installed payload (no bytecode, no strays)
+  0 change(s), 32 unchanged, 0 warning(s)
+```
+
+The first line of the idempotence run is the **new pre-flight gate** (I57): it
+parses `index.html` and refuses an install where the page asks for a
+package-local file `PLUGIN` does not ship.
+
+**Served == source, by SHA-256, for every artefact the installer claims to
+ship** — 5 package files, the helper, all 5 backends, the schema:
+
+```
+  OK    manifest.json              bb51d6b9956403a4
+  OK    index.html                 2f11e92428ca7e14
+  OK    secrets.js                 395a25ba4d6fbefe
+  OK    secrets.css                1885f5ff6b63460f
+  OK    theme.js                   e56b82e6f780dcec
+  OK    secrets-admin              f5bb562beaf8f65d
+  OK    base.py                    12ab9b664c9adf15
+  OK    __init__.py                8eea9b00b4d3c0fb
+  OK    kdbx.py                    b0bf7efbd49c0c82
+  OK    psafe3.py                  0d5693e5e3026f5f
+  OK    twofish_pure.py            f17e2cdb146bc7fc
+  OK    safe-registry.schema.json  f7488cb582ba9f81
+  mismatches: 0
+```
+
+All five package files `0644 root:root` in a `0755 root:root` directory. The
+package directory now lists **five** files, and the second install run reports
+`= unchanged` for `theme.js` rather than sweeping it — which is the actual proof
+that I57 is closed, because the previous behaviour was a delete on every run.
+
+## The browser console, on load
+
+Item 1, on the installed page, through the real shell as `cptestadm`:
+
+```
+  PASS  securitypolicyviolation events: 0
+  PASS  console CSP refusals: 0
+  PASS  page and console errors from the secrets package: 0
+  ....  Cockpit's own shell logged 1 error(s) in the same page:
+        ["Failed to load resource: … 401 (Authentication failed) <…/cockpit/login>"]
+```
+
+Zero errors, zero CSP violations. The one error in the page is Cockpit's own
+login probe, attributed by URL and not by assumption. The CSP the bridge really
+sends is recorded in the item's own note and nothing about it was relaxed.
+
+## R5, end to end — `live-ui.spec.js` item 11
+
+This is the requirement 0.5.0 did not deliver, and the reason this round exists.
+It runs **last and in a session of its own**, and escalates there through
+Cockpit's own header control, because R5 must be shown for a system-registry
+safe as well as a per-user one while items 1–10 are written against a
+limited-access session.
+
+Every line below is from the run, as `cptestadm`, against the installed helper:
+
+```
+R1 (access off): the helper lists 1 administrator safe(s) and the table draws
+                 none of them — rows: ["dummy-fake-user-kdbx","dummy-fake-user-psafe3"]
+administrative access is ON (cockpit.permission({admin:true}).allowed === true)
+R1 (access on):  the same 1 administrator safe(s) are now drawn —
+                 ["dummy-fake-safe","dummy-fake-user-kdbx","dummy-fake-user-psafe3"]
+safes with a path: ["dummy-fake-safe/system","dummy-fake-user-kdbx/user",
+                    "dummy-fake-user-psafe3/user"]
+
+R2 still holds: a real <table>, every <th> scope=col — ["Safe","Class","Format","State"]
+R2: 4 columns sort from a real <button> in the <th>
+
+R5: Path is NOT a column on first load — headers ["Safe","Class","Format","State"]
+R5: neither published path appears ANYWHERE in the default table ([])
+    …and no home-directory path of any kind is on screen by default
+the column chooser is a native <details>: ["col-path","col-registry","col-kdf","col-id"]
+R5: the chooser OFFERS a Path checkbox
+R5: every optional column is OFF by default, Path included
+ticking the box adds a real <th>Path</th> immediately, with no Apply step
+R5: the SYSTEM safe's cell holds the helper's own value in full:
+    "/etc/cockpit-secrets/safes/dummy-fake-safe.kdbx"
+R5: the PER-USER safe's cell holds the helper's own value in full:
+    "/home/cptestadm/.local/share/cockpit-secrets/safes/dummy-fake-user-kdbx.kdbx"
+R5: sorting by "Safe" keeps the Path column, in the same position (4)
+    …and both cells still hold the full path after the re-render
+    …and again with the sort reversed (aria-sort now "descending")
+
+R3: choosing the system-registry row opens the pane on "dummy-fake-safe"
+R5: the pane's FIRST section is Path (["Path","File header"])
+R5: it is the whole path, character for character, not ~-abbreviated and not elided
+R5: it is SELECTABLE — computed user-select is "auto"
+R5: it WRAPS rather than truncating (overflow-wrap "anywhere",
+    white-space "pre-wrap", scrollWidth 348 <= clientWidth 348)
+    …and text-overflow is not an ellipsis, which is the other way a path lies
+    …and the pane says what the LOCATION means for this class of safe ("admin")
+(the same seven lines again for the PER-USER safe, ("user"))
+
+R4: the pane toggle is a real <button> with aria-controls=sec-pane
+R4: collapsing hides the pane and flips aria-expanded to false
+R4: expanding brings it back
+
+R5: unticking removes the column and the path string leaves the table with it
+    …while the pane still shows it — that is what ALWAYS means (R5)
+```
+
+**I11 across all of it**, against a baseline taken immediately after escalation
+and before the chooser was ever opened:
+
+```
+storage baseline: local ["superuser:cptestadm","superuser-key","standard-login"],
+                  session ["cockpit:page_status","cockpit:v2-machines.json"]
+a full unlock of "dummy-fake-user-kdbx" succeeds in this escalated session
+host-shell keys that changed and were tolerated by name: none
+I11: the column chooser, the details pane, the sort, the pane toggle and a full
+     unlock added NOTHING to either storage area and overwrote nothing
+     ([] local, [] session)
+I11: no storage value anywhere holds the passphrase, a safe id, a safe PATH or
+     this package's name — the tolerated keys included ([])
+I11: no storage key belongs to this package ([])
+the operator's own safe was never named in this frame, at either access level,
+with the Path column on — which is the state that would have shown its file
+```
+
+The last line is the one worth reading twice: the Path column ON, in an
+escalated session, is precisely the state in which the operator's own safe would
+have disclosed its file, and it did not appear.
+
+## The live suite, re-run: `exit 0`
+
+`./tests/browser/run-live.sh`, against the installed page:
+
+| spec | result | was, in 0.5.0 |
+|---|---|---|
+| `live-registry.spec.js` | **57 checks, 0 failures** — R1 R2 R3 R4 R5 all PASS | 13/15, R0 and R1 red |
+| `live-ui.spec.js` | **185/185 checks held** — items 1, 2, 3, 4, 5, 6, 7, 10 **and the new 11** all PASS | 4/8 |
+| `live-access.spec.js` | **22/22 checks held** — items 8 and 9 PASS | 9/10 |
+
+**Item 6 drove BOTH formats this round**, which it had never done against this
+testbed:
+
+```
+driving 2 safe(s), one per format: ["dummy-fake-user-kdbx (kdbx)",
+                                    "dummy-fake-user-psafe3 (psafe3)"]
+formats driven: ["kdbx","psafe3"]; formats present but not driven: []
+```
+
+`dummy-fake-user-psafe3` is registered `mode: "ro"` on purpose — it is the
+fixture for the read-only and format-warning states — so it was flipped to `rw`
+for the run using the one command `tests/browser/TESTBED.md` documents, and
+**flipped back afterwards**; the helper's own `list` confirms `ro` again, with
+`registry_errors: 0`.
+
+Driving it found a real test defect, now fixed: item 6 asserted "the upload was
+accepted" unconditionally and then threw, aborting the whole psafe3 half at the
+attachment step. A Password Safe v3 database **this program creates** declares
+0x030D and attachments need 0x030F, so the only PWS3 in the testbed cannot take
+one, by construction (`docs/RESIDUAL-RISK.md` §4.11). The item now reads the
+helper's answer instead of assuming it:
+
+```
+the upload was refused, and refused as a FORMAT LIMIT rather than as an error:
+  code "unsupported"
+…and the sentence names the version this file declares and the version
+  attachments need: "this database declares format 0x030d; attachments need
+  0x030f (PasswordSafe V3.68) or later"
+the entry lists NO attachment, which is the correct reading of a file whose
+  format cannot hold one
+ATTACHMENT CHAIN NOT ATTEMPTED for psafe3 …
+```
+
+So **item 6 is a full pass for KDBX and a stated partial for PWS3** — add, edit,
+custom field (refused as `unsupported` with the format's own reason), history,
+save with the named backup, lock and reopen all held for both; attach-list,
+attach-get and the byte-for-byte download are not claimed for a 0x030D file, and
+the report says so rather than being silent.
+
+## Screenshots for the operator
+
+All `0600`, in `tests/browser/artifacts/`, all of the sanctioned `dummy-fake-*`
+safes. `grep -rl pwsafe3` over the whole directory returns nothing.
+
+| file | what it shows |
+|---|---|
+| `11-safes-path-on-light.png` | the safe list, **light**, Path column ON — three safes, full paths, and the pane showing the per-user safe's path with "Copy path" and the location sentence |
+| `11-safes-path-off-light.png` | the same list, **light**, Path column OFF — the default, with no path anywhere in the table |
+| `11-safes-path-on-dark.png` | the same, **dark** |
+| `11-safes-path-off-dark.png` | the same, **dark**, default columns |
+| `11-pane-path-light.png` / `11-pane-path-dark.png` | the details pane showing a path in full with the column OFF — R5's "always" |
+| `11-pane-path-system.png` | the pane for the **system** safe: `/etc/cockpit-secrets/safes/dummy-fake-safe.kdbx` with the "owned by root" sentence |
+| `11-pane-path-user.png` | the pane for the **per-user** safe, with the "a safe of your own" sentence |
+| `11-path-column-on.png` | the moment after ticking the box, before any sort |
+| `11-pane-collapsed.png` | R4 — the pane collapsed, `aria-expanded="false"`, the table reclaiming the width |
+| `11-safes-360-path-on.png` | a **360px** frame with the Path column ON: the table scrolls in its own box and the page does not (asked it to scroll 4000px, it moved 0) |
+| `10-entries-pane-open.png` | the entries table at its new 60rem floor in a 504px box — `ada.lovelace` on ONE line |
+| `10-entries-pane-collapsed.png`, `10-entries-zoom-200.png`, `10-entries-360.png` | the same table at the other three widths |
+| `02-pane-collapsed.png` | R4 from item 2's session |
+| `06-psafe3-attach-refused.png` | the PWS3 format limit, refused with its own sentence |
+
+## What is still not verified
+
+* **Chromium only.** No Firefox, no WebKit, in this round or any previous one.
+* **The attachment chain for PWS3.** It needs a 0x030F file, and this program
+  does not create one; adopting a foreign Password Safe database is the route to
+  that coverage, and there is no Password Safe CLI on this host to make one.
+* **The `path`-less case** — a `%u` registry entry that cannot be resolved for
+  the caller — is exercised only in a scratch registry under
+  `unshare --map-root-user`, not by anything committed.
+* **I61, new and open.** In a session that has *already* turned administrative
+  access on, the pane for an admin-class safe still reads "turn on Cockpit's
+  Administrative access and try again" — the helper's own sentence, correct for
+  the unescalated `list` that produced it, re-shown after the operator has done
+  the thing it asks. The control works: item 9 opens that safe in that state.
+  `11-safes-path-off-dark.png` is the evidence.
+* **`ui.spec.js` grew no source-level assertion on the CSS** — the natural one
+  is that `table.sec td` must resolve `break-word` and the only `anywhere`
+  inside a table must be the URL column and `#sec-safes .mono`.
+* **Two files that SHIP are not in the repository.** `git status` reports
+  `docs/DESIGN.md` and `theme.js` as untracked, and `git check-ignore` says
+  nothing ignores them — they were written and never added. `theme.js` is a
+  member of `install.sh`'s `PLUGIN` array and is served to every session, and
+  `docs/DESIGN.md` is the specification §18 of this file keeps citing. A clone
+  of this repository today gets neither: the installer's own pre-flight would
+  refuse the install, which is the gate working, and §18 would be a dangling
+  reference. This round did not run any `git` write command, so it is left for
+  whoever commits — but it should be the first thing they do, not the last.
+
+## What remains on the host
+
+* The installed package at `/usr/share/cockpit/secrets/` — **five** files now,
+  `theme.js` included, all `0644 root:root`, served == source by SHA-256,
+  version 0.5.1.
+* The three `dummy-fake-*` testbed safes, **left in place as the operator asked**.
+  `dummy-fake-user-psafe3` is back to `mode: "ro"`, confirmed from the helper's
+  own `list`. `dummy-fake-user-kdbx` and `dummy-fake-user-psafe3` carry the
+  entries item 6 wrote into them, which is what a management test does; the
+  testbed is rebuildable with the one command in `tests/browser/TESTBED.md`.
+* `.bak.d` backup rings beside the two user-class safes, written by the saves
+  item 6 made. They are the backup ring working (I12) and were not deleted.
+* Lockout and rate-cap bookkeeping under `/var/lib/cockpit-secrets/state/` and
+  the equivalent per-user counters in `~cptestadm`. **Deliberately not deleted**:
+  removing lockout state is tampering with a security control, and it expires on
+  its own.
+* 192 files in `tests/browser/artifacts/`, all `0600` (the directory's
+  `.gitignore` is the one exception, and holds nothing), in a git-ignored
+  directory.
+* Nothing else. No service was started, stopped or reloaded. `cockpit.socket`'s
+  `ActiveEnterTimestamp` is unchanged. No registry entry was created or removed;
+  one was edited twice — `dummy-fake-user-psafe3`'s `mode`, `ro` → `rw` → `ro` —
+  and it is back where it started.

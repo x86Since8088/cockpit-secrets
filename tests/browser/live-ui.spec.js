@@ -52,11 +52,46 @@ const ITEMS = {
     5: "The passphrase is demanded EVERY time: after a lock, after a page reload, and in a fresh tab",
     6: "Full management in BOTH formats: add, edit, custom field, attach, list, download, history, save, reopen",
     7: "The conflict path surfaces a decision, not an alert",
-    10: "Accessibility: keyboard-only unlock with a focus trap, and usable at 200%"
+    10: "Accessibility: keyboard-only unlock with a focus trap, and usable at 200%",
+    11: "R5 end to end: the Path column is off by default, selectable, survives a sort, and is always in the pane"
 };
-const ORDER = [1, 2, 3, 4, 5, 6, 7, 10];
+const ORDER = [1, 2, 3, 4, 5, 6, 7, 10, 11];
 
 /* --------------------------------------------------------------- helpers -- */
+
+/* THE OPERATOR'S OWN SAFES ARE NOT THIS SUITE'S TO TOUCH.
+ *
+ * `pwsafe3` is real data — a user-class safe in eddie's per-user registry,
+ * holding this host's actual credentials (tests/browser/TESTBED.md). Nothing
+ * here may unlock it, open it, read it, forget it, delete it, or put it in a
+ * screenshot. Three things kept that true before this file had a guard, and
+ * all three were arguments rather than code: the suite signs in as cptestadm,
+ * whose bridge cannot read eddie's per-user registry; every safe it drives
+ * needs a `safe-<id>.pass` file this suite did not create; and no assertion
+ * iterated the whole registry.
+ *
+ * Arguments stop being true quietly. `SECRETS_LIVE_ADMIN=eddie` is one
+ * environment variable away and would put the operator's own safe in front of
+ * pickSafe() with a passphrase file beside it. So the rule is code now:
+ * anything that CHOOSES a safe from the live registry filters this list first,
+ * and anything handed an id checks it and throws. A test that would have to be
+ * skipped is the right outcome; opening the operator's safe is not.
+ *
+ * SECRETS_LIVE_EXCLUDE adds ids, comma-separated. It cannot REMOVE one. */
+const EXCLUDED_SAFES = ["pwsafe3"].concat(
+    String(process.env.SECRETS_LIVE_EXCLUDE || "").split(",").map((s) => s.trim()).filter(Boolean));
+
+function excluded(id) { return EXCLUDED_SAFES.indexOf(String(id).trim()) >= 0; }
+
+/* Throws. Used at the point an id becomes an ACTION, so a mistake in a caller
+ * cannot become an unlock. */
+function guard(id) {
+    if (excluded(id))
+        throw new Error("refused: “" + id + "” is on this suite's exclusion list — it is the " +
+                        "operator's own safe and no test may open, read, forget or " +
+                        "screenshot it (tests/browser/TESTBED.md)");
+    return id;
+}
 
 function classOf(s) { return (!s.access || s.access === "admin") ? "admin" : "user"; }
 function reachable(s) {
@@ -65,6 +100,7 @@ function reachable(s) {
 
 function pickSafe(list, want) {
     for (const s of ((list && list.safes) || [])) {
+        if (excluded(s.id)) continue;
         if (want.cls && classOf(s) !== want.cls) continue;
         if (!reachable(s)) continue;
         if (want.rw && s.mode === "ro") continue;
@@ -85,6 +121,7 @@ function pickPerFormat(list) {
     const out = [];
     const seen = {};
     for (const s of ((list && list.safes) || [])) {
+        if (excluded(s.id)) continue;
         if (!reachable(s)) continue;
         if (s.mode === "ro") continue;
         if (!H.safePassphrase(s.id)) continue;
@@ -96,12 +133,96 @@ function pickPerFormat(list) {
     return out;
 }
 
-/* The card for one registry id. `.sec-safe-id` carries the id verbatim, which
- * is what makes a card addressable without depending on its label. */
+/* THE 0.5.0 RESTYLE, AND WHAT IT DID TO EVERY SELECTOR IN THIS FILE.
+ *
+ * The safe list used to be a list of CARDS, and every action a safe had sat on
+ * its own card: `.sec-safe … button:text-is("Unlock…")` addressed a real
+ * button. R2/R3 replaced that with a sortable `<table>` whose rows carry
+ * NOTHING you can act on — secrets.js says it in as many words: "nothing in
+ * the row is an action. Every action lives in the pane" — so that one selector
+ * stopped resolving and took all three live suites down with it. Repairing it
+ * is not a matter of renaming a class: an action is now TWO gestures, select
+ * the row and then use the pane, and the code below is that pair.
+ *
+ * WHAT IS ADDRESSED, AND WHY IT AND NOT SOMETHING ELSE
+ *
+ *   the row      `#sec-safes tbody tr.sec-safe` filtered on `.sec-safe-id`.
+ *                Both classes were deliberately kept from the card markup for
+ *                exactly this reason, and the id text is exact, so a safe whose
+ *                LABEL contains another safe's id cannot win the match.
+ *   the door     `button.sec-rowdoor` — the row's real, accessible control.
+ *                Clicking the <tr> works too and is what a mouse does, but the
+ *                button is the thing a keyboard reaches and it is the one worth
+ *                driving.
+ *   the pane     `#sec-pane` / `#sec-pane-body` / `#sec-pane-h`, all ids from
+ *                the shipped index.html.
+ *   Unlock       `#sec-pane-body .sec-safe-actions button.sec-btn.primary`.
+ *                STRUCTURE, not text: safeActions() builds exactly one primary
+ *                button and it is Unlock — the consequence ladder in §7.1 has
+ *                one rung-1 control by design — so this cannot drift with the
+ *                wording, and it goes on resolving if the ellipsis or the
+ *                translation changes.
+ *
+ * Everything else in the pane (Backups…, Forget…, Delete…, Export…, Check this
+ * safe) is a plain `.sec-btn` with no distinguishing hook, so those stay text
+ * matches — but scoped to `.sec-safe-actions`, so a word appearing in the
+ * pane's prose can never be clicked instead.
+ *
+ * COLLAPSED OR EXPANDED, THE PANE IS A STATE THE PAGE CAN BE IN. R4's toggle
+ * sets `#sec-pane.hidden`, and Playwright will not click inside a hidden
+ * element. selectSafeRow() does not have to fight that — secrets.js's own
+ * selectSafe() re-opens the pane whenever a row is chosen — but it is asserted
+ * rather than assumed, because "the pane happened to be open" and "choosing a
+ * row opens the pane" are different facts and only one of them is a product
+ * guarantee. */
+
+/* The ROW for one registry id. Scoped to #sec-safes because `.sec-safe-id` now
+ * appears in the details pane as well as in the table. */
 function cardFor(frame, id) {
-    return frame.locator(".sec-safe").filter({
+    return frame.locator("#sec-safes tbody tr.sec-safe").filter({
         has: frame.locator(`.sec-safe-id:text-is("${id}")`)
     });
+}
+
+/* Is R4's pane expanded? Read from the toggle's aria-expanded, which is the
+ * state's accessible carrier and therefore the one worth trusting. */
+async function paneOpen(frame) {
+    return (await frame.locator("#sec-pane-toggle").getAttribute("aria-expanded")) === "true";
+}
+
+async function setPane(frame, want) {
+    if ((await paneOpen(frame)) === !!want) return;
+    await frame.locator("#sec-pane-toggle").click();
+    await frame.waitForFunction((w) => {
+        const t = document.getElementById("sec-pane-toggle");
+        return !!t && (t.getAttribute("aria-expanded") === "true") === w;
+    }, !!want, { timeout: 10000 });
+}
+
+/* Choose a safe: click its row door and wait for the pane to be showing THAT
+ * safe. The wait is on the pane's own id line rather than on a timeout, so a
+ * mis-aimed click is a failed wait naming the id instead of a later assertion
+ * about the wrong safe. */
+async function selectSafeRow(frame, id) {
+    guard(id);
+    await cardFor(frame, id).locator("button.sec-rowdoor").click();
+    await frame.waitForFunction((wanted) => {
+        const pane = document.getElementById("sec-pane");
+        if (!pane || pane.hidden) return false;
+        const n = pane.querySelector(".sec-safe-id");
+        return !!n && n.textContent.trim() === wanted;
+    }, id, { timeout: 15000 });
+}
+
+/* The pane's action group, and the two ways into it. */
+function paneActions(frame) {
+    return frame.locator("#sec-pane-body .sec-safe-actions");
+}
+function unlockButton(frame) {
+    return paneActions(frame).locator("button.sec-btn.primary");
+}
+function paneButton(frame, text) {
+    return paneActions(frame).locator(`button:text-is("${text}")`);
 }
 
 /* WAIT FOR THE LIST TO HAVE LANDED, not merely for the page to have started.
@@ -115,21 +236,38 @@ function cardFor(frame, id) {
  * Measured, not theorised: this is exactly how item 2 read "cptest sees 0
  * safe(s) rendered unreachable" against a page that a moment later showed two
  * (artifacts/02-safes-nonadmin.png from that run is the "Loading…" state).
- * A settled list is one with cards, an explicit empty-registry line, or an
- * error — all three are answers; "Loading…" is not. */
+ * A settled list is one with rows, an explicit empty-registry line, or an
+ * error — all three are answers; "Loading…" is not.
+ *
+ * AND IT WAITS FOR A STRUCTURE, NOT FOR TEXT. "Any text that does not start
+ * with Loading" is true of a host that is HALFWAY THROUGH BEING REPAINTED:
+ * renderSafes() calls clear(host) and then appends, and a probe landing at the
+ * wrong moment re-enters it. Measured on the 0.5.0 repair run — item 2 read
+ * `#sec-safes`.textContent as "" for the non-admin principal and failed four
+ * assertions about a panel that live-access.spec.js read in full a moment
+ * later off the same page. So the wait is for one of the three things
+ * renderSafes() can actually leave behind, all of which are settled:
+ *
+ *   a row of the table          .sec-safe        (safes are visible)
+ *   an empty/limited panel      .sec-state h3    (none are, and it says why)
+ *   the helper's error          .sec-alert       (the list itself failed)
+ */
 async function waitForSafeList(frame, timeout) {
     await frame.waitForFunction(() => {
         const host = document.getElementById("sec-safes");
         if (!host) return false;
-        if (host.querySelector(".sec-safe")) return true;
-        if (host.querySelector(".sec-alert")) return true;
-        const t = (host.textContent || "").trim();
-        return !!t && !/^Loading/i.test(t);
+        return !!(host.querySelector("tbody tr.sec-safe") ||
+                  host.querySelector(".sec-state h3") ||
+                  host.querySelector(".sec-alert"));
     }, null, { timeout: timeout || 30000 });
 }
 
+/* Two gestures, because the page is two gestures: choose the safe, then use
+ * the pane's primary control. */
 async function openUnlockDialog(frame, id) {
-    await cardFor(frame, id).locator('button:text-is("Unlock…")').click();
+    guard(id);
+    await selectSafeRow(frame, id);
+    await unlockButton(frame).click();
     await frame.waitForSelector(".sec-modal input[type=password]", { timeout: 15000 });
 }
 
@@ -356,6 +494,16 @@ async function main() {
         await item6(page, frame, state, list);
         await item7(browser, page, frame, state, password);
         await item10(page, frame, state);
+        /* Item 11 runs LAST and in a SESSION OF ITS OWN, on purpose. R5 has to
+         * be shown for a SYSTEM safe as well as a per-user one, and a system
+         * safe is only drawn while Cockpit's administrative access is on — but
+         * items 1-10 are written against a limited-access session and item 2's
+         * R1 assertions are ABOUT that state. Escalating this page would
+         * silently change what every earlier item was measuring, and Cockpit
+         * reloads the plugin frame when superuser status changes anyway
+         * (docs/DESIGN.md §18.2), so the frame handle above would be stale. A
+         * second context is cheaper than either. */
+        await item11(browser, password);
     } catch (e) {
         console.log("\n\x1b[31mThe walkthrough aborted:\x1b[0m " + String((e && e.stack) || e));
         if (page) await H.shot(page, "abort");
@@ -458,77 +606,319 @@ async function item2(browser, page, frame, list) {
         return;
     }
 
-    /* Admin FIRST, because admin is the default access class (I1) and the page
-     * says so by putting it first. Read the headings in document order. */
-    const heads = await frame.locator(".sec-class-block h3").allInnerTexts();
-    it.note("class blocks in document order: " + JSON.stringify(heads));
-    const iAdmin = heads.findIndex((h) => /Administrator safes/i.test(h));
-    const iUser = heads.findIndex((h) => /Your own safes/i.test(h));
-    const haveAdmin = safes.some((s) => classOf(s) === "admin");
-    const haveUser = safes.some((s) => classOf(s) === "user");
+    /* R2 — IT IS A REAL TABLE, and that is checked before anything is read out
+     * of it. Everything below addresses rows and header cells, so a page that
+     * had gone back to a list of <div>s would otherwise fail as six confusing
+     * assertions instead of one clear one. */
+    const shape = await frame.evaluate(() => {
+        const t = document.querySelector("#sec-safes table.sec");
+        if (!t) return null;
+        const ths = Array.prototype.map.call(t.querySelectorAll("thead th"), (th) => ({
+            label: th.textContent.replace(/[▲▼]/g, "").trim(),
+            scope: th.getAttribute("scope"),
+            sort: th.getAttribute("aria-sort"),
+            button: !!th.querySelector("button")
+        }));
+        const rows = Array.prototype.map.call(t.querySelectorAll("tbody tr.sec-safe"), (tr) => ({
+            id: (tr.querySelector(".sec-safe-id") || {}).textContent || "",
+            cells: Array.prototype.map.call(tr.children, (td) => td.innerText.trim()),
+            unreachable: tr.classList.contains("unreachable")
+        }));
+        return { ths, rows };
+    });
+    it.ok(!!shape && shape.ths.length > 0,
+          "the safe list is a <table> with real <th> headers (R2): " +
+          JSON.stringify(shape ? shape.ths.map((t) => t.label) : null));
+    if (!shape) { it.done(); return; }
+    it.ok(shape.ths.every((t) => t.scope === "col"),
+          "every header cell declares scope=col, so a screen reader can name the column " +
+          "a value belongs to");
+    it.ok(shape.ths.filter((t) => t.button).length >= 4,
+          shape.ths.filter((t) => t.button).length + " of " + shape.ths.length +
+          " columns sort from a real <button> in the <th> (R2)");
 
-    if (haveAdmin && haveUser) {
-        it.ok(iAdmin >= 0 && iUser >= 0 && iAdmin < iUser,
-              "both access classes render, and Administrator safes comes first");
+    /* ADMIN FIRST — the same fact as before, carried differently.
+     *
+     * The 0.5.0 restyle removed the `.sec-class-block` headings this item used
+     * to read; the class is a COLUMN now, and "admin first" is delivered by the
+     * table's default sort — SAFESORT starts on `class` ascending and
+     * safeSortValue() sorts admin before user. So the assertion is made from
+     * the two carriers the page actually has: aria-sort on the Class header,
+     * and the order of the Class cells down the table.
+     *
+     * AND IT IS CONDITIONAL ON BOTH CLASSES BEING VISIBLE, which is R1's doing
+     * and not a weakening: while Cockpit's administrative access is off the
+     * admin rows are not drawn at all, so their position cannot be observed.
+     * Saying that is the honest result; asserting an order over rows that are
+     * not on the page would be asserting nothing. */
+    const classCol = shape.ths.findIndex((t) => /^Class$/i.test(t.label));
+    it.ok(classCol >= 0, "the access class is a column of its own (R2)");
+    const classes = shape.rows.map((r) => (r.cells[classCol] || "").trim());
+    it.note("Class cells in row order: " + JSON.stringify(classes));
+    const haveAdminList = safes.some((s) => classOf(s) === "admin");
+    const haveUserList = safes.some((s) => classOf(s) === "user");
+    const shownAdmin = classes.filter((c) => /Administrator/i.test(c)).length;
+    const shownUser = classes.filter((c) => /Yours/i.test(c)).length;
+    it.note("the helper lists " + safes.length + " safe(s) (" +
+            safes.filter((s) => classOf(s) === "admin").length + " admin, " +
+            safes.filter((s) => classOf(s) === "user").length + " user); the page draws " +
+            shownAdmin + " admin and " + shownUser + " user row(s)");
+
+    if (classCol >= 0) {
+        it.ok(shape.ths[classCol].sort === "ascending",
+              "the table is sorted by Class ascending on load, and says so with aria-sort=" +
+              JSON.stringify(shape.ths[classCol].sort));
+    }
+    if (shownAdmin && shownUser) {
+        const lastAdmin = classes.reduce((acc, c, i) => (/Administrator/i.test(c) ? i : acc), -1);
+        const firstUser = classes.findIndex((c) => /Yours/i.test(c));
+        it.ok(lastAdmin < firstUser,
+              "both access classes render and every Administrator row comes before every " +
+              "user row (last admin at " + lastAdmin + ", first user at " + firstUser + ")");
     } else {
-        it.note("only the " + (haveAdmin ? "admin" : "user") + " class is registered on " +
-                "this host, so the ORDER of the two blocks cannot be observed from it.");
-        it.ok((haveAdmin && iAdmin >= 0) || (haveUser && iUser >= 0),
-              "the one registered class renders under its own heading");
+        it.note("only the " + (shownAdmin ? "administrator" : "user") + " class is VISIBLE to " +
+                H.CFG.admin + " right now" +
+                (haveAdminList && haveUserList
+                    ? " — R1 hides administrator safes while Cockpit's administrative access " +
+                      "is off, so their position in the sort cannot be observed from this " +
+                      "session. The count line below is what the operator gets instead."
+                    : " because that is all the registry declares.") +
+                " The ORDER is therefore not asserted here.");
+        it.ok(shape.rows.length > 0,
+              "the one visible class renders as " + shape.rows.length + " row(s) of the table");
     }
 
-    /* A safe this caller cannot reach: control disabled, reason on the card.
-     * The admin principal is in `sudo` and may legitimately reach everything,
-     * so when nothing is unreachable HERE the check is made in a second session
-     * as the non-admin principal. The case exists; it just does not exist for
-     * this operator, and saying that is not the same as skipping it. */
-    if (await frame.locator(".sec-safe.unreachable").count()) {
-        await assertDisabledCard(frame, it, H.CFG.admin);
-        it.shot(await H.shot(page, "02-safes-admin"));
+    /* R1 — THE COUNT-ONLY LINE. The requirement is explicit that hiding is
+     * cosmetic and that the operator is TOLD, so the sentence is checked for
+     * the count and for naming the control that reveals them, and checked NOT
+     * to be an alert: a warning-coloured box on every load of a perfectly
+     * normal unelevated session is how a page teaches people to ignore its
+     * warnings. */
+    const hidden = safes.length - shape.rows.length;
+    if (hidden > 0) {
+        const note = (await frame.locator("#sec-safes .sec-hidden-note").innerText()
+                                 .catch(() => "")).trim();
+        it.ok(new RegExp("\\b" + hidden + "\\b").test(note) && /hidden/i.test(note),
+              "R1: " + hidden + " safe(s) are hidden and the page says so as a COUNT: " +
+              JSON.stringify(note));
+        it.ok(/Administrative access/i.test(note),
+              "…and names the control that would show them, so the operator has a route out");
+        it.ok(!(await frame.locator("#sec-safes .sec-toolbar .sec-alert").count()),
+              "…and it is a quiet line, not an alert box");
+        const hiddenIds = safes.map((s) => s.id)
+                               .filter((id) => !shape.rows.some((r) => r.id.trim() === id));
+        it.ok(hiddenIds.length > 0 && hiddenIds.every((id) => !note.includes(id)),
+              "…and it is a COUNT ONLY — it names none of " + JSON.stringify(hiddenIds));
     } else {
-        it.note("every registered safe is reachable by " + H.CFG.admin + " (it is in " +
-                "`sudo`), so the disabled card is checked as " + H.CFG.user + ".");
-        it.shot(await H.shot(page, "02-safes-admin"));
-        const upw = H.credential(H.CFG.user);
-        if (!upw) {
-            it.skip("no credential file for " + H.CFG.user + " at " +
-                    path.join(H.CFG.creds, H.CFG.user + ".pass") + ", so an unreachable " +
-                    "card could not be observed for any principal.");
-            it.done();
-            return;
+        it.note("nothing is hidden from " + H.CFG.admin + " in this session, so R1's count " +
+                "line has nothing to say and is correctly absent.");
+    }
+
+    /* R3 and R4 — the pane, and its toggle. Both are asserted here because
+     * every action assertion in this file now goes through them, and a suite
+     * that drove the pane without ever checking it was the documented pane
+     * would report on a mechanism it had not identified. */
+    /* The first row that is not the operator's own safe. Choosing a row opens
+     * the pane on it and the pane reads the safe's registry entry, which is
+     * exactly what must never happen to `pwsafe3`. */
+    const pickRow = shape.rows.map((r) => r.id.trim()).filter((id) => !excluded(id))[0];
+    if (!pickRow) {
+        it.note("every visible row is on the exclusion list, so R3/R4 were NOT ATTEMPTED.");
+        it.done();
+        return;
+    }
+    const firstId = pickRow;
+    await selectSafeRow(frame, firstId);
+    it.ok(await frame.locator("#sec-pane").isVisible(),
+          "R3: clicking a row opens the right-docked details pane on “" + firstId + "”");
+    it.ok(await unlockButton(frame).count() > 0,
+          "…and the pane is where the actions are — the row itself carries none");
+    it.ok(!(await cardFor(frame, firstId).locator("button.sec-btn.primary").count()),
+          "…confirmed from the other side: the row has no primary action button in it");
+    const tog = frame.locator("#sec-pane-toggle");
+    it.ok((await tog.evaluate((n) => n.tagName)) === "BUTTON",
+          "R4: the pane toggle is a real <button>");
+    it.ok((await tog.getAttribute("aria-expanded")) === "true" &&
+          (await tog.getAttribute("aria-controls")) === "sec-pane",
+          "…carrying aria-expanded and aria-controls=sec-pane");
+    await setPane(frame, false);
+    it.ok(!(await frame.locator("#sec-pane").isVisible()) &&
+          (await tog.getAttribute("aria-expanded")) === "false",
+          "…and collapsing it hides the pane and flips aria-expanded");
+    it.shot(await H.shot(page, "02-pane-collapsed"));
+    await setPane(frame, true);
+    it.ok(await frame.locator("#sec-pane").isVisible(), "…and expanding it brings the pane back");
+
+    /* R5 — the Path column. Reported from what the page can actually offer,
+     * because docs/DESIGN.md §18.1 records that `list` publishes no `path` at
+     * all and the chooser therefore never offers the column. What IS checkable
+     * is the half of R5 that does not depend on that field: the chooser is a
+     * real disclosure, and NO optional column is on by default. */
+    const cols = await frame.evaluate(() => {
+        const d = document.querySelector("#sec-safes .sec-columns");
+        if (!d) return null;
+        return {
+            tag: d.tagName,
+            offered: Array.prototype.map.call(d.querySelectorAll('input[type="checkbox"]'),
+                (c) => ({ name: c.name, on: c.checked }))
+        };
+    });
+    if (!cols) {
+        it.note("the page offered no optional-column chooser for this row set at all.");
+    } else {
+        it.ok(cols.tag === "DETAILS",
+              "the column chooser is a native <details> (no focus trap, no popup maths): " +
+              JSON.stringify(cols.offered.map((c) => c.name)));
+        it.ok(cols.offered.every((c) => !c.on),
+              "every optional column is OFF by default, Path included when it is offered");
+        const hasPath = cols.offered.some((c) => c.name === "col-path");
+        it.note(hasPath
+            ? "the Path column IS offered by this helper, so R5's chooser half is live."
+            : "the Path column is NOT offered: optColAvailable() only offers it when some " +
+              "row has a `path`, and this helper's `list` response does not carry one " +
+              "(docs/DESIGN.md §18.1 — the fix is in the helper, not the page). Neither " +
+              "half of R5 can be driven until it does, and this is a stated gap, not a pass.");
+    }
+    it.shot(await H.shot(page, "02-safes-admin"));
+
+    /* AN UNREACHABLE SAFE: the control disabled, with the helper's reason.
+     *
+     * WHAT CHANGED, AND WHY THE OLD FORM CANNOT BE KEPT. This used to look for
+     * `.sec-safe.unreachable` in a NON-ADMIN session, and it found one because
+     * the admin-class safe was drawn there and dimmed. Two 0.5.0 decisions
+     * removed that case, and both are deliberate:
+     *
+     *   R1 does not draw an administrator safe at all while administrative
+     *   access is off, so a non-admin session has no such row to dim; and
+     *
+     *   safeReachable() no longer treats an admin-class row as unreachable —
+     *   `list` is always spawned unescalated and answers usable:false for every
+     *   admin entry for EVERY caller, so reading that as a refusal is what once
+     *   disabled the default access class permanently.
+     *
+     * So the state is now reached only by a USER-class safe the helper says is
+     * not usable — a file that has gone missing or changed owner. That does not
+     * exist on this host's registry for either principal, and this suite will
+     * not manufacture one: breaking a registered safe to observe a disabled
+     * button is a change to the host, not a test of the page. The assertion is
+     * therefore made where the state exists and reported NOT ATTEMPTED with
+     * this reason where it does not — and what an unelevated principal DOES
+     * see is asserted in full below, because that is R1's real carrier. */
+    if (await frame.locator("#sec-safes tbody tr.sec-safe.unreachable").count()) {
+        await assertUnreachableRow(frame, it, H.CFG.admin);
+    } else {
+        it.note("no row is rendered unreachable for " + H.CFG.admin +
+                ": every VISIBLE safe is a user-class safe the helper reports usable, and an " +
+                "admin-class safe is never marked unreachable by design. The disabled-control " +
+                "half of this item is NOT ATTEMPTED for this principal.");
+    }
+
+    /* And the non-admin principal, in its own session: R1's strongest case,
+     * where nothing at all is visible and the page has to say why. */
+    const upw = H.credential(H.CFG.user);
+    if (!upw) {
+        it.note("no credential file for " + H.CFG.user + " at " +
+                path.join(H.CFG.creds, H.CFG.user + ".pass") + ", so the non-admin view of " +
+                "the list was NOT ATTEMPTED.");
+        it.done();
+        return;
+    }
+    const ctx2 = await H.newContext(browser);
+    try {
+        const p2 = await H.login(ctx2, H.CFG.user, upw);
+        const f2 = await H.openPlugin(p2);
+        /* openPlugin() returns when the SCHEMA has landed; the safe list is
+         * a different verb and a different helper process. Reading the list
+         * here without waiting read "0 unreachable" off a page still saying
+         * "Loading the safe registry…" — a false FAIL this suite has now made
+         * twice, once for #sec-safes and once here. */
+        await waitForSafeList(f2);
+        /* waitForFunction and not evaluate: the host is repainted whenever a
+         * probe answers, and a read that lands inside clear()-then-append gets
+         * an empty div. Returning null until the structure is there makes the
+         * read retry instead of asserting about a half-drawn page. */
+        const seen = await f2.waitForFunction(() => {
+            const host = document.getElementById("sec-safes");
+            if (!host) return null;
+            if (!host.querySelector("tbody tr.sec-safe") &&
+                !host.querySelector(".sec-state h3") &&
+                !host.querySelector(".sec-alert")) return null;
+            return {
+                rows: host.querySelectorAll("tbody tr.sec-safe").length,
+                unreachable: host.querySelectorAll("tbody tr.sec-safe.unreachable").length,
+                state: (host.querySelector(".sec-state h3") || {}).textContent || "",
+                /* innerText, NOT textContent. textContent runs a heading
+                 * straight into the paragraph under it — "…while access is
+                 * limited1 administrator safe is hidden" — and a \b before
+                 * the count then matches nothing, which failed this very
+                 * assertion against a panel that was word-for-word right. */
+                body: (host.innerText || host.textContent || "")
+                          .replace(/\s+/g, " ").trim().slice(0, 400),
+                alerts: host.querySelectorAll(".sec-alert.err").length,
+                ids: Array.prototype.map.call(host.querySelectorAll(".sec-safe-id"),
+                                              (n) => n.textContent.trim())
+            };
+        }, null, { timeout: 30000 }).then((h) => h.jsonValue());
+        const ulist = await H.liveList(f2);
+        const uAll = ((ulist && ulist.safes) || []);
+        it.note(H.CFG.user + "'s own `list` returns " + uAll.length + " safe(s); the page " +
+                "draws " + seen.rows + " row(s)");
+        if (seen.rows === 0) {
+            it.ok(/Nothing is visible while access is limited/i.test(seen.state),
+                  "R1: with nothing visible, " + H.CFG.user + " gets a panel that says so " +
+                  "rather than an empty box: " + JSON.stringify(seen.state));
+            it.ok(new RegExp("\\b" + uAll.length + "\\b").test(seen.body) &&
+                  /hidden/i.test(seen.body),
+                  "…and it states the COUNT of what is hidden");
+            it.ok(/Limited access|Administrative access/i.test(seen.body),
+                  "…and names the Cockpit header control that would reveal them");
+            it.ok(/presentation only|re-checks/i.test(seen.body),
+                  "…and says in the page's own words that hiding is cosmetic and the helper " +
+                  "is the gate (I3)");
+            it.ok(seen.alerts === 0,
+                  "…and it is not an error: nothing has failed, the operator simply has not " +
+                  "escalated");
+            it.ok(seen.ids.length === 0,
+                  "…and it names none of them — a count, never an inventory");
+        } else {
+            it.ok(seen.unreachable > 0,
+                  H.CFG.user + " sees " + seen.rows + " row(s), " + seen.unreachable +
+                  " of them unreachable");
+            if (seen.unreachable > 0) await assertUnreachableRow(f2, it, H.CFG.user);
         }
-        const ctx2 = await H.newContext(browser);
-        try {
-            const p2 = await H.login(ctx2, H.CFG.user, upw);
-            const f2 = await H.openPlugin(p2);
-            /* openPlugin() returns when the SCHEMA has landed; the safe list is
-             * a different verb and a different helper process. Counting cards
-             * here without waiting read "0 unreachable" off a page still saying
-             * "Loading the safe registry…" — a false FAIL that this suite has
-             * now made twice, once for #sec-safes and once here. */
-            await waitForSafeList(f2);
-            const n = await f2.locator(".sec-safe.unreachable").count();
-            it.ok(n > 0, H.CFG.user + " sees " + n + " safe(s) rendered unreachable");
-            if (n > 0) await assertDisabledCard(f2, it, H.CFG.user);
-            it.shot(await H.shot(p2, "02-safes-nonadmin"));
-        } finally {
-            await ctx2.close();
-        }
+        it.shot(await H.shot(p2, "02-safes-nonadmin"));
+    } finally {
+        await ctx2.close();
     }
     it.done();
 }
 
-async function assertDisabledCard(frame, it, who) {
-    const card = frame.locator(".sec-safe.unreachable").first();
-    const id = (await card.locator(".sec-safe-id").innerText()).trim();
-    const open = card.locator('button:text-is("Unlock…")');
-    it.ok(await open.isDisabled(), "“" + id + "” shows its Unlock control disabled for " + who);
-    /* The reason is carried twice on purpose — as the button's title and as a
-     * line under it — so it reaches a pointer and a screen reader alike. */
+/* The unreachable state, read where it now lives: the ROW carries the class,
+ * and the disabled control and the helper's sentence are in the PANE. */
+async function assertUnreachableRow(frame, it, who) {
+    const ids = (await frame.locator("#sec-safes tbody tr.sec-safe.unreachable .sec-safe-id")
+                            .allInnerTexts()).map((t) => t.trim()).filter((t) => !excluded(t));
+    if (!ids.length) {
+        it.note("the only unreachable row belongs to the exclusion list, so it was NOT " +
+                "selected and the disabled-control check was NOT ATTEMPTED.");
+        return;
+    }
+    const id = ids[0];
+    await selectSafeRow(frame, id);
+    const open = unlockButton(frame);
+    it.ok(await open.isDisabled(),
+          "“" + id + "” shows its Unlock control disabled in the pane for " + who);
+    /* The reason is carried twice on purpose — as the control's title and as
+     * VISIBLE text in the pane — so it reaches a pointer and a screen reader
+     * alike. A title alone is invisible to touch and to browse mode. */
     const title = (await open.getAttribute("title")) || "";
-    const line = (await card.locator(".sec-subtle").last().innerText().catch(() => "")) || "";
-    it.ok(!!title.trim() || !!line.trim(),
-          "the card states the reason: " + JSON.stringify((line || title).trim().slice(0, 160)));
+    const line = (await frame.locator("#sec-pane-body .sec-alert.err").last().innerText()
+                             .catch(() => "")) || "";
+    it.ok(!!line.trim(),
+          "the pane states the reason as visible text: " +
+          JSON.stringify(line.trim().slice(0, 160)));
+    it.ok(!!title.trim(), "…and repeats it on the control's title: " +
+          JSON.stringify(title.trim().slice(0, 160)));
 }
 
 /* ================================================================== item 3 */
@@ -1148,6 +1538,45 @@ async function item6(page, frame, state, list) {
     it.note("driving " + targets.length + " safe(s), one per format: " +
             JSON.stringify(targets.map((s) => s.id + " (" + s.format + ")")));
 
+    /* "BOTH FORMATS" IS A CLAIM, SO THE FORMATS THAT WERE *NOT* DRIVEN ARE
+     * NAMED, ONE REASON EACH.
+     *
+     * This item's whole point is that a KDBX bag-of-strings and a Password
+     * Safe v3 list-of-typed-fields are different programs under one page, and a
+     * run that silently exercised one of them and reported "full management"
+     * would be the claim this item exists to stop. pickPerFormat() drops a safe
+     * for four different reasons and used to drop it in silence; each one is
+     * now a line in the report, so "psafe3 did not run" can never again be read
+     * off a green item. */
+    const drivable = targets.map((s) => String(s.format || "?"));
+    const gaps = [];
+    ((list && list.safes) || []).forEach((s) => {
+        const f = String(s.format || "?");
+        if (drivable.indexOf(f) >= 0) return;
+        if (excluded(s.id)) return;
+        let why = null;
+        if (!reachable(s))
+            why = "the helper reports it not usable by this session (" +
+                  JSON.stringify(String(s.reason || "")) + ") — for an administrator-class " +
+                  "safe that is R1/I1 working, and it means this format can only be driven " +
+                  "from a session with Cockpit's administrative access already on";
+        else if (s.mode === "ro")
+            why = "it is registered read-only (mode: \"ro\"), so nothing can be added, " +
+                  "edited, attached or saved through it. That is the state it exists in to " +
+                  "demonstrate, and flipping it would be this suite editing another " +
+                  "account's registry — see tests/browser/TESTBED.md for the one command " +
+                  "that flips it back to rw if this coverage is wanted";
+        else if (!H.safePassphrase(s.id))
+            why = "no passphrase file at " + path.join(H.CFG.creds, "safe-" + s.id + ".pass") +
+                  " — and this suite will not guess one (I16 locks a safe out after five)";
+        if (why) gaps.push({ id: s.id, format: f, why });
+    });
+    gaps.forEach((g) => it.note("FORMAT NOT DRIVEN — " + g.format + " (" + g.id + "): " + g.why));
+    it.note("formats driven: " + JSON.stringify(drivable) +
+            "; formats present but not driven: " +
+            JSON.stringify(Array.from(new Set(gaps.map((g) => g.format)))) +
+            ". This item is a full pass ONLY for the first list.");
+
     for (const safe of targets) {
         const pass = H.safePassphrase(safe.id);
         console.log("\n   -- " + safe.id + " · " + safe.format + " --");
@@ -1361,6 +1790,30 @@ async function manageOne(page, frame, it, safe, pass, state) {
     const attachBody = "live walkthrough attachment " + fmt + " " + Date.now() + "\n";
     fs.writeFileSync(tmp, attachBody);
     const addAttach = frame.locator('#sec-detail button:text-is("Add an attachment…")');
+    /* THE SAFE MAY LEGITIMATELY REFUSE THIS, AND A REFUSAL IS AN ANSWER.
+     *
+     * A Password Safe v3 database created by THIS program declares 0x030D,
+     * because raising the declared version is a claim about which readers can
+     * open the file and there is no Password Safe on this host to check the
+     * other choice against (docs/RESIDUAL-RISK.md §4.11, backends/psafe3.py).
+     * Attachments arrived in 0x030F. So `dummy-fake-user-psafe3` — the only
+     * PWS3 in the testbed — cannot take one, by construction and on purpose.
+     *
+     * This assertion used to read "the upload was accepted" unconditionally and
+     * then THREW, which aborted the whole of item 6 for that format at the
+     * attachment step: measured, the first time item 6 was ever driven against
+     * a PWS3 this program had created. That is the test encoding an assumption
+     * the product never made.
+     *
+     * It is not fixed by skipping. It is fixed by asserting the product's
+     * behaviour in BOTH directions and letting the helper decide which one this
+     * safe is: accepted -> the whole upload/list/download chain below; refused
+     * -> the refusal must be the FORMAT's own `unsupported`, carrying the
+     * version it needs and the version this file declares, so an operator can
+     * tell a format limit from a bug. Any other refusal is still a failure, and
+     * the download half is then reported NOT ATTEMPTED with the helper's own
+     * sentence as the reason rather than silently passing. */
+    let attached = false;
     if (await addAttach.count()) {
         await addAttach.click();
         await frame.waitForSelector(".sec-modal", { timeout: 15000 });
@@ -1368,12 +1821,29 @@ async function manageOne(page, frame, it, safe, pass, state) {
         await setLabelledFile(frame, "Attachment content", tmp);
         await runButton(frame).click();
         const attOut = await dialogOutcome(frame);
-        it.ok(!!(attOut && attOut.ok), "the upload was accepted" +
-              (attOut && !attOut.ok
-                  ? " — got " + JSON.stringify(attOut.code + ": " + attOut.detail) : "") + tag);
-        if (!(attOut && attOut.ok)) {
+        attached = !!(attOut && attOut.ok);
+        if (!attached) {
             it.shot(await H.shot(page, shotName("attach-refused")));
-            throw new Error("attach-add refused: " + JSON.stringify(attOut));
+            it.ok(!!(attOut && attOut.code === "unsupported"),
+                  "the upload was refused, and refused as a FORMAT LIMIT rather than as an " +
+                  "error: code " + JSON.stringify(attOut && attOut.code) + tag);
+            const d = String((attOut && attOut.detail) || "");
+            it.ok(/0x03[0-9a-f]{2}/i.test(d) && /attachment/i.test(d),
+                  "…and the sentence names the version this file declares and the version " +
+                  "attachments need, so an operator can tell it from a bug: " +
+                  JSON.stringify(d.slice(0, 160)) + tag);
+            it.note("ATTACHMENT CHAIN NOT ATTEMPTED for " + fmt + " (" + safe.id + "): the " +
+                    "helper refuses it for this file. attach-list, attach-get, the byte-for-byte " +
+                    "download and the survives-a-save check below are therefore not claimed for " +
+                    "this format. A PWS3 at 0x030F would take them; this program does not create " +
+                    "one, and adopting a foreign PWS3 is the route to that coverage " +
+                    "(docs/RESIDUAL-RISK.md §4.11).");
+            /* Close the dialog and carry on with the rest of management, which
+             * is what this item is mostly about. */
+            const c = frame.locator('.sec-modal button:text-is("Cancel"), .sec-modal button:text-is("Close")').last();
+            if (await c.count()) await c.click().catch(() => {});
+        } else {
+            it.ok(true, "the upload was accepted" + tag);
         }
         await frame.locator(`#sec-entries td button.sec-btn.link:text-is("${title}")`).click();
         await frame.waitForSelector("#sec-detail h4", { timeout: 15000 });
@@ -1387,7 +1857,7 @@ async function manageOne(page, frame, it, safe, pass, state) {
         it.note("the section reads: " +
                 JSON.stringify((await attachmentsSectionText(frame)).replace(/\s+/g, " ")
                     .slice(0, 160)) + tag);
-        it.shot(await H.shot(page, shotName("attached")));
+        it.shot(await H.shot(page, shotName(attached ? "attached" : "attach-refused-detail")));
     } else {
         it.fail("the detail pane offers no “Add an attachment…” control for a writable safe" + tag);
         return;
@@ -1404,10 +1874,20 @@ async function manageOne(page, frame, it, safe, pass, state) {
      * what is asserted is the whole chain: count -> attach-list -> a name a
      * person can see -> attach-get -> the bytes in the browser. */
     const nameCell = frame.locator("#sec-detail .sec-file-row .sec-file-name");
-    const listed = await nameCell.first().waitFor({ timeout: 30000 })
-                                 .then(() => true).catch(() => false);
-    it.ok(listed,
-          "attach-list turned the count into a NAME on the card, with no operator action" + tag);
+    const listed = attached
+        ? await nameCell.first().waitFor({ timeout: 30000 }).then(() => true).catch(() => false)
+        : false;
+    if (attached) {
+        it.ok(listed,
+              "attach-list turned the count into a NAME on the card, with no operator " +
+              "action" + tag);
+    } else {
+        /* Asserted the other way round rather than skipped: an entry the helper
+         * refused an attachment for must not be drawn as if it had one. */
+        it.ok((await nameCell.count()) === 0,
+              "the entry lists NO attachment, which is the correct reading of a file whose " +
+              "format cannot hold one" + tag);
+    }
     if (listed) {
         const names = await nameCell.allInnerTexts();
         it.ok(names.map((s) => s.trim()).indexOf(attachName) >= 0,
@@ -1501,10 +1981,16 @@ async function manageOne(page, frame, it, safe, pass, state) {
      * file rather than out of the page's memory. */
     await frame.locator(`#sec-entries td button.sec-btn.link:text-is("${title}")`).click();
     await frame.waitForSelector("#sec-detail h3", { timeout: 15000 });
-    const reListed = await frame.locator("#sec-detail .sec-file-row .sec-file-name")
-                                .first().waitFor({ timeout: 30000 })
-                                .then(() => true).catch(() => false);
-    it.ok(reListed, "the attachment survived the save and is listed again after reopening" + tag);
+    if (attached) {
+        const reListed = await frame.locator("#sec-detail .sec-file-row .sec-file-name")
+                                    .first().waitFor({ timeout: 30000 })
+                                    .then(() => true).catch(() => false);
+        it.ok(reListed,
+              "the attachment survived the save and is listed again after reopening" + tag);
+    } else {
+        it.note("no attachment was accepted for this format, so 'it survived the save' is not " +
+                "claimed" + tag);
+    }
     it.shot(await H.shot(page, shotName("reopened")));
 }
 
@@ -1792,8 +2278,13 @@ async function item10(page, frame, state) {
     }
     /* Remember the control that opened it. modal() stashes document.activeElement
      * and focuses it again on close, and a dialog that drops focus back to the
-     * top of the document is a keyboard user losing their place. */
-    const opener = cardFor(frame, state.safe.id).locator('button:text-is("Unlock…")');
+     * top of the document is a keyboard user losing their place.
+     *
+     * The control now lives in the pane, so the safe has to be CHOSEN first —
+     * which is the keyboard journey an operator actually makes: reach the row's
+     * door, activate it, then tab into the pane. */
+    await selectSafeRow(frame, state.safe.id);
+    const opener = unlockButton(frame);
     await opener.focus();
     const openerId = await frame.evaluate(() => {
         const a = document.activeElement;
@@ -1887,6 +2378,10 @@ async function item10(page, frame, state) {
     it.ok(unlocked, "Enter in the passphrase box submits the unlock — no pointer needed");
     it.shot(await H.shot(page, "10-keyboard-unlock"));
 
+    /* The entries table, at the four widths that decide whether it is readable.
+     * It needs a safe open, which is why it is here and not in zoomHalf(). */
+    if (unlocked) await entriesWidthHalf(page, frame, it);
+
     /* Escape closes an ordinary dialog. Checked on one that is allowed to be
      * dismissed — the conflict dialog is deliberately not, and item 7 checks
      * that side of it. */
@@ -1916,6 +2411,172 @@ async function item10(page, frame, state) {
     it.done();
 }
 
+/* THE ENTRIES TABLE AT THE FOUR WIDTHS THAT MATTER.
+ *
+ * docs/DESIGN.md §18.9 found this defect by LOOKING AT A SCREENSHOT: nothing
+ * overflowed, the page did not scroll, every numeric check in §11.5 passed —
+ * and the first row still rendered 26 lines tall with `ada.lovelace` broken in
+ * the middle of a 103px column. A defect that no assertion can see is a defect
+ * that comes back, so these are the assertions that can see it:
+ *
+ *   1. the floor is the one the sheet derives (60rem), not the old 42rem;
+ *   2. Username resolves `overflow-wrap: break-word` — the value that makes a
+ *      whole word its column's minimum — and the URL column, the only one whose
+ *      content can be a single 300-character token, resolves `anywhere`;
+ *   3. the third header really is URL, which is what the CSS rule addresses by
+ *      position, so a schema that reordered the columns fails HERE and loudly
+ *      rather than in a stylesheet nobody re-reads;
+ *   4. no row is absurdly tall;
+ *   5. the table scrolls inside `.sec-scroll` and the DOCUMENT DOES NOT — at
+ *      every one of the four widths, checked by asking the page to scroll and
+ *      reading how far it went, because documentElement.scrollWidth alone was
+ *      what let an escaped absolutely-positioned span go unnoticed.
+ *
+ * The four widths are the ones an operator meets: the pane docked (the
+ * documented default at >= 60rem), the pane collapsed, 200% zoom, and a 360px
+ * frame. */
+const WRAP_MAX_LINES = 12;
+
+async function entriesWidthHalf(page, frame, it) {
+    const shots = [];
+    const at = async (label, name) => {
+        await page.waitForTimeout(400);
+        await page.waitForTimeout(250);
+        const m = await frame.evaluate(() => {
+            const host = document.getElementById("sec-entries");
+            const t = host && host.querySelector("table.sec");
+            const box = host && host.querySelector(".sec-scroll");
+            if (!t || !box) return null;
+            const de = document.documentElement;
+            const was = window.scrollX;
+            window.scrollTo(4000, 0);
+            const canScroll = window.scrollX;
+            window.scrollTo(was, 0);
+            const lh = parseFloat(getComputedStyle(t.querySelector("tbody td")).lineHeight) || 21;
+            const heads = Array.prototype.map.call(t.querySelectorAll("thead th"),
+                (th) => th.textContent.replace(/[▲▼▴▾]/g, "").trim());
+            const wrapOf = (i) => {
+                const td = t.querySelector("tbody tr td:nth-child(" + i + ")");
+                return td ? getComputedStyle(td).overflowWrap : null;
+            };
+            const rows = Array.prototype.map.call(t.querySelectorAll("tbody tr"),
+                (tr) => Math.round(tr.getBoundingClientRect().height / lh));
+            return {
+                frame: de.clientWidth,
+                host: host.clientWidth,
+                table: Math.round(t.getBoundingClientRect().width),
+                boxScroll: box.scrollWidth, boxClient: box.clientWidth,
+                docScroll: de.scrollWidth, docClient: de.clientWidth,
+                canScroll,
+                heads,
+                wrap: heads.map((h, i) => [h, wrapOf(i + 1)]),
+                maxLines: rows.length ? Math.max.apply(null, rows) : 0,
+                colW: Array.prototype.map.call(t.querySelectorAll("thead th"),
+                    (th) => Math.round(th.getBoundingClientRect().width))
+            };
+        });
+        if (!m) { it.note("no entries table at " + label); return null; }
+        it.note(label + ": frame " + m.frame + "px, table " + m.table + "px in a " +
+                m.boxClient + "px box, columns " + JSON.stringify(m.colW) +
+                ", tallest row " + m.maxLines + " line(s)");
+        it.ok(m.canScroll === 0 && m.docScroll <= m.docClient + 1,
+              label + ": the table scrolls in its own box (" + m.boxScroll + " > " +
+              m.boxClient + ") and the PAGE does not (scrollTo(4000) moved it " +
+              m.canScroll + "px)");
+        it.ok(m.maxLines <= WRAP_MAX_LINES,
+              label + ": the tallest row is " + m.maxLines + " line(s), at or under the " +
+              WRAP_MAX_LINES + "-line ceiling");
+        /* THE ELEMENT, NOT THE VIEWPORT. `H.shot()` captures the shell's
+         * visible viewport, and at 700x480 and at 360px the entries table is
+         * below the fold — measured, twice: both artefacts came back as
+         * pictures of the escalation banner, and neither an in-frame
+         * `scrollIntoView` nor Playwright's `scrollIntoViewIfNeeded` moved
+         * them, because Cockpit's shell owns the scrolling here. A screenshot
+         * of the wrong element is worse than none: §18.9's defect was found by
+         * LOOKING at a picture, so these have to show the table. An element
+         * screenshot is scrolled into view by Playwright itself and frames
+         * exactly `#sec-entries` — which is the clipped `.sec-scroll` box, so
+         * how much of the table the operator can actually see at this width is
+         * what the picture shows.
+         *
+         * lockDown() because the artefacts in this tree are 0600: Playwright's
+         * screenshot() has no mode option and this host's umask is 0002. */
+        const file = path.join(H.artifactsDir(), name + ".png");
+        let nm = null;
+        try {
+            await frame.locator("#sec-entries").screenshot({ path: file });
+            H.lockDown(file);
+            nm = path.basename(file);
+        } catch (e) {
+            nm = await H.shot(page, name);       /* better a viewport than nothing */
+        }
+        shots.push(nm);
+        it.shot(nm);
+        return m;
+    };
+
+    const wasOpen = await paneOpen(frame);
+    await page.setViewportSize({ width: 1400, height: 950 });
+    await setPane(frame, true);
+    const docked = await at("pane docked, 1400px window", "10-entries-pane-open");
+
+    if (docked) {
+        /* The two numbers the stylesheet claims for itself. `min-inline-size`
+         * is read from the resolved style rather than from the rendered width,
+         * so a table that happens to be wide for another reason cannot pass
+         * this. */
+        const floor = await frame.evaluate(() => {
+            const t = document.querySelector("#sec-entries table.sec");
+            return t ? getComputedStyle(t).minInlineSize : null;
+        });
+        it.ok(floor === "960px",
+              "the entries table's floor is the derived 60rem (" + floor + "), not the " +
+              "42rem that gave seven columns 96px each");
+        const iURL = docked.heads.findIndex((h) => /^URL$/i.test(h));
+        it.ok(iURL === 2,
+              "the URL column is the third, which is the position secrets.css addresses " +
+              "(headers: " + JSON.stringify(docked.heads) + ")");
+        const wrapAt = (name) => (docked.wrap.find((w) => new RegExp("^" + name + "$", "i")
+                                                            .test(w[0])) || [])[1];
+        it.ok(wrapAt("URL") === "anywhere",
+              "the URL column may break anywhere — it is the one column whose content can " +
+              "be a single unbreakable 300-character token (overflow-wrap: " +
+              wrapAt("URL") + ")");
+        it.ok(wrapAt("Username") === "break-word",
+              "…and Username may NOT: overflow-wrap is " + wrapAt("Username") +
+              ", so the whole word is the column's minimum and a username can never be " +
+              "broken mid-word again");
+        const others = docked.wrap.filter((w) => !/^URL$/i.test(w[0]));
+        it.ok(others.every((w) => w[1] === "break-word"),
+              "…and neither may any other column: " +
+              JSON.stringify(others.map((w) => w[0] + "=" + w[1])));
+        const uw = docked.colW[docked.heads.findIndex((h) => /^Username$/i.test(h))];
+        it.note("the Username column measures " + uw + "px with the pane docked. At the old " +
+                "42rem floor, with `anywhere` on every cell, the same column measured 96–103px " +
+                "on this host's two safes — docs/DESIGN.md §18.9 recorded 103px and " +
+                "`ada.lovelace` split across five lines in it. It is now the longest token " +
+                "plus its padding, which is the width no break can happen in.");
+    }
+
+    await setPane(frame, false);
+    await at("pane collapsed, 1400px window", "10-entries-pane-collapsed");
+    await setPane(frame, true);
+
+    /* 200%: the layout-equivalent viewport, the same way zoomHalf() does it. */
+    await page.setViewportSize({ width: 700, height: 480 });
+    await at("200% zoom (700x480 viewport)", "10-entries-zoom-200");
+
+    /* And the narrowest frame the design names. Cockpit drops its sidebar
+     * below ~768px, so a 360px window is a 360px frame. */
+    await page.setViewportSize({ width: 360, height: 760 });
+    await at("360px frame", "10-entries-360");
+
+    await page.setViewportSize({ width: 1400, height: 950 });
+    await setPane(frame, wasOpen);
+    await page.waitForTimeout(300);
+    it.note("width artefacts: " + JSON.stringify(shots));
+}
+
 /* 200%, as a layout change rather than a screenshot filter.
  *
  * Browser zoom re-lays-out the page against a smaller CSS viewport; the
@@ -1940,6 +2601,522 @@ async function zoomHalf(page, frame, it) {
     await page.waitForTimeout(300);
 }
 
+/* Tick or untick one optional column, IDEMPOTENTLY.
+ *
+ * `<details>` is a toggle and its summary is a gesture, so a helper that clicks
+ * the summary "to open it" CLOSES it on its second call — and Playwright's
+ * check()/uncheck() then time out on a checkbox that is in the DOM but not
+ * visible. Measured, on this item's first live run: every R5 assertion above
+ * held and the item then aborted in the screenshot pass with
+ * "element is not visible" against a locator that had resolved.
+ *
+ * So the state is SET rather than toggled. Setting `open` fires the element's
+ * own toggle event, which is what secrets.js listens to for COLS_OPEN, so the
+ * disclosure stays open across the re-render the checkbox causes. */
+async function setOptionalColumn(frame, key, want) {
+    await frame.evaluate(() => {
+        const d = document.querySelector("#sec-safes .sec-columns");
+        if (d) d.open = true;
+    });
+    const box = frame.locator('#sec-safes .sec-columns input[name="col-' + key + '"]');
+    await box.waitFor({ state: "visible", timeout: 15000 });
+    if (want) await box.check(); else await box.uncheck();
+    await frame.waitForTimeout(250);
+}
+
+/* ================================================================= item 11 */
+/* R5, END TO END, ON THE LIVE PAGE — the requirement 0.5.0 shipped without.
+ *
+ * docs/DESIGN.md §18.1 recorded R5 as UNREACHABLE: `list` published no `path`,
+ * so `optColAvailable()` never offered the checkbox and the pane's section was
+ * behind an `if (safe.path)` that was never true. The helper now publishes it
+ * (docs/CONTRACT.md, `list` → `path`), and this item is what stops that
+ * regressing — it is the only committed test that drives R5 against the REAL
+ * helper, where the field either exists or does not.
+ *
+ * WHY IT IS NOT AN ADDITION TO ITEM 2. R5 has to be shown for a SYSTEM safe
+ * and for a PER-USER safe, because those are the two answers the pane's
+ * location sentence distinguishes and the two registries the helper resolves
+ * differently. A system safe is drawn only while Cockpit's administrative
+ * access is ON — and items 1-10 are written against a limited-access session,
+ * with item 2's R1 assertions being ABOUT that state. So this runs last, in a
+ * context of its own, and escalates there.
+ *
+ * IT ALSO RE-PROVES R1-R4 AND I11 AFTER THIS ROUND'S DOM CHANGES, in the same
+ * session, because a Path column is a new <th> and a new <td> in the table R2
+ * is about and a new section in the pane R3 is about — checking R5 on a page
+ * whose other four requirements had quietly broken would be checking nothing.
+ * R1 is checked in BOTH directions here (before and after escalation), which is
+ * the one thing item 2 structurally cannot do.
+ *
+ * THE OPERATOR'S OWN SAFE. This is the first item in this suite that
+ * deliberately escalates, and escalation is exactly what would make somebody
+ * else's registry readable. It does not make eddie's readable — the per-user
+ * registry is resolved from the CALLER's own home and the caller is cptestadm —
+ * but the item does not rely on that: every id it touches goes through guard(),
+ * the rows it chooses are filtered through excluded(), and the last assertion
+ * is that the string "pwsafe3" never appeared in the frame at all. */
+async function item11(browser, password) {
+    const it = REC.item(11, ITEMS[11]);
+    console.log("\n== 11. " + ITEMS[11] + " ==");
+
+    const ctx = await H.newContext(browser);
+    let page = null;
+    try {
+        page = await H.login(ctx, H.CFG.admin, password);
+        let frame = await H.openPlugin(page);
+        await waitForSafeList(frame);
+
+        /* ---- R1, direction one: administrative access OFF ---------------- */
+        const before = await H.adminAccessState(page);
+        it.note("Cockpit's header reports administrative access: " + before);
+        const listOff = await H.liveList(frame);
+        const offSafes = ((listOff && listOff.safes) || []);
+        const adminIds = offSafes.filter((s) => classOf(s) === "admin").map((s) => s.id);
+        const drawnOff = await frame.$$eval("#sec-safes tbody .sec-safe-id",
+            (ns) => ns.map((n) => n.textContent.trim()));
+        if (adminIds.length) {
+            it.ok(adminIds.every((id) => drawnOff.indexOf(id) < 0),
+                  "R1 (access off): the helper lists " + adminIds.length +
+                  " administrator safe(s) and the table draws none of them — rows on screen: " +
+                  JSON.stringify(drawnOff));
+        } else {
+            it.note("this principal's registry declares no administrator safe while access is " +
+                    "off, so R1's hiding direction has nothing to hide and is not asserted here.");
+        }
+
+        /* ---- escalate, through Cockpit's own control -------------------- */
+        frame = await escalateHere(page, it, password);
+        if (!frame) {
+            it.fail("Cockpit's administrative access could not be turned on, so the SYSTEM " +
+                    "half of R5 was NOT ATTEMPTED. The per-user half needs the same session " +
+                    "and is not reported separately rather than reported on a different one.");
+            it.done();
+            return;
+        }
+        await waitForSafeList(frame);
+
+        /* THE I11 BASELINE, taken here and not earlier: escalation reloads the
+         * plugin frame (docs/DESIGN.md §18.2), so a snapshot from before it is
+         * a snapshot of a document that no longer exists. Everything this item
+         * does to the page — open the chooser, tick a column, sort, select
+         * rows, collapse and expand the pane, and a full unlock — happens after
+         * this line and is measured against it. */
+        const storage0 = await readStorage(frame, []);
+        it.note("storage baseline before the chooser, the pane and the unlock: local " +
+                JSON.stringify(Object.keys(storage0.local)) + ", session " +
+                JSON.stringify(Object.keys(storage0.session)));
+
+        const list = await H.liveList(frame);
+        const safes = ((list && list.safes) || []).filter((s) => !excluded(s.id));
+
+        /* ---- R1, direction two: administrative access ON ---------------- */
+        const drawnOn = await frame.$$eval("#sec-safes tbody .sec-safe-id",
+            (ns) => ns.map((n) => n.textContent.trim()));
+        if (adminIds.length) {
+            it.ok(adminIds.every((id) => drawnOn.indexOf(id) >= 0),
+                  "R1 (access on): the same " + adminIds.length +
+                  " administrator safe(s) are now drawn — rows on screen: " +
+                  JSON.stringify(drawnOn));
+        }
+
+        /* ---- the two safes R5 has to be shown for ----------------------- */
+        const sysSafe = safes.find((s) => s.path && String(s.registry) === "system");
+        const usrSafe = safes.find((s) => s.path && String(s.registry) === "user");
+        it.note("safes with a path: " +
+                JSON.stringify(safes.filter((s) => s.path).map((s) => s.id + "/" + s.registry)));
+        it.ok(!!sysSafe && !!usrSafe,
+              "the helper publishes `path` for a SYSTEM-registry safe and for a PER-USER one — " +
+              "the two cases the pane's location sentence distinguishes (" +
+              JSON.stringify(sysSafe ? sysSafe.id : null) + ", " +
+              JSON.stringify(usrSafe ? usrSafe.id : null) + ")");
+        if (!sysSafe || !usrSafe) {
+            it.fail("R5 needs one of each and this registry does not offer both. Nothing " +
+                    "below is asserted on a substitute.");
+            it.done();
+            return;
+        }
+        guard(sysSafe.id); guard(usrSafe.id);
+        const wantPaths = { [sysSafe.id]: String(sysSafe.path), [usrSafe.id]: String(usrSafe.path) };
+
+        /* ---- R2, re-proved after this round's DOM changes --------------- */
+        const shape = () => frame.evaluate(() => {
+            const t = document.querySelector("#sec-safes table.sec");
+            if (!t) return null;
+            return {
+                ths: Array.prototype.map.call(t.querySelectorAll("thead th"), (th) => ({
+                    label: th.textContent.replace(/[▲▼]/g, "").trim(),
+                    scope: th.getAttribute("scope"),
+                    sort: th.getAttribute("aria-sort"),
+                    button: !!th.querySelector("button")
+                })),
+                rows: Array.prototype.map.call(t.querySelectorAll("tbody tr.sec-safe"), (tr) => ({
+                    id: ((tr.querySelector(".sec-safe-id") || {}).textContent || "").trim(),
+                    cells: Array.prototype.map.call(tr.children, (td) => td.innerText.trim())
+                }))
+            };
+        });
+        const s0 = await shape();
+        it.ok(!!s0 && s0.ths.length > 0 && s0.ths.every((t) => t.scope === "col"),
+              "R2 still holds: a real <table>, every <th> scope=col — " +
+              JSON.stringify(s0 ? s0.ths.map((t) => t.label) : null));
+        it.ok(!!s0 && s0.ths.filter((t) => t.button).length >= 4,
+              "R2: " + (s0 ? s0.ths.filter((t) => t.button).length : 0) +
+              " columns sort from a real <button> in the <th>");
+
+        /* ---- R5 half one: OFF BY DEFAULT, and the path is NOWHERE ------- */
+        it.ok(!s0.ths.some((t) => /^Path$/i.test(t.label)),
+              "R5: Path is NOT a column on first load — headers are " +
+              JSON.stringify(s0.ths.map((t) => t.label)));
+        /* THE ASSERTION THE TASK ASKS FOR IN THOSE WORDS: the path STRING is
+         * absent from the default table. Checked against the exact values the
+         * helper published, not against a pattern that might match nothing —
+         * a regex for "looks like a path" would pass on a page that printed
+         * the path in a format the regex did not anticipate. */
+        const tableText0 = await frame.locator("#sec-safes").innerText();
+        const leaked0 = Object.keys(wantPaths).filter((id) => tableText0.includes(wantPaths[id]));
+        it.ok(leaked0.length === 0,
+              "R5: neither published path appears ANYWHERE in the default table — not the " +
+              "system safe's and not the per-user one's, whose value names a home directory " +
+              "and therefore an account (" + JSON.stringify(leaked0) + ")");
+        const homes = await frame.locator("#sec-safes").innerText();
+        it.ok(!/\/home\//.test(homes),
+              "…and no home-directory path of any kind is on screen by default");
+
+        /* ---- R5 half two: THE CHOOSER TURNS IT ON ----------------------- */
+        const cols = await frame.evaluate(() => {
+            const d = document.querySelector("#sec-safes .sec-columns");
+            if (!d) return null;
+            return { tag: d.tagName,
+                     offered: Array.prototype.map.call(d.querySelectorAll('input[type="checkbox"]'),
+                        (c) => ({ name: c.name, on: c.checked })) };
+        });
+        it.ok(!!cols && cols.tag === "DETAILS",
+              "the column chooser is a native <details>: " +
+              JSON.stringify(cols ? cols.offered.map((c) => c.name) : null));
+        it.ok(!!cols && cols.offered.some((c) => c.name === "col-path"),
+              "R5: the chooser OFFERS a Path checkbox — the half docs/DESIGN.md §18.1 recorded " +
+              "as unreachable, because optColAvailable() only offers it when a row has a path");
+        it.ok(!!cols && cols.offered.every((c) => !c.on),
+              "R5: every optional column is OFF by default, Path included");
+
+        await setOptionalColumn(frame, "path", true);
+        await frame.waitForSelector("#sec-safes th:has-text('Path')", { timeout: 10000 });
+        const s1 = await shape();
+        const pathCol = s1.ths.findIndex((t) => /^Path$/i.test(t.label));
+        it.ok(pathCol >= 0, "ticking the box adds a real <th>Path</th> immediately, with no " +
+              "Apply step (headers " + JSON.stringify(s1.ths.map((t) => t.label)) + ")");
+        const cellFor = (sh, id) => {
+            const r = sh.rows.find((x) => x.id === id);
+            return r ? (r.cells[pathCol] || "") : "(no row)";
+        };
+        it.ok(cellFor(s1, sysSafe.id) === wantPaths[sysSafe.id],
+              "R5: the SYSTEM safe's cell holds the helper's own value in full, unabbreviated: " +
+              JSON.stringify(cellFor(s1, sysSafe.id)));
+        it.ok(cellFor(s1, usrSafe.id) === wantPaths[usrSafe.id],
+              "R5: the PER-USER safe's cell holds the helper's own value in full: " +
+              JSON.stringify(cellFor(s1, usrSafe.id)));
+        it.shot(await H.shot(page, "11-path-column-on"));
+
+        /* ---- R5 half three: IT SURVIVES A SORT -------------------------- */
+        /* A column chooser that is reset by re-sorting is a column chooser an
+         * operator cannot use: sorting is the FIRST thing anyone does to a
+         * table they have just added a column to. renderSafes() rebuilds the
+         * whole <tbody> on every sort, so this is a real question and not a
+         * formality. */
+        const sortBtn = frame.locator("#sec-safes thead th button").first();
+        const sortName = (await sortBtn.innerText()).replace(/[▲▼]/g, "").trim();
+        await sortBtn.click();
+        await frame.waitForTimeout(300);
+        const s2 = await shape();
+        it.ok(s2.ths.findIndex((t) => /^Path$/i.test(t.label)) === pathCol,
+              "R5: sorting by " + JSON.stringify(sortName) + " keeps the Path column, in the " +
+              "same position (" + pathCol + ")");
+        it.ok(cellFor(s2, sysSafe.id) === wantPaths[sysSafe.id] &&
+              cellFor(s2, usrSafe.id) === wantPaths[usrSafe.id],
+              "…and both cells still hold the full path after the re-render");
+        await sortBtn.click();                       /* and back, descending */
+        await frame.waitForTimeout(300);
+        const s3 = await shape();
+        it.ok(s3.ths.findIndex((t) => /^Path$/i.test(t.label)) === pathCol &&
+              cellFor(s3, sysSafe.id) === wantPaths[sysSafe.id],
+              "…and again with the sort reversed (aria-sort now " +
+              JSON.stringify(s3.ths[0].sort) + ")");
+
+        /* ---- R3 and R4, re-proved, and R5's pane half ------------------- */
+        for (const safe of [sysSafe, usrSafe]) {
+            await selectSafeRow(frame, safe.id);
+            it.ok(await frame.locator("#sec-pane").isVisible(),
+                  "R3: choosing the " + String(safe.registry) + "-registry row opens the pane on " +
+                  JSON.stringify(safe.id));
+            const pane = await frame.evaluate(() => {
+                const body = document.getElementById("sec-pane-body");
+                if (!body) return null;
+                const code = body.querySelector("code.sec-path");
+                const cs = code ? getComputedStyle(code) : null;
+                return {
+                    sections: Array.prototype.map.call(body.querySelectorAll("h4.sec-pane-section"),
+                        (h) => h.textContent.trim()),
+                    text: code ? code.textContent : null,
+                    /* Truncation would show as a clipped box: the element is a
+                     * block, so a value that did not wrap would scroll wider
+                     * than its own content box. */
+                    scrollW: code ? code.scrollWidth : 0,
+                    clientW: code ? code.clientWidth : 0,
+                    wrap: cs ? cs.overflowWrap : null,
+                    ws: cs ? cs.whiteSpace : null,
+                    select: cs ? (cs.userSelect || cs.webkitUserSelect) : null,
+                    ellipsis: cs ? cs.textOverflow : null,
+                    note: (body.innerText || "")
+                };
+            });
+            it.ok(!!pane && pane.sections.indexOf("Path") === 0,
+                  "R5: the pane's FIRST section is Path — before the file header, because it is " +
+                  "the fact an operator opens the pane for (" +
+                  JSON.stringify(pane ? pane.sections : null) + ")");
+            it.ok(!!pane && pane.text === String(safe.path),
+                  "R5: it is the whole path, character for character, not ~-abbreviated and not " +
+                  "elided: " + JSON.stringify(pane ? pane.text : null));
+            it.ok(!!pane && pane.select !== "none",
+              "R5: it is SELECTABLE — computed user-select is " +
+                  JSON.stringify(pane ? pane.select : null) + ", so an operator can copy it " +
+                  "with the mouse and not only with the button");
+            it.ok(!!pane && pane.wrap === "anywhere" && /pre-wrap/.test(String(pane.ws)) &&
+                  pane.scrollW <= pane.clientW + 1,
+                  "R5: it WRAPS rather than truncating (overflow-wrap " +
+                  JSON.stringify(pane ? pane.wrap : null) + ", white-space " +
+                  JSON.stringify(pane ? pane.ws : null) + ", scrollWidth " +
+                  (pane ? pane.scrollW : 0) + " <= clientWidth " + (pane ? pane.clientW : 0) + ")");
+            it.ok(!!pane && pane.ellipsis !== "ellipsis",
+                  "…and text-overflow is not an ellipsis, which is the other way a path lies");
+            const wantNote = classOf(safe) === "admin" ? /owned by root/i : /safe of your own/i;
+            it.ok(wantNote.test(pane.note),
+                  "…and the pane says what the LOCATION means for this class of safe (" +
+                  JSON.stringify(classOf(safe)) + ")");
+            it.ok(await frame.locator('#sec-pane-body button:text-is("Copy path")').count() === 1,
+                  "…and offers exactly one Copy path control");
+            it.shot(await H.shot(page, "11-pane-path-" + String(safe.registry)));
+        }
+
+        /* R4 — the hamburger, on the page as it now stands. */
+        const tog = frame.locator("#sec-pane-toggle");
+        it.ok((await tog.evaluate((n) => n.tagName)) === "BUTTON" &&
+              (await tog.getAttribute("aria-controls")) === "sec-pane",
+              "R4: the pane toggle is a real <button> with aria-controls=sec-pane");
+        await setPane(frame, false);
+        it.ok(!(await frame.locator("#sec-pane").isVisible()) &&
+              (await tog.getAttribute("aria-expanded")) === "false",
+              "R4: collapsing hides the pane and flips aria-expanded to false");
+        it.shot(await H.shot(page, "11-pane-collapsed"));
+        await setPane(frame, true);
+        it.ok(await frame.locator("#sec-pane").isVisible() &&
+              (await tog.getAttribute("aria-expanded")) === "true",
+              "R4: expanding brings it back");
+
+        /* ---- the operator's screenshots: light, dark, narrow ------------ */
+        await themeShots(page, frame, it, sysSafe);
+
+        /* ---- R5: turning it back off removes it ------------------------- */
+        await setOptionalColumn(frame, "path", false);
+        const s4 = await shape();
+        const tableText1 = await frame.locator("#sec-safes").innerText();
+        it.ok(!s4.ths.some((t) => /^Path$/i.test(t.label)) &&
+              !Object.keys(wantPaths).some((id) => tableText1.includes(wantPaths[id])),
+              "R5: unticking removes the column and the path string leaves the table with it");
+        it.ok(await frame.locator("#sec-pane code.sec-path").count() === 1,
+              "…while the pane still shows it — that is what ALWAYS means (R5)");
+
+        /* ---- a full unlock, so I11 is measured across all three --------- */
+        const pass = H.safePassphrase(usrSafe.id);
+        let unlocked = false;
+        if (!pass) {
+            it.note("no passphrase file for " + usrSafe.id + ", so the UNLOCK half of this " +
+                    "item's I11 check was NOT ATTEMPTED; the chooser and pane half below still " +
+                    "stands, and item 4 measures I11 across an unlock in the other session.");
+        } else {
+            await openUnlockDialog(frame, usrSafe.id);
+            const out = await unlockAndWaitOutBackoff(frame, pass, it);
+            unlocked = !!(out && out.ok);
+            it.ok(unlocked, "a full unlock of " + JSON.stringify(usrSafe.id) +
+                  " succeeds in this escalated session" +
+                  (unlocked ? "" : " — the helper said " + JSON.stringify(out && out.code)));
+        }
+
+        /* ---- I11, against the baseline taken before any of it ----------- */
+        const probes = [{ label: "this package's name", text: "cockpit-secrets" },
+                        { label: "the system safe's registry id", text: sysSafe.id },
+                        { label: "the per-user safe's registry id", text: usrSafe.id },
+                        { label: "the system safe's path", text: String(sysSafe.path) },
+                        { label: "the per-user safe's path", text: String(usrSafe.path) }];
+        if (pass) probes.push({ label: "the passphrase", text: pass });
+        const after = await readStorage(frame, probes);
+        const added = storageAdded(storage0, after);
+        const waived = storageTolerated(storage0, after);
+        it.note("host-shell keys that changed and were tolerated by name: " +
+                (waived.length ? JSON.stringify(waived) : "none") +
+                "  (tolerated list: " + JSON.stringify(HOST_SHELL_KEYS) + ")");
+        it.ok(!added.local.length && !added.session.length,
+              "I11: the column chooser, the details pane, the sort, the pane toggle and " +
+              (unlocked ? "a full unlock " : "") +
+              "added NOTHING to either storage area and overwrote nothing " +
+              "(" + JSON.stringify(added.local) + " local, " +
+              JSON.stringify(added.session) + " session, against the pre-interaction baseline)");
+        const hits = storageProbeHits(after);
+        it.ok(!hits.length,
+              "I11: no storage value anywhere holds the passphrase, a safe id, a safe PATH or " +
+              "this package's name — the tolerated keys included (" + JSON.stringify(hits) + ")");
+        const ours = Object.keys(after.local).concat(Object.keys(after.session))
+                           .filter((k) => /secret|^sec[-_.:]/i.test(k));
+        it.ok(!ours.length, "I11: no storage key belongs to this package (" +
+              JSON.stringify(ours) + ")");
+        /* The column choice and the pane state are SESSION-ONLY by design (I11
+         * again): they live in module variables and die with the document.
+         * Asserting they did NOT persist is the same assertion as above, read
+         * the other way round, and it is here so nobody later "improves" the
+         * chooser by remembering it. */
+        it.note("COLS and the pane state are module variables, not storage — the check above " +
+                "is what enforces that, and a future 'remember my columns' change would fail " +
+                "it rather than pass silently.");
+
+        /* ---- and the operator's own safe, nowhere at all ---------------- */
+        const whole = await frame.evaluate(() => document.documentElement.outerHTML);
+        it.ok(whole.indexOf("pwsafe3") < 0,
+              "the operator's own safe was never named in this frame, at either access level, " +
+              "with the Path column on — which is the state that would have shown its file");
+    } catch (e) {
+        it.fail("item 11 aborted: " + String((e && e.stack) || e));
+        if (page) await H.shot(page, "11-abort");
+    } finally {
+        await ctx.close();
+    }
+    it.done();
+}
+
+/* Cockpit's own escalation, driven the way an operator drives it.
+ *
+ * The reasoning is live-provision.spec.js's and is not repeated: a channel
+ * opened with superuser:"require" from a limited session is refused IMMEDIATELY
+ * with access-denied and NO DIALOG IS DRAWN ANYWHERE, because the escalation
+ * dialog belongs to the shell and no API a package page can reach will summon
+ * it (docs/LIVE-WALKTHROUGH.md item 9). So the only way in is the header
+ * control. Returns the fresh frame, or null. */
+async function escalateHere(page, it, password) {
+    const perm0 = await (await H.openPlugin(page)).evaluate(() => new Promise((resolve) => {
+        const p = cockpit.permission({ admin: true });
+        setTimeout(() => resolve(p.allowed), 600);
+    }));
+    if (perm0 === true) {
+        it.note("this session already has administrative access — nothing to escalate");
+        return H.openPlugin(page);
+    }
+    const hdr = page.locator('button:has-text("Limited access"), a:has-text("Limited access")');
+    if (!(await hdr.count())) {
+        it.fail("Cockpit's header carries no “Limited access” control, so this session cannot " +
+                "be escalated through the gesture an operator makes.");
+        return null;
+    }
+    await hdr.first().click();
+    const prompt = await page.waitForFunction(() => {
+        const t = document.body ? document.body.innerText : "";
+        const pw = document.querySelector("input[type=password]");
+        return (/administrative access|switch to admin|password for|Limited access mode/i.test(t)
+                && !!pw) ? true : null;
+    }, null, { timeout: 30000 }).then(() => true).catch(() => false);
+    if (!prompt) return null;
+    await page.locator("input[type=password]:visible").first().fill(password);
+    /* noWaitAfter: Cockpit reloads the whole page the moment its superuser
+     * state changes, so the button is detached before the click can report. */
+    const auth = page.locator("button:visible")
+                     .filter({ hasText: /^(Authenticate|Ok|Continue|Apply|Log in)$/i }).first();
+    if (await auth.count()) await auth.click({ noWaitAfter: true, timeout: 10000 }).catch(() => {});
+    else await page.keyboard.press("Enter");
+    await page.waitForLoadState("domcontentloaded").catch(() => {});
+    await page.waitForFunction(() => {
+        const t = document.body ? document.body.innerText : "";
+        return /Administrative access/i.test(t) && !/Limited access/i.test(t);
+    }, null, { timeout: 30000 }).catch(() => {});
+    const frame = await H.openPlugin(page);
+    const now = await frame.evaluate(() => new Promise((resolve) => {
+        const p = cockpit.permission({ admin: true });
+        setTimeout(() => resolve(p.allowed), 800);
+    }));
+    it.ok(now === true,
+          "administrative access is ON (cockpit.permission({admin:true}).allowed === " +
+          JSON.stringify(now) + "), so a system-registry safe is drawn");
+    return now === true ? frame : null;
+}
+
+/* THE OPERATOR'S SCREENSHOTS — light and dark, Path on and off, and narrow.
+ *
+ * The theme is flipped by toggling the SHELL's own PatternFly dark class, which
+ * is the exact observable theme.js watches (it holds a MutationObserver on the
+ * parent document's class attribute). That is a presentation change to the
+ * shell document and nothing else: no storage is written, so it cannot disturb
+ * the I11 measurement this item makes afterwards, and it is not a stub — the
+ * page resolves it through the same code path a real Light/Dark choice takes.
+ *
+ * The class is restored before this function returns. */
+async function themeShots(page, frame, it, safe) {
+    const set = (dark) => page.evaluate((d) => {
+        const r = document.documentElement;
+        if (d) r.classList.add("pf-v6-theme-dark");
+        else r.classList.remove("pf-v6-theme-dark");
+        return r.className;
+    }, dark);
+    const resolved = () => frame.evaluate(() => document.documentElement.className);
+    const had = await page.evaluate(() =>
+        document.documentElement.classList.contains("pf-v6-theme-dark"));
+
+    const shots = [];
+    const boxOn = async (dark, label) => {
+        await set(dark);
+        await page.waitForTimeout(350);
+        const cls = await resolved();
+        it.ok(new RegExp(dark ? "sec-dark" : "sec-light").test(cls) &&
+              /sec-theme-managed/.test(cls),
+              "the frame follows the shell's " + label + " theme (<html> class " +
+              JSON.stringify(cls) + ") — theme.js resolved it, not the media query");
+        return cls;
+    };
+
+    for (const [dark, label] of [[false, "light"], [true, "dark"]]) {
+        await boxOn(dark, label);
+        /* Path ON — the column is currently on when this is called. */
+        shots.push(await H.shot(page, "11-safes-path-on-" + label));
+        await setOptionalColumn(frame, "path", false);
+        shots.push(await H.shot(page, "11-safes-path-off-" + label));
+        /* the pane, showing the path, with the column off — R5's "always" */
+        await selectSafeRow(frame, safe.id);
+        shots.push(await H.shot(page, "11-pane-path-" + label));
+        /* and back on, so the loop's next pass starts where this one did */
+        await setOptionalColumn(frame, "path", true);
+    }
+
+    /* The narrow viewport, in the theme the operator is most likely reading in
+     * a screenshot review. Cockpit drops its sidebar below ~768px, so a 360px
+     * window is a 360px frame. */
+    await set(false);
+    await page.setViewportSize({ width: 360, height: 760 });
+    await page.waitForTimeout(500);
+    const narrow = await frame.evaluate(() => {
+        const d = document.documentElement;
+        window.scrollTo(4000, 0);
+        const moved = window.scrollX;
+        window.scrollTo(0, 0);
+        return { scrollW: d.scrollWidth, clientW: d.clientWidth, moved };
+    });
+    it.ok(narrow.moved === 0,
+          "at a 360px frame with the Path column ON the PAGE still does not scroll sideways " +
+          "(asked it to scroll 4000px, it moved " + narrow.moved + "px; scrollWidth " +
+          narrow.scrollW + " vs clientWidth " + narrow.clientW + ")");
+    shots.push(await H.shot(page, "11-safes-360-path-on"));
+    await page.setViewportSize({ width: 1400, height: 950 });
+    await page.waitForTimeout(300);
+
+    await set(had);
+    it.note("operator screenshots: " + JSON.stringify(shots.filter(Boolean)));
+}
+
 /* ---------------------------------------------------------------- report -- */
 function finish() {
     const s = REC.summary();
@@ -1960,4 +3137,8 @@ if (require.main === module) main();
 module.exports = { classOf, reachable, pickSafe, pickPerFormat, cardFor, openUnlockDialog,
                    submitUnlock, unlockOutcome, unlockAndWaitOutBackoff, waitForSafeList,
                    waitForSaveOutcome, inBrowseView,
+                   /* the 0.5.0 pane idiom, shared with live-access.spec.js so
+                      the two suites cannot disagree about how a safe is chosen */
+                   paneOpen, setPane, selectSafeRow, paneActions, unlockButton, paneButton,
+                   EXCLUDED_SAFES, excluded, guard,
                    spawnVerb, parseMaybe, controlIdByLabel, fillLabelled, runButton, ITEMS };

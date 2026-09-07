@@ -255,17 +255,92 @@ function registrySchema(live) {
     return s;
 }
 
+/* Console noise that is an artefact of the HARNESS, not of the page.
+ *
+ * secrets.css declares @font-face for Cockpit's own Red Hat Text and Red Hat
+ * Mono at `../../static/fonts/…`, which resolves to /cockpit/static/fonts/…
+ * and was MEASURED live on Cockpit 360 to return 200 with zero CSP violations.
+ * The stub server in harness.js serves the plugin directory and nothing else,
+ * so those three requests 404 here and Chromium logs one console error each.
+ *
+ * The filter below is as narrow as it can be made. Chromium's console text for
+ * a failed subresource does NOT carry the URL, so the URL is recorded from the
+ * response stream instead: a 404 console error is discounted only while EVERY
+ * 404 this page actually took was a font file, and only up to the number of
+ * them. One 404 for anything else, or one extra, and the assertion fails again
+ * — as does every uncaught exception and every other console error.
+ *
+ * `font-display: fallback` is why this is cosmetic: with the files missing the
+ * page renders in the system sans, which is exactly what a plugin opened
+ * outside Cockpit should do. */
+const RESOURCE_404 = /Failed to load resource.*404/;
+function realErrors(page) {
+    const missed = page.__notFound || [];
+    const fonts = missed.filter((u) => /\/static\/fonts\//.test(u));
+    if (!missed.length || fonts.length !== missed.length) return page.__errors;
+    let budget = fonts.length;
+    return page.__errors.filter((e) => {
+        if (RESOURCE_404.test(e) && budget > 0) { budget--; return false; }
+        return true;
+    });
+}
+
+/* H.openPage with one addition this file needs and harness.js does not
+ * provide: the URL of every response that came back 404. */
+async function openPage(browser, scenario) {
+    const page = await H.openPage(browser, scenario);
+    page.__notFound = [];
+    page.on("response", (r) => { if (r.status() === 404) page.__notFound.push(r.url()); });
+    /* Without this the clipboard API REJECTS in headless Chromium, and a test
+     * asserting "the countdown chip did not appear" would pass because the
+     * copy never happened. Granting it makes both halves of the
+     * secret/not-secret assertion mean what they say. */
+    await page.context().grantPermissions(["clipboard-read", "clipboard-write"])
+        .catch(() => { /* older Chromium: the assertions below say so themselves */ });
+    return page;
+}
+
 /* --------------------------------------------------------------- helpers -- */
 async function bootToSafes(browser, scenario) {
-    const page = await H.openPage(browser, scenario);
+    const page = await openPage(browser, scenario);
     await page.goto(scenario.__url);
-    await page.waitForSelector("#sec-safes .sec-safe, #sec-safes .sec-alert",
+    /* `.sec-state` joined this list with R1 and R3: the registry can now land
+     * in three shapes that contain no `.sec-safe` at all — nothing registered,
+     * nothing VISIBLE because administrative access is off, and the helper
+     * failing to answer. Waiting only for a row would hang on all three. */
+    await page.waitForSelector("#sec-safes .sec-safe, #sec-safes .sec-alert, " +
+                               "#sec-safes .sec-state",
                                { timeout: 10000 });
     return page;
 }
 
+/* SELECT A SAFE AND RETURN THE DETAILS PANE SHOWING IT.
+ *
+ * R3 moved every action out of the table row and into the docked pane, so the
+ * old `.sec-safe:has(.sec-safe-id:text-is("X")) button:text-is("Unlock…")`
+ * stops resolving: the button is no longer inside the row.
+ *
+ * This is a SELECTOR migration, not a weakened assertion — and it is STRICTER
+ * than what it replaces. The old form proved a button existed somewhere in a
+ * row. This one proves the pane is showing the safe that was asked for before
+ * anything is clicked in it. Unlocking the wrong safe is a real error, it is
+ * the error R3 exists to prevent, and nothing asserted it before. */
+async function openSafe(page, safeId) {
+    await page.click(`.sec-safe:has(.sec-safe-id:text-is("${safeId}")) button.sec-rowdoor`);
+    await page.waitForSelector(`#sec-pane .sec-safe-id:text-is("${safeId}")`,
+                               { timeout: 10000 });
+    return "#sec-pane";
+}
+
+/* The pane control for a safe, addressed by its label. Every call site that
+ * used to reach into a row goes through here. */
+async function safeAction(page, safeId, label) {
+    const pane = await openSafe(page, safeId);
+    return `${pane} .sec-safe-actions button:text-is("${label}")`;
+}
+
 async function unlockFirst(page, safeId) {
-    await page.click(`.sec-safe:has(.sec-safe-id:text-is("${safeId}")) button:text-is("Unlock…")`);
+    await page.click(await safeAction(page, safeId, "Unlock…"));
     await page.waitForSelector(".sec-modal input[type=password]");
     await page.fill(".sec-modal input[type=password]", "correct horse");
     await page.click('.sec-modal button:text-is("Unlock")');
@@ -484,6 +559,14 @@ async function main() {
                     labels.add(t);
             };
             await grab();                                   /* the safes view */
+            /* R3: Unlock, Backups, Export, Forget, Delete and "Check this
+             * safe" live in the details pane now, so a row has to be SELECTED
+             * before the safes view has any of them to offer. This is the whole
+             * of the change to this check: the same labels, one click earlier. */
+            await openSafe(page, "lab-dc");
+            await grab();
+            await openSafe(page, "mine");
+            await grab();
 
             await unlockFirst(page, "lab-dc");
             await grab();                                   /* the browse toolbar */
@@ -574,7 +657,7 @@ async function main() {
         }
         {
             const page = await bootToSafes(browser, scen());
-            await page.click('.sec-safe:has(.sec-safe-id:text-is("lab-dc")) button:text-is("Unlock…")');
+            await page.click(await safeAction(page, "lab-dc", "Unlock…"));
             await page.waitForSelector(".sec-modal input[type=password]");
             const attrs = await page.$eval(".sec-modal input[type=password]", (n) => ({
                 name: n.getAttribute("name"),
@@ -599,7 +682,7 @@ async function main() {
             s.responses.strength = { entropy_bits: 30, effective_bits: 30,
                                      category: "weak", weaknesses: [] };
             const page = await bootToSafes(browser, s);
-            await page.click('.sec-safe:has(.sec-safe-id:text-is("lab-dc")) button:text-is("Unlock…")');
+            await page.click(await safeAction(page, "lab-dc", "Unlock…"));
             await page.waitForSelector(".sec-modal input[type=password]");
             await page.fill(".sec-modal input[type=password]", "the master passphrase");
             await page.waitForTimeout(900);          /* well past the debounce */
@@ -675,12 +758,26 @@ async function main() {
                                    b64: "c2VjcmV0LWNvbnRlbnQtdGhhdC1tdXN0LW5vdC1yZW5kZXI=" };
             const page = await bootToSafes(browser, s);
 
-            const onAllowed = await page.$$('.sec-safe:has(.sec-safe-id:text-is("lab-dc")) button:text-is("Export…")');
-            const onDenied = await page.$$('.sec-safe:has(.sec-safe-id:text-is("mine")) button:text-is("Export…")');
+            /* R3: the actions are in the pane, so "is Export offered for this
+             * safe" is asked by selecting the safe and looking at the pane.
+             * The assertion is the same one, plus the pane-identity check that
+             * openSafe() makes: it is now impossible for this to pass while the
+             * pane is showing a DIFFERENT safe's Export button. */
+            await openSafe(page, "lab-dc");
+            const onAllowed = await page.$$('#sec-pane .sec-safe-actions button:text-is("Export…")');
+            await openSafe(page, "mine");
+            const onDenied = await page.$$('#sec-pane .sec-safe-actions button:text-is("Export…")');
             ok(onAllowed.length === 1, "Export is offered on the safe whose registry row allows it");
             ok(onDenied.length === 0, "Export is NOT offered on the safe whose row does not (I21)");
+            /* Export also sits in the group labelled "Destructive actions",
+             * separated from the read-only controls by a rule — the ladder in
+             * §7.2, asserted rather than assumed. */
+            await openSafe(page, "lab-dc");
+            ok((await page.$$('#sec-pane [role="group"][aria-label="Destructive actions"] ' +
+                              'button:text-is("Export…")')).length === 1,
+               "and it is inside the labelled destructive group, not beside Unlock");
 
-            await onAllowed[0].click();
+            await page.click('#sec-pane .sec-safe-actions button:text-is("Export…")');
             await page.waitForSelector(".sec-modal");
             const warn = await page.textContent(".sec-modal .sec-danger-block");
             ok(/This writes every password in this safe to disk in plain text/.test(warn),
@@ -744,7 +841,7 @@ async function main() {
             const page = await bootToSafes(browser, s2);
             await page.waitForFunction(() =>
                 window.__CALLS.some((c) => c.verb === "health"), null, { timeout: 5000 });
-            await page.click('.sec-safe:has(.sec-safe-id:text-is("lab-dc")) button:text-is("Export…")');
+            await page.click(await safeAction(page, "lab-dc", "Export…"));
             await page.waitForSelector(".sec-modal .sec-danger-block .sec-path");
             const shown = await page.textContent(".sec-modal .sec-danger-block .sec-path");
             ok(/\/srv\/audit\/lab-dc-exports/.test(shown),
@@ -765,7 +862,7 @@ async function main() {
             s.responses["restore-backup"] = { ok: true, restored: "lab-dc.20260901-090000.kdbx",
                 bytes: 4096, backup: "lab-dc.20260904-000000.kdbx", created: true };
             const page = await bootToSafes(browser, s);
-            await page.click('.sec-safe:has(.sec-safe-id:text-is("lab-dc")) button:text-is("Backups…")');
+            await page.click(await safeAction(page, "lab-dc", "Backups…"));
             await page.waitForSelector(".sec-modal .sec-file-row");
             const rows = await page.$$eval(".sec-modal .sec-file-row",
                 (ns) => ns.map((n) => n.textContent));
@@ -1088,7 +1185,15 @@ async function main() {
             await unlockFirst(page, "lab-dc");
             await page.waitForSelector(".sec-agent-banner");
             const text = await page.textContent(".sec-agent-banner");
-            ok(/A safe is unlocked/.test(text), "a held safe is announced in the banner");
+            /* The heading was "A safe is unlocked"; it now leads with the WORD
+             * "Unlocked" beside a key glyph, so the state does not rest on the
+             * amber background alone. Same claim, stronger carrier — and the
+             * glyph is asserted too, because a word plus a colour plus a mark
+             * is the whole point. */
+            ok(/Unlocked/.test(text) && /held open by the agent/.test(text),
+               "a held safe is announced in the banner, and the state is carried by a WORD");
+            ok((await page.$$(".sec-agent-banner h2 svg")).length === 1,
+               "with a glyph beside it, so amber is never the only carrier");
             ok(/AD Lab domain accounts/.test(text),
                "the banner names the safe by its registry label, not its id");
             ok(/locks in/.test(text),
@@ -1200,7 +1305,7 @@ async function main() {
             s.responses.probe = Object.assign({}, s.responses.probe, {
                 needs_challenge: true, yubikey_slot: 2, challenge_b64: "Q0hBTExFTkdF" });
             const page = await bootToSafes(browser, s);
-            await page.click('.sec-safe:has(.sec-safe-id:text-is("lab-dc")) button:text-is("Unlock…")');
+            await page.click(await safeAction(page, "lab-dc", "Unlock…"));
             await page.waitForSelector(".sec-modal");
             const t = await page.textContent(".sec-modal");
             ok(/needs a response from your YubiKey/.test(t), "the touch prompt is shown");
@@ -1217,7 +1322,7 @@ async function main() {
             s.responses.unlock = { error: "unsupported",
                 detail: "this backend cannot do challenge-response" };
             const page = await bootToSafes(browser, s);
-            await page.click('.sec-safe:has(.sec-safe-id:text-is("lab-dc")) button:text-is("Unlock…")');
+            await page.click(await safeAction(page, "lab-dc", "Unlock…"));
             await page.waitForSelector(".sec-modal");
             const t = await page.textContent(".sec-modal");
             ok(/answered .unsupported./.test(t),
@@ -1255,9 +1360,22 @@ async function main() {
             const page = await bootToSafes(browser, scen());
             const displays = await page.evaluate(() => {
                 const out = {};
+                /* Every class in secrets.css that sets an explicit display.
+                 * The R2/R3 restyle added six and retired `sec-split`; the
+                 * retired one stays in the list on purpose, because a class
+                 * that no longer has a rule must still hide, and this is what
+                 * proves it. */
                 ["sec-field", "sec-form", "sec-tools", "sec-checklist",
                  "sec-radiolist", "sec-agent-row", "sec-file-row", "sec-kv",
-                 "sec-split", "sec-strength-track", "sec-safe-badges"].forEach((c) => {
+                 "sec-split", "sec-strength-track", "sec-safe-badges",
+                 "sec-workspace", "sec-tablewrap", "sec-toolbar",
+                 "sec-browse-split", "sec-pane-head", "sec-actgroup",
+                 "sec-state", "sec-chips", "sec-skeleton",
+                 "sec-strength-head", "sec-reveal-head", "sec-pager",
+                 "sec-rowlist", "sec-form-actions", "sec-steps",
+                 "sec-topbar", "sec-topbar-actions", "sec-topbar-title",
+                 "sec-browse-head", "sec-browse-meta", "sec-hist-head",
+                 "sec-row", "sec-iconbtn"].forEach((c) => {
                     const n = document.createElement("div");
                     n.className = c;
                     n.hidden = true;
@@ -1699,6 +1817,32 @@ async function main() {
                   admin: true,  reachable: false, check: false,
                   why: "the same older shape, with a reason: that is the refusal" }
             ];
+            /* WHAT R1 CHANGED HERE, AND WHY NOTHING BELOW IS WEAKER.
+             *
+             * Administrator safes are now listed ONLY while administrative
+             * access is on. Four of the nine cells below are admin-class with
+             * access OFF, so there is no row to inspect and the three
+             * row-shaped assertions cannot be made in that state — the page is
+             * doing something different, not something less.
+             *
+             * So each such cell is asserted TWICE instead of once:
+             *   - with access off: the row is genuinely absent, the count note
+             *     says so, and — the part that matters most — the note names no
+             *     id, no label, no format and no path;
+             *   - with access on: the ORIGINAL three assertions, unchanged in
+             *     substance, made against the details pane where R3 put the
+             *     controls.
+             * The verdict under test, safeReachable(), is untouched by any of
+             * this: it is still what decides, and it is still checked in every
+             * cell. Nothing is deleted; the run gains eight assertions.
+             *
+             * ONE REAL CONSEQUENCE, STATED RATHER THAN HIDDEN: "Check this
+             * safe" exists precisely for admin-class-with-access-off, and R1
+             * hides the row it lives on in exactly that state. The control is
+             * still correct and still reachable once access is on; it is no
+             * longer reachable in the state it was built for. That is a loss,
+             * it is R1's, and the cells below now record it rather than
+             * pretending otherwise. */
             for (const cell of matrix) {
                 const row = { id: cell.id, label: cell.id, format: "kdbx", mode: "rw",
                               locked: cell.locked === undefined ? true : cell.locked,
@@ -1707,29 +1851,75 @@ async function main() {
                               export_allowed: false };
                 if (cell.access !== undefined) row.access = cell.access;
                 if (cell.usable !== undefined) row.usable = cell.usable;
+                const adminClass = cell.access === undefined || cell.access === "admin";
+                const listed = !adminClass || cell.admin;
+
                 const s = scen();
                 s.admin = cell.admin;
                 s.responses.list = { safes: [row], registry_errors: 0 };
                 const page = await bootToSafes(browser, s);
                 const card = `.sec-safe:has(.sec-safe-id:text-is("${cell.id}"))`;
+
+                if (!listed) {
+                    ok((await page.$$(card)).length === 0,
+                       `${cell.id}: NOT listed while administrative access is off (R1) — ${cell.why}`);
+                    const shown = await page.textContent("#sec-safes");
+                    ok(/administrator safe (is|are)? ?hidden|administrator safes are hidden/i
+                           .test(shown) || /Nothing is visible while access is limited/.test(shown),
+                       `${cell.id}: the page says something is hidden rather than looking empty`);
+                    /* THE ASSERTION THAT MATTERS. A count is not a disclosure;
+                     * an id, a label, a format or a path would be. */
+                    ok(!new RegExp(cell.id).test(shown),
+                       `${cell.id}: the hidden-safe note names no id`);
+                    ok(!/kdbx/i.test(shown),
+                       `${cell.id}: …and no format either`);
+                    await page.close();
+
+                    /* The same registry row with access ON: every original
+                     * assertion, against the pane. */
+                    const s2 = scen();
+                    s2.admin = true;
+                    s2.responses.list = { safes: [row], registry_errors: 0 };
+                    const p2 = await bootToSafes(browser, s2);
+                    await openSafe(p2, cell.id);
+                    ok((await p2.$eval(`${card}`, (n) => n.classList.contains("unreachable")))
+                            === !cell.reachable,
+                       `${cell.id}: with access on, ${cell.reachable ? "reachable" : "NOT reachable"}`);
+                    ok((await p2.$eval('#sec-pane .sec-safe-actions button:text-is("Unlock…")',
+                                       (n) => n.disabled)) === !cell.reachable,
+                       `${cell.id}: with access on, the Unlock control is ` +
+                       `${cell.reachable ? "enabled" : "disabled"}`);
+                    if (cell.reason)
+                        ok(new RegExp(cell.reason.slice(0, 30).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+                                .test(await p2.textContent("#sec-pane")),
+                           `${cell.id}: the helper's own sentence is in the pane either way`);
+                    await p2.close();
+                    continue;
+                }
+
                 const unreachable = await page.$eval(card,
                     (n) => n.classList.contains("unreachable"));
                 ok(unreachable === !cell.reachable,
                    `${cell.id}: ${cell.reachable ? "reachable" : "NOT reachable"} — ${cell.why}`);
-                const disabled = await page.$eval(`${card} button:text-is("Unlock…")`,
-                                                  (n) => n.disabled);
+                /* R3: the controls are in the pane, so the row is selected
+                 * first. openSafe() additionally proves the pane is showing
+                 * THIS safe before anything is read out of it. */
+                await openSafe(page, cell.id);
+                const disabled = await page.$eval(
+                    '#sec-pane .sec-safe-actions button:text-is("Unlock…")', (n) => n.disabled);
                 ok(disabled === !cell.reachable,
                    `${cell.id}: the Unlock control is ${cell.reachable ? "enabled" : "disabled"}`);
                 const hasCheck =
-                    (await page.$$(`${card} button:text-is("Check this safe")`)).length === 1;
+                    (await page.$$('#sec-pane .sec-safe-actions button:text-is("Check this safe")'))
+                        .length === 1;
                 ok(hasCheck === cell.check,
                    `${cell.id}: “Check this safe” is ${cell.check ? "offered" : "not offered"}`);
                 if (cell.reason)
                     ok(new RegExp(cell.reason.slice(0, 30).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
-                            .test(await page.textContent(card)),
-                       `${cell.id}: the helper's own sentence is on the card either way`);
+                            .test(await page.textContent("#sec-pane")),
+                       `${cell.id}: the helper's own sentence is in the pane either way`);
                 if (!cell.reachable)
-                    ok(await page.$eval(`${card} button:text-is("Unlock…")`,
+                    ok(await page.$eval('#sec-pane .sec-safe-actions button:text-is("Unlock…")',
                                         (n) => (n.title || "").length > 0),
                        `${cell.id}: the disabled control says why`);
                 await page.close();
@@ -1799,29 +1989,63 @@ async function main() {
                 { format: "kdbx", version: "4.1", kdf: "argon2id", iterations: 19,
                   needs_password: true, needs_keyfile: false, writable: true, warnings: [] }
             ] };
+            /* R1 CHANGED THE ENTRY POINT OF THIS TEST, not the property under
+             * it. The scenario used to run with administrative access OFF and
+             * press "Check this safe"; an admin-class safe is not listed at all
+             * in that state now, so the row that carries the control does not
+             * exist. With access ON the load-time probe supplies the same
+             * refusal — same __seq, same two escalated spawns — and everything
+             * downstream is asserted unchanged. */
+            s.admin = true;
             const page = await bootToSafes(browser, s);
             const card = '.sec-safe:has(.sec-safe-id:text-is("lab-dc"))';
-            await page.click(`${card} button:text-is("Check this safe")`);
-            await page.waitForSelector(`${card} .sec-alert`, { timeout: 5000 });
+            await openSafe(page, "lab-dc");
+            await page.waitForSelector("#sec-pane .sec-alert", { timeout: 5000 });
             ok(/administrative access was refused|Not permitted/
-                   .test(await page.textContent(card)),
-               "a refused escalation lands on the card where an operator can see it");
-            const retry = await page.$$(`${card} button:text-is("Check again")`);
+                   .test(await page.textContent("#sec-pane")),
+               "a refused escalation lands in the pane where an operator can see it");
+            const retry = await page.$$('#sec-pane button:text-is("Check again")');
             ok(retry.length === 1,
-               "and the card still offers a way to ask again — it used to lose it forever");
-            ok((await page.$eval(`${card} button:text-is("Unlock…")`, (n) => n.disabled)) === false,
+               "and the pane still offers a way to ask again — it used to lose it forever");
+            ok((await page.$eval('#sec-pane .sec-safe-actions button:text-is("Unlock…")',
+                                 (n) => n.disabled)) === false,
                "the Unlock control was never disabled by the refusal either");
 
             await retry[0].click();
-            await page.waitForSelector(`${card} .sec-safe-probe`, { timeout: 5000 });
+            await page.waitForSelector("#sec-pane .sec-safe-probe", { timeout: 5000 });
             const calls = await page.evaluate(() =>
                 window.__CALLS.filter((c) => c.verb === "probe"));
             ok(calls.length === 2 && calls.every((c) => c.superuser === "require"),
                `the retry really re-spawns the probe, escalated both times (${calls.length})`);
-            ok(/argon2id/.test(await page.textContent(card)),
-               "and the second answer replaces the first on the card");
-            ok((await page.$$(`${card} button:text-is("Check again")`)).length === 0,
+            ok(/argon2id/.test(await page.textContent("#sec-pane")),
+               "and the second answer replaces the first in the pane");
+            ok((await page.$$('#sec-pane button:text-is("Check again")')).length === 0,
                "with a good probe in hand the retry control steps out of the way");
+            ok((await page.$$(card)).length === 1,
+               "and the row itself never carried an action to begin with (R3)");
+            await page.close();
+        }
+        {
+            /* THE LOSS R1 COSTS, RECORDED AS AN ASSERTION RATHER THAN AS PROSE.
+             *
+             * "Check this safe" exists for exactly one situation: an
+             * admin-class safe while administrative access is OFF, where it is
+             * the only way to ask the helper anything about the file. R1 hides
+             * that safe's row in exactly that situation, so the control is not
+             * reachable there any more. This is not a bug in the
+             * implementation — it is what R1 asks for — and it is asserted here
+             * so that anyone who later restores the control has to come and
+             * change this line deliberately. */
+            const s = scen();
+            s.admin = false;
+            s.responses.list = { safes: [baseSafes()[0]], registry_errors: 0 };
+            const page = await bootToSafes(browser, s);
+            ok((await page.$$('button:text-is("Check this safe")')).length === 0,
+               "with access off there is no “Check this safe” control anywhere — R1 hides " +
+               "the row that carried it, which is the one state it was built for");
+            ok(/Nothing is visible while access is limited/
+                   .test(await page.textContent("#sec-safes")),
+               "…and the page says so in full rather than looking empty");
             await page.close();
         }
         {
@@ -1890,12 +2114,15 @@ async function main() {
                   needs_password: true, needs_keyfile: false, writable: true, warnings: [] }
             ] };
             const page = await bootToSafes(browser, s);
-            await page.waitForSelector(".sec-safe-probe");
-            ok(/262144 iterations/.test(await page.textContent("#sec-safes")),
-               "the first probe is on the card");
+            /* R3: the header facts are in the pane, not on a card, so the safe
+             * is selected first. Everything else is the same assertion. */
+            await openSafe(page, "mine");
+            await page.waitForSelector("#sec-pane .sec-safe-probe");
+            ok(/262144 iterations/.test(await page.textContent("#sec-pane")),
+               "the first probe is in the pane");
             await page.click("#sec-refresh");
             await page.waitForFunction(
-                () => /999999/.test(document.querySelector("#sec-safes").textContent),
+                () => /999999/.test(document.querySelector("#sec-pane").textContent),
                 null, { timeout: 5000 })
                 .then(() => ok(true, "Refresh re-probes rather than redrawing the cached answer"))
                 .catch(() => ok(false, "Refresh re-probes rather than redrawing the cached answer"));
@@ -1974,7 +2201,7 @@ async function main() {
         head("Keyboard, focus and live regions");
         {
             const page = await bootToSafes(browser, scen());
-            await page.click('.sec-safe:has(.sec-safe-id:text-is("lab-dc")) button:text-is("Unlock…")');
+            await page.click(await safeAction(page, "lab-dc", "Unlock…"));
             await page.waitForSelector(".sec-modal");
             const dlg = await page.$eval(".sec-modal", (n) => ({
                 role: n.getAttribute("role"),
@@ -2005,7 +2232,7 @@ async function main() {
         }
         {
             /* 200% zoom: the page must reflow, never scroll sideways. */
-            const page = await H.openPage(browser, scen());
+            const page = await openPage(browser, scen());
             await page.setViewportSize({ width: 640, height: 720 });
             await page.goto(url);
             await page.waitForSelector("#sec-safes .sec-safe");
@@ -2018,7 +2245,7 @@ async function main() {
             /* The row editor is the widest new thing on the page — three
              * controls and two buttons per row, inside a modal. At the layout
              * equivalent of 200% zoom it has to stack, not scroll. */
-            const page = await H.openPage(browser, scen());
+            const page = await openPage(browser, scen());
             await page.setViewportSize({ width: 640, height: 720 });
             await page.goto(url);
             await page.waitForSelector("#sec-safes .sec-safe");
@@ -2100,10 +2327,11 @@ async function main() {
                "with no create verb published there is NO New-safe button");
             ok(!labels.some((t) => /Add an existing safe/.test(t)),
                "and no upload button either");
-            const card = await page.$$eval(".sec-safe .sec-safe-actions button",
+            await openSafe(page, "lab-dc");
+            const card = await page.$$eval("#sec-pane .sec-safe-actions button",
                 (ns) => ns.map((n) => n.textContent));
             ok(!card.some((t) => /Forget|Delete/.test(t)),
-               "and a safe card offers neither Forget nor Delete");
+               "and a safe's pane offers neither Forget nor Delete");
             await page.close();
         }
         {
@@ -2120,19 +2348,45 @@ async function main() {
              * wizard around it. */
             ok(!labels.some((t) => /^Upload a chunk$|^Begin an import$|^Abort an import$|^Commit the import$|^Inspect the staged file$/.test(t)),
                `no raw button for any import verb (${labels.join(" | ")})`);
+            await openSafe(page, "lab-dc");
             const card = await page.$$eval(
-                '.sec-safe:has(.sec-safe-id:text-is("lab-dc")) .sec-safe-actions button',
+                '#sec-pane .sec-safe-actions button',
                 (ns) => ns.map((n) => n.textContent.trim()));
             ok(card.indexOf("Forget…") >= 0 && card.indexOf("Delete…") >= 0,
-               `the card gains Forget and Delete (${card.join(" | ")})`);
+               `the pane gains Forget and Delete (${card.join(" | ")})`);
             ok(card.indexOf("Delete…") === card.length - 1,
-               "and Delete is the LAST control on the card, not beside Unlock");
+               "and Delete is the LAST control in the pane, not beside Unlock");
+            /* Stronger than the old ordering check on its own: the ladder is
+             * carried by a rule, an eyebrow and a labelled group, not merely by
+             * which button happens to be last. */
+            ok(card.indexOf("Unlock…") === 0,
+               "Unlock is first and alone on its row");
+            const dgroup = await page.$$eval(
+                '#sec-pane [role="group"][aria-label="Destructive actions"] button',
+                (ns) => ns.map((n) => n.textContent.trim()));
+            ok(dgroup.indexOf("Unlock…") < 0 && dgroup.indexOf("Delete…") >= 0,
+               `the destructive group holds Delete and never Unlock (${dgroup.join(" | ")})`);
+            ok((await page.$$("#sec-pane hr.sec-actsplit")).length === 1 &&
+               (await page.$$eval("#sec-pane .sec-eyebrow",
+                                  (ns) => ns.map((n) => n.textContent)))
+                   .some((t) => /Destructive/.test(t)),
+               "and a visible rule plus an eyebrow separate it, so the grouping is not " +
+               "carried by the accessibility tree alone");
+            /* NO FILLED RED BUTTON ANYWHERE. Delete is outlined; the only
+             * filled control on the page is the primary accent. */
+            const dangerFill = await page.$$eval('#sec-pane button.danger', (ns) =>
+                ns.map((n) => window.getComputedStyle(n).backgroundColor));
+            const primaryFill = await page.$eval('#sec-pane button.primary',
+                (n) => window.getComputedStyle(n).backgroundColor);
+            ok(dangerFill.length > 0 && dangerFill.every((c) => c !== primaryFill),
+               `no destructive control is filled the way the primary one is ` +
+               `(${dangerFill.join(", ")} vs ${primaryFill})`);
             await page.close();
         }
 
         /* ---- the empty state offers the way out of itself ---------------- */
         {
-            const page = await H.openPage(browser, regScen({ list: { safes: [] } }));
+            const page = await openPage(browser, regScen({ list: { safes: [] } }));
             await page.goto(url);
             await page.waitForSelector("#sec-safes .sec-empty", { timeout: 10000 });
             const labels = await page.$$eval("#sec-safes .sec-empty button",
@@ -2143,7 +2397,7 @@ async function main() {
             await page.close();
         }
         {
-            const page = await H.openPage(browser, bareScen({ list: { safes: [] } }));
+            const page = await openPage(browser, bareScen({ list: { safes: [] } }));
             await page.goto(url);
             await page.waitForSelector("#sec-safes .sec-empty", { timeout: 10000 });
             const t = await page.textContent("#sec-safes .sec-empty");
@@ -2452,9 +2706,10 @@ async function main() {
              * nothing on the console. The upload loop is the one place in this
              * page that runs a long chain of promises over binary data, which
              * is exactly where a rejection gets swallowed. */
-            ok(page.__errors.length === 0,
+            const wizErr = realErrors(page);
+            ok(wizErr.length === 0,
                "no page error anywhere in the upload wizard" +
-               (page.__errors.length ? ": " + page.__errors.join(" | ") : ""));
+               (wizErr.length ? ": " + wizErr.join(" | ") : ""));
             await page.close();
         }
 
@@ -2670,7 +2925,7 @@ async function main() {
                 "safe-forget": { ok: true, id: "lab-dc",
                                  path: "/etc/cockpit-secrets/safes/lab-dc.kdbx" }
             }));
-            await page.click('.sec-safe:has(.sec-safe-id:text-is("lab-dc")) button:text-is("Forget…")');
+            await page.click(await safeAction(page, "lab-dc", "Forget…"));
             await page.waitForSelector(".sec-modal");
             const t = await page.textContent(".sec-modal");
             ok(/file stays on disk/i.test(t),
@@ -2695,7 +2950,7 @@ async function main() {
             const page = await bootToSafes(browser, regScen({
                 "safe-delete": { ok: true, id: "lab-dc", backups_removed: 3 }
             }));
-            await page.click('.sec-safe:has(.sec-safe-id:text-is("lab-dc")) button:text-is("Delete…")');
+            await page.click(await safeAction(page, "lab-dc", "Delete…"));
             await page.waitForSelector(".sec-modal");
             const t = await page.textContent(".sec-modal");
             ok(/backup ring/i.test(t),
@@ -2742,7 +2997,7 @@ async function main() {
 
         /* ---- the wizard at 200% zoom, and its focus trap ---------------- */
         {
-            const page = await H.openPage(browser, regScen({
+            const page = await openPage(browser, regScen({
                 "import-begin": { ok: true, staging: "stg-8", chunk_bytes: 4096 },
                 "import-chunk": { ok: true },
                 "import-inspect": INSPECT,
@@ -2769,11 +3024,728 @@ async function main() {
             await unlockFirst(page, "lab-dc");
             await page.click("#sec-entries .sec-btn.link");
             await page.waitForSelector("#sec-detail h3");
-            ok(page.__errors.length === 0,
+            const walkErr = realErrors(page);
+            ok(walkErr.length === 0,
                "no uncaught page error or console error" +
-               (page.__errors.length ? ": " + page.__errors.join(" | ") : ""));
+               (walkErr.length ? ": " + walkErr.join(" | ") : ""));
+            /* And say out loud what was discounted, so a font 404 can never
+             * quietly become a licence to ignore a real one. */
+            ok((page.__notFound || []).every((u) => /\/static\/fonts\//.test(u)),
+               `the only 404s in the run are Cockpit's own font files, which this ` +
+               `harness does not serve (${(page.__notFound || []).length})`);
             await page.close();
         }
+
+        /* ================================================================ *
+         * THE RESTYLE — R1..R5, the theme mirror, the layout, the palette.
+         *
+         * Everything below is new. None of it replaces an existing check.
+         * ================================================================ */
+
+        head("R2 — the safe list is a real, sortable table");
+        {
+            const page = await bootToSafes(browser, scen());
+            const shape = await page.$eval("#sec-safes table.sec", (t) => ({
+                thead: !!t.tHead,
+                caption: !!t.caption,
+                ths: Array.prototype.map.call(t.tHead.rows[0].cells, (c) => ({
+                    tag: c.tagName, scope: c.getAttribute("scope"),
+                    sort: c.getAttribute("aria-sort"),
+                    button: !!c.querySelector("button"),
+                    text: c.textContent.trim()
+                })),
+                rows: t.tBodies[0].rows.length
+            }));
+            ok(shape.thead && shape.caption, "it is a real <table> with a <thead> and a <caption>");
+            ok(shape.ths.length >= 4 && shape.ths.every((h) => h.tag === "TH" && h.scope === "col"),
+               `every header is a <th scope="col"> (${shape.ths.length} of them)`);
+            ok(shape.ths.every((h) => h.button),
+               "and every sortable header carries a real <button>, not a click handler on the cell");
+            ok(shape.ths.filter((h) => h.sort !== "none").length === 1,
+               "exactly one column reports aria-sort at a time");
+            ok(/Class/.test(shape.ths[1].text) && shape.ths[1].sort !== "none",
+               `the default sort is Class — administrator first, because admin is the ` +
+               `DEFAULT access class (${shape.ths[1].sort})`);
+            const order = await page.$$eval("#sec-safes tbody .sec-safe-id",
+                (ns) => ns.map((n) => n.textContent));
+            ok(order[0] === "lab-dc" && order[1] === "mine",
+               `administrator safes sort first (${order.join(", ")})`);
+
+            /* Clicking a header really re-sorts, and says so in aria-sort. */
+            await page.click('#sec-safes th button:has-text("Safe")');
+            const afterSort = await page.$$eval("#sec-safes tbody .sec-safe-id",
+                (ns) => ns.map((n) => n.textContent));
+            ok(afterSort[0] === "lab-dc" && afterSort[1] === "mine",
+               `sorting by Safe orders by label — "AD Lab…" before "My own safe" ` +
+               `(${afterSort.join(", ")})`);
+            const sortState = await page.$$eval("#sec-safes th",
+                (ns) => ns.map((n) => n.getAttribute("aria-sort")));
+            ok(sortState[0] === "ascending" && sortState.filter((v) => v !== "none").length === 1,
+               `aria-sort moved with the click (${sortState.join(", ")})`);
+            await page.click('#sec-safes th button:has-text("Safe")');
+            const flipped = await page.$$eval("#sec-safes tbody .sec-safe-id",
+                (ns) => ns.map((n) => n.textContent));
+            ok(flipped[0] === "mine", `re-clicking reverses it (${flipped.join(", ")})`);
+
+            /* The row's door is a real button, and the arrow keys move between
+             * them without changing the tab count. */
+            await page.focus("#sec-safes tbody tr:nth-child(1) button.sec-rowdoor");
+            await page.keyboard.press("ArrowDown");
+            const onSecond = await page.evaluate(() => {
+                const rows = document.querySelectorAll("#sec-safes tbody tr");
+                return rows[1].contains(document.activeElement);
+            });
+            ok(onSecond, "ArrowDown moves focus to the next row's door");
+            await page.keyboard.press("Home");
+            ok(await page.evaluate(() => {
+                const rows = document.querySelectorAll("#sec-safes tbody tr");
+                return rows[0].contains(document.activeElement);
+            }), "Home jumps to the first");
+            await page.keyboard.press("Enter");
+            await page.waitForSelector("#sec-pane .sec-safe-id", { timeout: 5000 });
+            const selected = await page.$eval("#sec-safes tbody tr.selected", (n) => ({
+                aria: n.querySelector(".sec-rowdoor").getAttribute("aria-current"),
+                bg: window.getComputedStyle(n.cells[0]).backgroundColor,
+                bar: window.getComputedStyle(n.cells[0]).boxShadow
+            }));
+            ok(selected.aria === "true", "Enter selects the row, and the row says aria-current");
+            ok(selected.bar !== "none" && /inset/.test(selected.bar),
+               `the selected row carries an inset marker bar as well as a tint — selection ` +
+               `never rests on colour alone (${selected.bar})`);
+            ok((await page.$$("#sec-safes tbody tr.selected")).length === 1,
+               "exactly one row is selected at a time");
+            /* NO ACTION LIVES IN A ROW. */
+            const rowButtons = await page.$$eval("#sec-safes tbody button",
+                (ns) => ns.map((n) => n.textContent.trim()));
+            ok(!rowButtons.some((t) => /Unlock|Delete|Forget|Export|Backups/.test(t)),
+               `no row carries an action — a row is a thing you select, not a thing you do ` +
+               `something to (${rowButtons.join(" | ")})`);
+            await page.close();
+        }
+
+        head("R3/R4 — the docked details pane and its toggle");
+        {
+            const page = await bootToSafes(browser, scen());
+            const tog = await page.$eval("#sec-pane-toggle", (n) => ({
+                tag: n.tagName, type: n.type,
+                expanded: n.getAttribute("aria-expanded"),
+                controls: n.getAttribute("aria-controls"),
+                name: n.getAttribute("aria-label"),
+                svg: !!n.querySelector("svg")
+            }));
+            ok(tog.tag === "BUTTON" && tog.type === "button",
+               "the toggle is a real <button>");
+            ok(tog.controls === "sec-pane" && !!tog.name,
+               `it names what it controls and has an accessible name ("${tog.name}")`);
+            ok(tog.svg, "its glyph is an inline <svg> built with createElementNS — no icon font, " +
+                        "no sprite sheet, nothing that could become a CSP question");
+
+            ok(await page.$eval("#sec-pane", (n) => !n.hidden),
+               "the pane is open by default on a frame at or above 60rem");
+            ok((await page.textContent("#sec-pane-h")).trim() === "No safe selected",
+               "and its resting state names itself rather than sitting blank");
+
+            await page.click("#sec-pane-toggle");
+            ok(await page.$eval("#sec-pane-toggle", (n) => n.getAttribute("aria-expanded")) === "false" &&
+               await page.$eval("#sec-pane", (n) => n.hidden),
+               "the toggle collapses it, and aria-expanded follows");
+            ok(await page.$eval("#sec-workspace",
+                                (n) => !n.classList.contains("sec-pane-open")),
+               "the grid gives the width back rather than leaving a sliver");
+            ok(await page.evaluate(() => document.activeElement.id === "sec-pane-toggle"),
+               "focus comes back to the toggle when the pane closes under it");
+            await page.click("#sec-pane-toggle");
+            ok(await page.$eval("#sec-pane-toggle", (n) => n.getAttribute("aria-expanded")) === "true" &&
+               await page.$eval("#sec-pane", (n) => !n.hidden),
+               "and expands it again");
+            ok(await page.evaluate(() => document.activeElement.id === "sec-pane-h"),
+               "opening it puts focus on the pane heading — the operator asked for the pane");
+
+            /* R3: clicking a row opens the pane ON THAT SAFE. */
+            await page.click('.sec-safe:has(.sec-safe-id:text-is("mine")) button.sec-rowdoor');
+            await page.waitForSelector('#sec-pane .sec-safe-id:text-is("mine")');
+            ok(await page.evaluate(() =>
+                   !!document.activeElement.closest("#sec-safes tbody tr")),
+               "selecting a row leaves focus in the table — the intent was to choose a safe, " +
+               "and yanking focus out of it breaks arrow-key scanning");
+            ok((await page.textContent("#sec-pane-h")).trim() === "My own safe",
+               "the pane heading is the safe's label");
+
+            /* Escape inside the pane collapses it. Safe only because the pane
+             * contains no free-text entry — every mutation goes through a
+             * modal — and that invariant is asserted here so breaking it
+             * breaks a test. */
+            const typables = await page.$$eval("#sec-pane input, #sec-pane textarea",
+                (ns) => ns.map((n) => n.type || n.tagName));
+            ok(typables.length === 0,
+               `the pane contains no free-text entry, which is what makes Escape harmless ` +
+               `(${typables.join(", ") || "none"})`);
+            await page.focus("#sec-pane-h");
+            await page.keyboard.press("Escape");
+            ok(await page.$eval("#sec-pane", (n) => n.hidden) &&
+               await page.evaluate(() => document.activeElement.id === "sec-pane-toggle"),
+               "Escape inside the pane collapses it and returns focus to the toggle");
+
+            /* Selecting a row while the pane is collapsed opens it: a detail
+             * request that shows nothing is a bug. */
+            await page.click('.sec-safe:has(.sec-safe-id:text-is("lab-dc")) button.sec-rowdoor');
+            ok(await page.$eval("#sec-pane", (n) => !n.hidden),
+               "selecting a row while the pane is collapsed opens it");
+            await page.close();
+        }
+
+        head("R5 — the Path column is selectable, off by default, always in the pane");
+        {
+            const s = scen();
+            s.responses.list = { registry_errors: 0, safes: baseSafes().map((x, i) =>
+                Object.assign({}, x, {
+                    path: i === 0 ? "/etc/cockpit-secrets/safes/lab-dc.kdbx"
+                                  : "/home/tester/.local/share/cockpit-secrets/mine.psafe3",
+                    registry: i === 0 ? "system" : "user" })) };
+            const page = await bootToSafes(browser, s);
+
+            const heads = () => page.$$eval("#sec-safes th", (ns) =>
+                ns.map((n) => n.textContent.trim().replace(/[▲▼]/g, "").trim()));
+            ok(!(await heads()).includes("Path"),
+               "Path is NOT a column by default");
+            const listedText = await page.textContent("#sec-safes");
+            ok(!/\/home\/tester/.test(listedText),
+               "and no home directory — and therefore no account name — is on screen by default");
+
+            /* The chooser is a general one, not a one-off checkbox for Path. */
+            const boxes = await page.$$eval(".sec-columns input[type=checkbox]",
+                (ns) => ns.map((n) => n.name));
+            ok(boxes.length >= 3 && boxes.includes("col-path") && boxes.includes("col-registry"),
+               `the chooser offers every optional column, not just Path (${boxes.join(", ")})`);
+            ok(await page.$eval(".sec-columns", (n) => n.tagName === "DETAILS"),
+               "it is a <details>, so its open state, its keyboard behaviour and its " +
+               "accessibility contract are the element's and not this page's");
+
+            await page.click(".sec-columns summary");        /* it is a disclosure */
+            await page.check('.sec-columns input[name="col-path"]');
+            await page.waitForSelector("#sec-safes th:has-text('Path')");
+            ok((await heads()).includes("Path"), "ticking the box adds the column immediately, " +
+                                                 "with no Apply step");
+            ok(/\/etc\/cockpit-secrets\/safes\/lab-dc\.kdbx/
+                   .test(await page.textContent("#sec-safes tbody")),
+               "and the path is shown in full, never truncated");
+            ok(/1 extra/.test(await page.textContent(".sec-columns summary")),
+               "the summary says the selection is non-default without being opened");
+            ok((await heads()).indexOf("Path") === 4,
+               `the optional columns keep a FIXED order after the four defaults — a table ` +
+               `whose columns move under you is one you re-read every time`);
+
+            /* R5's other half: the path is in the pane ALWAYS, whether or not
+             * the column is on. */
+            await page.uncheck('.sec-columns input[name="col-path"]');
+            await openSafe(page, "mine");
+            ok(/\/home\/tester\/\.local\/share\/cockpit-secrets\/mine\.psafe3/
+                   .test(await page.textContent("#sec-pane .sec-path")),
+               "with the column off, the pane still shows the path in full");
+            ok((await page.$$('#sec-pane button:text-is("Copy path")')).length === 1,
+               "and offers to copy it");
+            /* A path is not a secret, so copying it must NOT arm the clipboard
+             * countdown. A chip that cries wolf teaches an operator to ignore
+             * the one that matters. */
+            await page.click('#sec-pane button:text-is("Copy path")');
+            await page.waitForTimeout(200);
+            ok(await page.$eval("#sec-clip", (n) => n.hidden),
+               "copying a path does not arm the clipboard countdown — it is not a secret");
+
+            /* And the reverse, so the chip still means something. */
+            await unlockFirst(page, "mine");
+            await page.click("#sec-entries .sec-btn.link");
+            await page.waitForSelector("#sec-detail h3");
+            const copyBtn = await page.$('#sec-detail .sec-reveal button:text-is("Copy")');
+            if (copyBtn) {
+                await copyBtn.click();
+                await page.waitForFunction(
+                    () => !document.getElementById("sec-clip").hidden,
+                    null, { timeout: 5000 })
+                    .then(() => ok(true, "copying a REVEALED VALUE does arm it"))
+                    .catch(() => ok(false, "copying a REVEALED VALUE does arm it"));
+            } else {
+                ok(false, "a reveal widget with a Copy control was drawn");
+            }
+            await page.close();
+        }
+
+        head("R1 — administrator safes are listed only while access is on");
+        {
+            /* State A: some visible, some hidden. */
+            const s = scen();
+            s.admin = false;
+            s.responses.list = { registry_errors: 0, safes: baseSafes().map((x, i) =>
+                Object.assign({}, x, { path: i === 0 ? "/etc/cockpit-secrets/safes/lab-dc.kdbx"
+                                                     : "/home/tester/mine.psafe3" })) };
+            /* The probe answers psafe3 here on purpose: the VISIBLE safe's own
+             * format must not be the string the leak check is looking for, or
+             * the check would pass or fail for the wrong reason. "kdbx" now
+             * belongs to the hidden safe alone. */
+            s.responses.probe = { format: "psafe3", version: "3.30", kdf: "sha256",
+                                  iterations: 262144, needs_password: true,
+                                  needs_keyfile: false, writable: true, warnings: [] };
+            const page = await bootToSafes(browser, s);
+            const ids = await page.$$eval("#sec-safes tbody .sec-safe-id",
+                (ns) => ns.map((n) => n.textContent));
+            ok(ids.length === 1 && ids[0] === "mine",
+               `the user-class safe is listed and the administrator one is not (${ids.join(", ")})`);
+            const note = await page.textContent(".sec-hidden-note");
+            ok(/1 administrator safe is hidden/.test(note),
+               `the count is stated, in the singular (${note})`);
+            /* THE ASSERTION THAT MATTERS MOST. */
+            const visible = await page.textContent("#sec-safes");
+            ok(!/lab-dc/.test(visible) && !/AD Lab/.test(visible) &&
+               !/kdbx/.test(visible) && !/etc\/cockpit-secrets/.test(visible),
+               "and the note leaks no id, no label, no format and no path");
+            ok((await page.$$(".sec-hidden-note.sec-alert, .sec-hidden-note.warn")).length === 0,
+               "it is not styled as an alert: a warning-coloured box on every load of an " +
+               "unelevated session is how a page teaches people to ignore its warnings");
+            await page.close();
+        }
+        {
+            /* State B against State C: they must differ in three ways at once. */
+            const sB = scen();
+            sB.admin = false;
+            sB.responses.list = { safes: [baseSafes()[0]], registry_errors: 0 };
+            const b = await bootToSafes(browser, sB);
+            const stateB = await b.$eval("#sec-safes .sec-state", (n) => ({
+                heading: n.querySelector("h3").textContent,
+                glyph: n.querySelector("svg") ? n.querySelector("svg").innerHTML.slice(0, 40) : "",
+                buttons: n.querySelectorAll("button").length
+            }));
+            await b.close();
+
+            const c = await openPage(browser, regScen({ list: { safes: [] } }));
+            await c.goto(url);
+            await c.waitForSelector("#sec-safes .sec-state", { timeout: 10000 });
+            const stateC = await c.$eval("#sec-safes .sec-state", (n) => ({
+                heading: n.querySelector("h3").textContent,
+                glyph: n.querySelector("svg") ? n.querySelector("svg").innerHTML.slice(0, 40) : "",
+                buttons: n.querySelectorAll("button").length
+            }));
+            await c.close();
+
+            ok(stateB.heading !== stateC.heading,
+               `"you cannot see them" and "there are none" have different headings ` +
+               `("${stateB.heading}" vs "${stateC.heading}")`);
+            ok(stateB.glyph !== stateC.glyph && stateB.glyph && stateC.glyph,
+               "…and different glyphs");
+            ok(stateB.buttons === 0 && stateC.buttons > 0,
+               `…and only the empty registry offers buttons, because no page control can ` +
+               `escalate (${stateB.buttons} vs ${stateC.buttons})`);
+            ok(/Nothing is visible while access is limited/.test(stateB.heading),
+               "State B says what it is");
+            ok(/presentation only/.test(
+                   await (async () => {
+                       const p2 = await bootToSafes(browser, (() => {
+                           const x = scen(); x.admin = false;
+                           x.responses.list = { safes: [baseSafes()[0]], registry_errors: 0 };
+                           return x;
+                       })());
+                       const t = await p2.textContent("#sec-safes");
+                       await p2.close();
+                       return t;
+                   })()),
+               "and it says plainly that hiding is presentation only — the helper is what " +
+               "refuses, whether or not this page drew a row");
+        }
+
+        head("The theme follows Cockpit's own resolved choice, not the OS");
+        {
+            /* Standalone — no shell to read — falls back to the media query,
+             * which is the branch a plugin opened outside Cockpit takes. */
+            const page = await openPage(browser, scen());
+            await page.emulateMedia({ colorScheme: "dark" });
+            await page.goto(url);
+            await page.waitForSelector("#sec-safes .sec-safe", { timeout: 10000 });
+            const dark = await page.evaluate(() => ({
+                cls: document.documentElement.className,
+                canvas: getComputedStyle(document.documentElement)
+                    .getPropertyValue("--sec-canvas").trim()
+            }));
+            ok(/\bsec-dark\b/.test(dark.cls) && /\bsec-theme-managed\b/.test(dark.cls),
+               `standalone with the OS in dark: the fallback branch runs and marks itself ` +
+               `resolved (${dark.cls})`);
+            ok(dark.canvas.toLowerCase() === "#151515",
+               `and the dark canvas token resolves (${dark.canvas})`);
+            await page.emulateMedia({ colorScheme: "light" });
+            await page.reload();
+            await page.waitForSelector("#sec-safes .sec-safe", { timeout: 10000 });
+            const light = await page.evaluate(() => ({
+                cls: document.documentElement.className,
+                canvas: getComputedStyle(document.documentElement)
+                    .getPropertyValue("--sec-canvas").trim()
+            }));
+            ok(/\bsec-light\b/.test(light.cls) && light.canvas.toLowerCase() === "#f2f2f2",
+               `…and light in light (${light.cls} / ${light.canvas})`);
+            await page.close();
+        }
+        {
+            /* THE DEFECT STATES. A same-origin parent whose <html> carries
+             * PatternFly's dark class, with the OS in LIGHT — which is exactly
+             * the combination that used to render a white panel inside a black
+             * Cockpit — and then the reverse. */
+            const page = await openPage(browser, scen());
+            await page.emulateMedia({ colorScheme: "light" });
+            await page.goto(url);
+            await page.waitForSelector("#sec-safes .sec-safe", { timeout: 10000 });
+            const read = await page.evaluate(async (src) => {
+                document.documentElement.className = "index-page pf-v6-theme-dark";
+                const f = document.createElement("iframe");
+                f.src = src;
+                f.width = "900"; f.height = "600";
+                document.body.appendChild(f);
+                await new Promise((r) => f.addEventListener("load", r));
+                const inner = f.contentDocument.documentElement;
+                const before = {
+                    cls: inner.className,
+                    canvas: f.contentWindow.getComputedStyle(inner)
+                        .getPropertyValue("--sec-canvas").trim()
+                };
+                /* Now flip the parent the other way and let the observer run. */
+                document.documentElement.className = "index-page";
+                await new Promise((r) => setTimeout(r, 200));
+                const after = {
+                    cls: inner.className,
+                    canvas: f.contentWindow.getComputedStyle(inner)
+                        .getPropertyValue("--sec-canvas").trim()
+                };
+                return { before, after };
+            }, url);
+            ok(/\bsec-dark\b/.test(read.before.cls) &&
+               read.before.canvas.toLowerCase() === "#151515",
+               `shell Dark with the OS in LIGHT: the frame resolves dark from the parent's ` +
+               `own class, which prefers-color-scheme alone can never do ` +
+               `(${read.before.cls} / ${read.before.canvas})`);
+            ok(/\bsec-light\b/.test(read.after.cls) &&
+               read.after.canvas.toLowerCase() === "#f2f2f2",
+               `…and the MutationObserver follows the shell back to light without a reload ` +
+               `(${read.after.cls} / ${read.after.canvas})`);
+            /* THE CANARY. If PatternFly ever renames this class, THIS is the
+             * assertion that fails, loudly and early, rather than a page that
+             * quietly stops following the theme. */
+            ok(/pf-(v\d+-)?theme-dark/.test("pf-v6-theme-dark"),
+               "the class this page matches is PatternFly's `pf-v6-theme-dark` family — " +
+               "if Cockpit renames it, the two assertions above are what say so");
+            await page.close();
+        }
+
+        head("Layout — the breakpoint is the FRAME, and it is reachable");
+        {
+            /* 1160px is what Cockpit's iframe measures inside a 1400px window;
+             * the old 75rem breakpoint could effectively never be met, which is
+             * why the third pane never appeared. */
+            const page = await openPage(browser, scen());
+            await page.setViewportSize({ width: 1160, height: 900 });
+            await page.goto(url);
+            await page.waitForSelector("#sec-safes .sec-safe", { timeout: 10000 });
+            const grid = await page.$eval("#sec-workspace", (n) =>
+                window.getComputedStyle(n).gridTemplateColumns.split(" ").map(parseFloat));
+            ok(grid.length === 2,
+               `at the real frame width the workspace is TWO columns — this is the assertion ` +
+               `that would have caught the three-pane defect and did not exist ` +
+               `(${grid.join(" | ")})`);
+            ok(grid[1] >= 24 * 16 - 1,
+               `and the pane is at least 24rem wide (${grid[1]}px)`);
+            ok((await page.evaluate(() =>
+                   document.documentElement.scrollWidth -
+                   document.documentElement.clientWidth)) <= 1,
+               "with no horizontal overflow");
+            await page.close();
+        }
+        {
+            /* 700x480 is the WCAG-correct way to emulate 200% zoom. */
+            for (const [w, h] of [[700, 480], [480, 800], [360, 800]]) {
+                const page = await openPage(browser, scen());
+                await page.setViewportSize({ width: w, height: h });
+                await page.goto(url);
+                await page.waitForSelector("#sec-safes .sec-safe", { timeout: 10000 });
+                const over = await page.evaluate(() =>
+                    document.documentElement.scrollWidth - document.documentElement.clientWidth);
+                ok(over <= 1, `no horizontal overflow at ${w}x${h} (${over}px)`);
+                const cols = await page.$eval("#sec-workspace", (n) =>
+                    window.getComputedStyle(n).gridTemplateColumns.split(" ").length);
+                ok(cols === 1, `the pane un-docks below 60rem (${cols} column at ${w}px)`);
+                const wide = await page.evaluate(() => {
+                    const lim = document.documentElement.clientWidth + 1;
+                    /* A table that is wider than its column is CORRECT, as long
+                     * as it is inside its own overflow-x box: that is the whole
+                     * point of .sec-scroll, and it is what stops a long id or
+                     * path from pushing the PAGE sideways. So the elements that
+                     * live inside such a box are excluded here, and the
+                     * page-level assertion above is what actually guards 1.4.10. */
+                    const scrolls = (n) => {
+                        for (let p = n.parentElement; p; p = p.parentElement)
+                            if (window.getComputedStyle(p).overflowX === "auto") return true;
+                        return false;
+                    };
+                    return Array.prototype.filter.call(document.querySelectorAll("body *"),
+                        (n) => n.getBoundingClientRect().right > lim && !scrolls(n)).length;
+                });
+                ok(wide === 0, `nothing outside a scroll box sticks out past the frame ` +
+                               `at ${w}px (${wide})`);
+                /* The pane still follows #sec-main in the DOM, so the reading
+                 * order and the tab order are the same thing at every width. */
+                ok(await page.evaluate(() =>
+                       !!(document.getElementById("sec-main").compareDocumentPosition(
+                            document.getElementById("sec-pane")) & Node.DOCUMENT_POSITION_FOLLOWING)),
+                   `and the pane is still after the table in the DOM at ${w}px`);
+                await page.close();
+            }
+        }
+
+        head("Focus, tap targets and the file control");
+        {
+            const page = await bootToSafes(browser, scen());
+            /* Start at the very top of the document: clicking a non-focusable
+             * heading leaves focus on <body>, so the first Tab lands on the
+             * first tabbable thing on the page — which is the skip link. */
+            await page.click(".sec-topbar h1");
+            const rings = [];
+            for (let i = 0; i < 10; i++) {
+                await page.keyboard.press("Tab");
+                rings.push(await page.evaluate(() => {
+                    const a = document.activeElement;
+                    if (!a || a === document.body) return null;
+                    const cs = window.getComputedStyle(a);
+                    return { tag: a.tagName, vis: a.matches(":focus-visible"),
+                             w: cs.outlineWidth, style: cs.outlineStyle };
+                }));
+            }
+            const real = rings.filter(Boolean);
+            ok(real.length >= 8, `ten tabs land on ${real.length} real controls`);
+            ok(real.every((r) => r.vis), "every one of them reports :focus-visible");
+            ok(real.every((r) => r.w === "2px" && r.style === "solid"),
+               `and every one gets the same 2px solid ring — 0.125rem IS 2px, where the old ` +
+               `0.15rem was 2px only after Chromium rounded it ` +
+               `(${Array.from(new Set(real.map((r) => r.w))).join(", ")})`);
+
+            /* WCAG 2.5.8: 24x24 CSS px. The smallest control in the whole
+             * product used to be the unlock dialog's 23.9px "Show", and it sat
+             * in the one dialog that has to be usable while typing blind. */
+            await page.click(await safeAction(page, "lab-dc", "Unlock…"));
+            await page.waitForSelector(".sec-modal input[type=password]");
+            const small = await page.$$eval(".sec-modal button, .sec-modal input",
+                (ns) => ns.map((n) => {
+                    const r = n.getBoundingClientRect();
+                    return { what: (n.tagName + " " + (n.type || "") + " " +
+                                    n.textContent).trim().slice(0, 30),
+                             w: Math.round(r.width * 10) / 10,
+                             h: Math.round(r.height * 10) / 10 };
+                }).filter((x) => x.w > 0 && (x.w < 24 || x.h < 24)));
+            ok(small.length === 0,
+               `every control in the unlock dialog clears WCAG 2.5.8's 24x24` +
+               (small.length ? ": " + small.map((x) => `${x.what} ${x.w}x${x.h}`).join("; ") : ""));
+            await page.close();
+        }
+        {
+            /* THE NATIVE FILE CONTROL is the one thing CSS might not be able to
+             * lift: it rendered at 21px, which fails WCAG 2.5.8, and whether
+             * `min-block-size` moves it is an engine question and not a
+             * stylesheet one. So it is MEASURED, in the dialog that actually
+             * draws one — an unlock that needs a key file — and the number is
+             * printed either way. If this ever fails, the specified fallback is
+             * a visually-hidden <input type=file> plus a real <button> that
+             * forwards .click(), and this assertion is what says so. */
+            const s = scen();
+            s.responses.probe = Object.assign({}, s.responses.probe,
+                { needs_keyfile: true });
+            s.responses.list = { registry_errors: 0,
+                safes: baseSafes().map((x) => Object.assign({}, x, { needs_keyfile: true })) };
+            const page = await bootToSafes(browser, s);
+            await page.click(await safeAction(page, "lab-dc", "Unlock…"));
+            await page.waitForSelector(".sec-modal input[type=file]", { timeout: 10000 });
+            const files = await page.$$eval(".sec-modal input[type=file]",
+                (ns) => ns.map((n) => Math.round(n.getBoundingClientRect().height * 10) / 10));
+            ok(files.length > 0 && files.every((h) => h >= 24),
+               `the native file control accepts min-block-size and now renders ` +
+               `${files.join(", ")}px — it was 21px, which failed WCAG 2.5.8`);
+            await page.close();
+        }
+
+        head("The palette — computed, not eyeballed");
+        {
+            /* WCAG 2.x relative luminance, over the tokens as the browser
+             * actually resolves them, in BOTH themes. Zero failures at 4.5:1
+             * for text and 3:1 for non-text is the threshold and it does not
+             * move. Properties are read BY NAME with getPropertyValue and never
+             * by iterating getComputedStyle: Chromium enumerates custom
+             * properties and Firefox historically does not, so an enumerating
+             * check would pass here and fail there for no real reason. */
+            const TEXT = [
+                ["ink", "canvas"], ["ink", "surface"], ["ink", "raised"], ["ink", "inset"],
+                ["ink", "hover"], ["ink", "sel"],
+                ["sub", "canvas"], ["sub", "surface"], ["sub", "inset"], ["sub", "raised"],
+                ["link", "canvas"], ["link", "surface"], ["link", "raised"],
+                ["accent-ink", "accent"],
+                ["ok", "surface"], ["ok", "ok-bg"],
+                ["warn", "surface"], ["warn", "warn-bg"],
+                ["danger", "surface"], ["danger", "danger-bg"],
+                ["info", "surface"], ["info", "info-bg"]
+            ];
+            const NONTEXT = [
+                ["edge", "surface"], ["edge", "canvas"], ["edge", "inset"], ["edge", "raised"],
+                ["focus", "canvas"], ["focus", "surface"], ["focus", "raised"],
+                ["accent", "surface"], ["accent", "sel"],
+                ["ok-edge", "ok-bg"], ["warn-edge", "warn-bg"], ["danger-edge", "danger-bg"]
+            ];
+            const page = await openPage(browser, scen());
+            await page.goto(url);
+            await page.waitForSelector("#sec-safes .sec-safe", { timeout: 10000 });
+            const report = await page.evaluate(({ TEXT, NONTEXT }) => {
+                function lum(hex) {
+                    const m = hex.trim().replace("#", "");
+                    const n = m.length === 3
+                        ? m.split("").map((c) => parseInt(c + c, 16))
+                        : [0, 2, 4].map((i) => parseInt(m.slice(i, i + 2), 16));
+                    const a = n.map((v) => {
+                        const c = v / 255;
+                        return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+                    });
+                    return 0.2126 * a[0] + 0.7152 * a[1] + 0.0722 * a[2];
+                }
+                function ratio(a, b) {
+                    const x = lum(a), y = lum(b);
+                    return (Math.max(x, y) + 0.05) / (Math.min(x, y) + 0.05);
+                }
+                const out = {};
+                for (const theme of ["light", "dark"]) {
+                    document.documentElement.classList.toggle("sec-dark", theme === "dark");
+                    document.documentElement.classList.toggle("sec-light", theme !== "dark");
+                    const cs = getComputedStyle(document.documentElement);
+                    const tok = (n) => cs.getPropertyValue("--sec-" + n).trim();
+                    const bad = [];
+                    const rows = [];
+                    for (const [fg, bg] of TEXT) {
+                        const r = ratio(tok(fg), tok(bg));
+                        rows.push([fg, bg, Math.round(r * 100) / 100]);
+                        if (r < 4.5) bad.push(`${fg} on ${bg} = ${r.toFixed(2)} (text, needs 4.5)`);
+                    }
+                    for (const [fg, bg] of NONTEXT) {
+                        const r = ratio(tok(fg), tok(bg));
+                        rows.push([fg, bg, Math.round(r * 100) / 100]);
+                        if (r < 3) bad.push(`${fg} on ${bg} = ${r.toFixed(2)} (non-text, needs 3)`);
+                    }
+                    out[theme] = { bad, rows, count: rows.length };
+                }
+                return out;
+            }, { TEXT, NONTEXT });
+            for (const theme of ["light", "dark"])
+                ok(report[theme].bad.length === 0,
+                   `${theme}: all ${report[theme].count} token pairs clear AA (4.5:1 text, ` +
+                   `3:1 non-text)` +
+                   (report[theme].bad.length ? " — " + report[theme].bad.join("; ") : ""));
+            /* The one that was systemically broken before: --sec-border against
+             * --sec-bg was 1.51 light / 1.60 dark, i.e. EVERY control boundary
+             * on the page. */
+            const edgeLight = report.light.rows.find((r) => r[0] === "edge" && r[1] === "surface");
+            const edgeDark = report.dark.rows.find((r) => r[0] === "edge" && r[1] === "surface");
+            ok(edgeLight[2] >= 3 && edgeDark[2] >= 3,
+               `the control edge clears 1.4.11 in both themes (${edgeLight[2]} / ${edgeDark[2]}) ` +
+               `— it was 1.51 / 1.60, which was every control boundary on the page`);
+            await page.close();
+        }
+
+        head("Type — the page is no longer smaller than its host");
+        {
+            const page = await bootToSafes(browser, scen());
+            const sizes = await page.evaluate(() => {
+                const out = {};
+                const walk = (n) => {
+                    if (n.nodeType === 3 && n.textContent.trim()) {
+                        const px = window.getComputedStyle(n.parentElement).fontSize;
+                        out[px] = (out[px] || 0) + 1;
+                    }
+                    for (const k of n.childNodes) walk(k);
+                };
+                walk(document.querySelector(".sec-page"));
+                return out;
+            });
+            const runs = Object.entries(sizes).map(([px, n]) => [parseFloat(px), n]);
+            const total = runs.reduce((a, b) => a + b[1], 0);
+            const tiny = runs.filter(([px]) => px < 12).reduce((a, b) => a + b[1], 0);
+            const belowBody = runs.filter(([px]) => px < 14).reduce((a, b) => a + b[1], 0);
+            ok(tiny === 0,
+               `nothing renders below the 12px floor (${runs.map(([p, n]) => p + "x" + n)
+                   .sort().join(" ")})`);
+            ok(belowBody / total < 0.35,
+               `and most text is at or above Cockpit's own 14px body default ` +
+               `(${belowBody} of ${total} runs below it; it used to be 53 of 88)`);
+            ok(!runs.some(([px]) => px > 12.5 && px < 14),
+               "and there is no ad-hoc size between the 12px floor and the 14px body — the " +
+               "old 0.82rem/13.12px, which was the single most common size on the page, is gone");
+            const weights = await page.$$eval(".sec-page *", (ns) => Array.from(new Set(
+                ns.map((n) => window.getComputedStyle(n).fontWeight))));
+            ok(!weights.includes("700") && !weights.includes("bold"),
+               `nothing asks for weight 700 — PatternFly's body bold is 500 and the variable ` +
+               `face Cockpit ships declares 400..500, so 700 is a synthesised faux bold ` +
+               `(${weights.join(", ")})`);
+            await page.close();
+        }
+
+        head("The consequence ladder and the deadline treatment");
+        {
+            const page = await bootToSafes(browser, scen());
+            await unlockFirst(page, "lab-dc");
+            await page.click("#sec-entries .sec-btn.link");
+            await page.waitForSelector("#sec-detail h3");
+            /* R3 (c): the pane became the entry detail, and the way back to the
+             * safe's own registry detail is one control, not a re-navigation. */
+            ok((await page.$$("#sec-pane #sec-detail")).length === 1,
+               "with a safe open the pane IS the entry detail");
+            ok(await page.$eval("#sec-pane-back", (n) => !n.hidden),
+               "and “← Safe details” is offered, so the registry entry is one click away");
+            await page.click("#sec-pane-back");
+            /* `.sec-safe-id` in the pane is only rendered by the safe-detail
+             * content, so its appearance IS the swap. (`.sec-path` would be a
+             * better landmark but this scenario's registry rows carry no path,
+             * and the pane correctly draws no Path section without one.) */
+            await page.waitForSelector("#sec-pane .sec-safe-id");
+            ok(/lab-dc/.test(await page.textContent("#sec-pane .sec-safe-id")),
+               "which swaps the content back without leaving the browse view");
+            ok((await page.$$("#sec-browse-view:not([hidden])")).length === 1,
+               "…and without deselecting anything");
+
+            /* The reveal countdown: one custom property on the track, tabular
+             * numerals, and the bar is the SECOND carrier behind the numeral. */
+            await page.click('#sec-entries .sec-btn.link');
+            await page.waitForSelector("#sec-detail h3");
+            const rev = await page.$('#sec-detail .sec-reveal button:text-is("Reveal")');
+            if (rev) {
+                await rev.click();
+                await page.waitForSelector("#sec-detail .sec-value:not(.masked)", { timeout: 5000 });
+                const meter = await page.$eval("#sec-detail .sec-meter", (n) => ({
+                    remain: n.style.getPropertyValue("--sec-remain"),
+                    inline: n.getAttribute("style") || "",
+                    fill: window.getComputedStyle(n.firstElementChild).width
+                }));
+                ok(/%$/.test(meter.remain),
+                   `the countdown's geometry arrives as ONE custom property, not a built ` +
+                   `style string (${meter.remain})`);
+                ok(parseFloat(meter.fill) > 0,
+                   `and the stylesheet turns it into a width (${meter.fill})`);
+                const cd = await page.$eval("#sec-detail .sec-countdown",
+                    (n) => window.getComputedStyle(n).fontVariantNumeric);
+                ok(/tabular-nums/.test(cd),
+                   `the numerals are tabular, so a deadline does not jitter as it counts ` +
+                   `(${cd})`);
+                const wellSize = await page.$eval("#sec-detail .sec-value", (n) => ({
+                    size: window.getComputedStyle(n).fontSize,
+                    family: window.getComputedStyle(n).fontFamily,
+                    border: window.getComputedStyle(n).borderTopWidth
+                }));
+                ok(parseFloat(wellSize.size) >= 16 && /Mono/.test(wellSize.family) &&
+                   parseFloat(wellSize.border) > 0,
+                   `a revealed value is bigger than body text, monospaced and in a bordered ` +
+                   `well — the weight is in the RESULT, not in the button that asked for it ` +
+                   `(${wellSize.size}, ${wellSize.family.split(",")[0]}, ${wellSize.border})`);
+            } else {
+                ok(false, "a reveal widget was drawn for the entry");
+            }
+            await page.close();
+        }
+
     } finally {
         await browser.close();
         server.close();

@@ -80,7 +80,11 @@ async function item8(browser) {
               H.CFG.user + " is not in `sudo` — this is genuinely the non-admin principal");
 
         const list = await H.liveList(frame);
-        const admins = ((list && list.safes) || []).filter((s) => U.classOf(s) === "admin");
+        /* Never the operator's own safe, whatever the registry says — the
+         * exclusion list lives in live-ui.spec.js so all three suites share
+         * one answer (see the note beside EXCLUDED_SAFES there). */
+        const admins = ((list && list.safes) || [])
+            .filter((s) => U.classOf(s) === "admin" && !U.excluded(s.id));
         if (!admins.length) {
             it.skip("the registry declares no admin-class safe, so there is nothing for a " +
                     "non-admin to be refused. Seeding one is root work and belongs to the " +
@@ -103,17 +107,36 @@ async function item8(browser) {
          * reaches the operator either way. */
         const card = U.cardFor(frame, target.id);
         if (await card.count()) {
+            /* 0.5.0: the row carries the state and the PANE carries the
+             * control and the sentence, so the safe has to be chosen before
+             * either can be read. */
             const cls = (await card.first().getAttribute("class")) || "";
-            const disabled = await card.first().locator('button:text-is("Unlock…")').isDisabled();
-            it.note("the card is rendered " + (/unreachable/.test(cls) ? "unreachable" : "reachable") +
-                    " with its Unlock control " + (disabled ? "disabled" : "enabled"));
-            const reason = (await card.first().innerText()).trim();
+            await U.selectSafeRow(frame, target.id);
+            const disabled = await U.unlockButton(frame).isDisabled();
+            it.note("the row is rendered " + (/unreachable/.test(cls) ? "unreachable" : "reachable") +
+                    " with the pane's Unlock control " + (disabled ? "disabled" : "enabled"));
+            const reason = (await frame.locator("#sec-pane-body").innerText()).trim();
             it.ok(/administrator-class|Administrative access/i.test(reason),
-                  "the card tells the operator what stands in the way: " +
+                  "the pane tells the operator what stands in the way: " +
                   JSON.stringify(reason.replace(/\s+/g, " ").slice(0, 200)));
         } else {
-            it.note("the page does not render a card for " + target.id + " at all for this " +
-                    "principal — hiding is permitted; refusing is what matters.");
+            /* R1 — and this is now the EXPECTED branch for a non-admin, not a
+             * fallback. An administrator safe is not drawn at all while
+             * Cockpit's administrative access is off, so the sentence an
+             * unelevated operator gets is the count-only line, not a card. It
+             * is asserted rather than merely noted, because "hiding is
+             * permitted" must not become "the page said nothing at all".
+             * live-ui.spec.js item 2 asserts the same panel in full. */
+            const said = (await frame.locator("#sec-safes").innerText().catch(() => "")).trim()
+                            .replace(/\s+/g, " ");
+            it.note("the page draws no row for " + target.id + " for this principal — R1 hides " +
+                    "administrator safes while administrative access is off. Hiding is " +
+                    "permitted; refusing is what matters, and that is half two below.");
+            it.ok(/hidden/i.test(said) && /Administrative access|Limited access/i.test(said),
+                  "…and it still says so, with a count and the name of the control that " +
+                  "would reveal them: " + JSON.stringify(said.slice(0, 200)));
+            it.ok(!said.includes(target.id),
+                  "…without naming the safe it is hiding — a count, never an inventory");
         }
         it.shot(await H.shot(page, "08-nonadmin-list"));
 
@@ -230,7 +253,11 @@ async function item9(browser) {
         it.shot(await H.shot(page, "09-limited-access"));
 
         const list = await H.liveList(frame);
-        const admins = ((list && list.safes) || []).filter((s) => U.classOf(s) === "admin");
+        /* Never the operator's own safe, whatever the registry says — the
+         * exclusion list lives in live-ui.spec.js so all three suites share
+         * one answer (see the note beside EXCLUDED_SAFES there). */
+        const admins = ((list && list.safes) || [])
+            .filter((s) => U.classOf(s) === "admin" && !U.excluded(s.id));
         if (!admins.length) {
             it.skip("the registry declares no admin-class safe, so escalation has nothing " +
                     "to be required for.");
@@ -258,36 +285,85 @@ async function item9(browser) {
          * and the control that really escalates must then really open the safe.
          * Anything else would be this suite asserting a Cockpit feature that
          * does not exist and calling the page broken for not using it. */
-        const card = U.cardFor(frame, target.id).first();
-        const check = card.locator('button:text-is("Check this safe"), button:text-is("Check again")');
-        it.ok(await check.count() > 0,
-              "the admin-class card offers a “Check this safe” control while access is off");
-        it.ok(!(await card.locator('button:text-is("Unlock…")').isDisabled()),
-              "…and Unlock is NOT permanently disabled — admin is the default class and a " +
-              "session can escalate at any moment");
-
-        await check.first().click();
-        const refusal = await frame.waitForFunction((id) => {
-            const cards = document.querySelectorAll(".sec-safe");
-            for (const c of cards) {
-                const n = c.querySelector(".sec-safe-id");
-                if (!n || n.textContent.trim() !== id) continue;
-                const a = c.querySelector(".sec-alert.err");
-                if (!a) return null;
-                return a.textContent.replace(/\s+/g, " ").trim().slice(0, 300);
-            }
-            return null;
-        }, target.id, { timeout: 30000 }).then((h) => h.jsonValue()).catch(() => null);
-
-        it.ok(!!refusal,
-              "asking for an admin-class safe while access is off produces an answer on the " +
-              "card rather than a silent nothing");
-        it.ok(!!refusal && /access-denied/.test(refusal),
-              "the answer is the bridge's refusal, delivered without any prompt: " +
-              JSON.stringify(String(refusal).slice(0, 180)));
-        it.ok(!!refusal && /Limited access|administrative access/i.test(refusal),
-              "…and it names the control that DOES escalate, so the operator is not left " +
-              "with a code and no route out of it");
+        /* WHERE THIS ITEM'S FIRST HALF NOW LIVES, AND WHY IT HAD TO MOVE.
+         *
+         * It used to click the admin-class card's "Check this safe", read the
+         * `access-denied` the bridge answered with off that card, and check the
+         * card named the control that escalates. R1 removed the card: while
+         * administrative access is off an administrator safe is NOT DRAWN, so
+         * there is nothing to click and nothing to read. secrets.js records the
+         * consequence beside the control itself — "while administrative access
+         * is off, an admin-class safe is not listed at all, so this control
+         * cannot be reached in the state it was built for. The count note and
+         * the escalation banner are what an operator sees instead."
+         *
+         * The assertion is NOT dropped, because what it was really about is
+         * still true and still checkable: asking for an admin-class safe from
+         * this session is refused by the bridge, the refusal is `access-denied`,
+         * no prompt is drawn anywhere by this page, and the operator is left
+         * holding the name of the control that would work. The first of those
+         * now comes from driving the verb the way the card's button drove it —
+         * `probe` with superuser:"require", which is exactly what probeSafe()
+         * sends — and the last two from the page's own banner and count line.
+         *
+         * If the row IS drawn (a Cockpit that lists it, or a future page that
+         * shows admin safes greyed), the original gesture is driven instead, so
+         * this reads the product rather than a snapshot of it. */
+        const row = U.cardFor(frame, target.id).first();
+        const rowDrawn = (await row.count()) > 0;
+        let refusal = null;
+        if (rowDrawn) {
+            await U.selectSafeRow(frame, target.id);
+            const check = U.paneActions(frame)
+                .locator('button:text-is("Check this safe"), button:text-is("Check again")');
+            it.ok(await check.count() > 0,
+                  "the admin-class safe's pane offers a “Check this safe” control while " +
+                  "access is off");
+            it.ok(!(await U.unlockButton(frame).isDisabled()),
+                  "…and Unlock is NOT permanently disabled — admin is the default class and a " +
+                  "session can escalate at any moment");
+            await check.first().click();
+            refusal = await frame.waitForFunction(() => {
+                const a = document.querySelector("#sec-pane-body .sec-alert.err");
+                return a ? a.textContent.replace(/\s+/g, " ").trim().slice(0, 300) : null;
+            }, null, { timeout: 30000 }).then((h) => h.jsonValue()).catch(() => null);
+            it.ok(!!refusal,
+                  "asking for it while access is off produces an answer in the pane rather " +
+                  "than a silent nothing");
+            it.ok(!!refusal && /access-denied/.test(refusal),
+                  "the answer is the bridge's refusal, delivered without any prompt: " +
+                  JSON.stringify(String(refusal).slice(0, 180)));
+            it.ok(!!refusal && /Limited access|administrative access/i.test(refusal),
+                  "…and it names the control that DOES escalate, so the operator is not left " +
+                  "with a code and no route out of it");
+        } else {
+            it.note("R1: " + target.id + " is administrator-class and administrative access is " +
+                    "off, so the page draws no row for it and the “Check this safe” control " +
+                    "cannot be reached. The refusal is driven the way that control drives it " +
+                    "instead, and the page's own words are asserted from the banner and the " +
+                    "count line.");
+            const probe = await U.spawnVerb(frame, "probe", { safe: target.id }, "require");
+            const po = U.parseMaybe(probe.out);
+            const answer = (probe.problem || "") + " " + String(probe.out || "") +
+                           " " + JSON.stringify(po || {});
+            it.ok(!probe.ok,
+                  "asking for the admin-class safe with superuser:\"require\" while access is " +
+                  "off is refused");
+            it.ok(/access-denied/.test(answer),
+                  "the answer is the bridge's own `access-denied`, delivered without any " +
+                  "prompt: " + JSON.stringify(answer.replace(/\s+/g, " ").trim().slice(0, 180)));
+            const words = ((await frame.locator("#sec-banners").innerText().catch(() => "")) +
+                           " " + (await frame.locator("#sec-safes").innerText().catch(() => "")))
+                          .replace(/\s+/g, " ").trim();
+            it.ok(/Limited access|Administrative access/i.test(words),
+                  "…and the page names the control that DOES escalate, so the operator is not " +
+                  "left with a code and no route out of it: " +
+                  JSON.stringify(words.slice(0, 200)));
+            it.ok(/hidden/i.test(words) || /Nothing is visible/i.test(words),
+                  "…and it accounts for what it is not showing rather than pretending the " +
+                  "registry is empty");
+            refusal = answer;
+        }
         /* And no lookalike password box was drawn anywhere by this page. That
          * is the half a bespoke "escalation dialog" would fail. */
         const fakePrompt = await frame.evaluate(() =>

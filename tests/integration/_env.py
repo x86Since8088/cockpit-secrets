@@ -21,6 +21,25 @@ debugging time when they were got wrong:
   * `atomic_replace` REFUSES a backup ring under `/tmp` or `/var/tmp`, so a
     save into a `/tmp` fixture dir fails with `invalid`. The default root here
     is the user's XDG runtime directory.
+
+A fourth, added after it cost eight of twenty stages a whole run:
+
+  * THE HELPER READS TWO REGISTRIES, AND THIS FILE HAS TO OVERRIDE BOTH.
+    `COCKPIT_SECRETS_ETC` redirects the system registry. It does not touch the
+    PER-USER one, which `secrets-admin` resolves through `user_home()` — a
+    third seam, `COCKPIT_SECRETS_HOME`. Without it, `~/.config/cockpit-secrets/
+    safes.d` belonging to whoever runs the suite is merged straight into the
+    "hermetic" environment: the operator who registered one real safe of their
+    own turned `assert_loaded(9)` into `entries=10` and aborted eight scripts
+    at build time, before a test body ran.
+
+    Convenience is the smaller half of why that is fixed here. The larger half
+    is that a suite reading the operator's real registry is one bad assertion
+    away from operating on the operator's real SAFE — and these scripts unlock,
+    write, save, forget and delete. `assert_loaded` therefore no longer counts
+    entries alone; it checks that every id the helper loaded is one this
+    harness WROTE, so the failure mode can never come back silently as a count
+    that happens to add up.
 """
 import json
 import os
@@ -92,6 +111,14 @@ class Env:
         self.env = dict(os.environ)
         self.env["COCKPIT_SECRETS_ETC"] = self.etc
         self.env["COCKPIT_SECRETS_VAR"] = self.var
+        # The per-user registry's seam — see the module docstring. Pointed at
+        # `root` rather than at a dedicated subdirectory on purpose: the helper
+        # looks for `<home>/.config/cockpit-secrets/safes.d`, nothing here ever
+        # creates that, and a directory that does not exist is the one thing
+        # the loader can be relied on to skip without an error. `root` is
+        # 0700 and ours, so it also satisfies the ownership rules if a test
+        # ever does decide to write a per-user entry into it.
+        self.env["COCKPIT_SECRETS_HOME"] = self.root
 
     # -- construction ------------------------------------------------------
 
@@ -164,15 +191,62 @@ class Env:
             out = {"_unparseable": p.stdout[:400]}
         return out, p.returncode, p.stderr
 
+    def registered_ids(self):
+        """The ids this harness actually WROTE into `safes.d`, from the files.
+
+        Read off the filesystem rather than from `SAFES`, because two scripts
+        rewrite the registry themselves — `corpus_vs_helper.py` empties it and
+        registers a single `corpus` entry per case — and a hermeticity check
+        that only knew about `SAFES` would fail them for doing exactly what
+        they are supposed to do.
+        """
+        out = set()
+        for name in sorted(os.listdir(self.safes_d)):
+            if not name.endswith(".json"):
+                continue
+            try:
+                with open(os.path.join(self.safes_d, name)) as fh:
+                    out.add(json.load(fh).get("id"))
+            except (OSError, ValueError):
+                # A deliberately malformed entry. It has no id to claim and the
+                # loader will drop it; the count check below is what covers it.
+                continue
+        return out
+
     def assert_loaded(self, expected):
+        """The registry loaded is EXACTLY the registry this harness built.
+
+        Two assertions, and the second is the one that matters. The count has
+        always been here. The id check is what makes "hermetic" mean hermetic:
+        a registry the helper assembled from somewhere this harness did not
+        write is not a test fixture, it is somebody's real data, and every
+        script that imports this module goes on to unlock, write, save, forget
+        and delete what `list` hands it.
+
+        The comparison is one-directional — no id may be loaded that was not
+        written — rather than an equality. An entry a test wrote in order to
+        watch it be DROPPED (bad owner, bad mode, malformed JSON) is a real
+        case in this suite, and equality would fail it for succeeding. Foreign
+        ids are the whole risk and this catches every one of them.
+        """
         h, _rc, _err = self.run("health")
         if h.get("registry_entries") != expected:
             raise SystemExit(
                 "hermetic registry did not load: entries=%s errors=%s\n"
-                "(the usual cause is a group-writable directory somewhere "
-                "above %s)"
+                "(the usual causes are a group-writable directory somewhere "
+                "above %s, and a per-user registry leaking in — see this "
+                "module's docstring on COCKPIT_SECRETS_HOME)"
                 % (h.get("registry_entries"), h.get("registry_errors"),
                    self.etc))
+        listed, _rc, _err = self.run("list")
+        loaded = {s.get("id") for s in (listed.get("safes") or [])}
+        foreign = sorted(loaded - self.registered_ids())
+        if foreign:
+            raise SystemExit(
+                "the hermetic registry is NOT hermetic: %s came from outside "
+                "%s. This harness must never operate on a safe it did not "
+                "create; check that COCKPIT_SECRETS_ETC, _VAR and _HOME are "
+                "all still being exported by _env.Env." % (foreign, self.safes_d))
         return h
 
 

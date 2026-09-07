@@ -39,10 +39,31 @@ cs_mode "$CS_STATE"         700 root:root
 cs_mode "$CS_EXPORTS"       700 root:root
 
 cs_sect "the Cockpit package payload"
-# EXACTLY the four files, and each 0644 root:root. An extra file here is served
-# to every logged-in session.
-want_pkg="index.html manifest.json secrets.css secrets.js"
-got_pkg="$(cd "$CS_PKGDIR" && ls -A | sort | tr '\n' ' ' | sed 's/ $//')"
+# EXACTLY the files install.sh ships, and each 0644 root:root. An extra file
+# here is served to every logged-in session.
+#
+# DERIVED FROM install.sh, NOT RESTATED. This line used to read
+#     want_pkg="index.html manifest.json secrets.css secrets.js"
+# and it was correct until 0.5.1, when `theme.js` was added to the page and to
+# the installer's PLUGIN array. A hard gate that carries its own copy of a list
+# fails the release that legitimately grows the list, and the failure looks like
+# a defect in the installer rather than in the gate - which is exactly what
+# happened here. install.sh's PLUGIN array is already the single source of the
+# copy list, the stale-file sweep and the payload-present pre-flight; reading it
+# here makes this check a fourth reader of that one line instead of a fifth
+# opinion about it.
+#
+# The extraction is deliberately strict: it matches only the exact
+# `PLUGIN=(...)` assignment on its own line, so a rename or a multi-line
+# rewrite of the array yields an EMPTY want_pkg and the comparison below fails
+# loudly rather than silently checking nothing.
+want_pkg="$(cd "$CS_SRC" && sed -n 's/^PLUGIN=(\(.*\))$/\1/p' install.sh \
+            | tr ' ' '\n' | grep -v '^$' | LC_ALL=C sort | tr '\n' ' ' | sed 's/ $//')"
+if [[ -z $want_pkg ]]; then
+    cs_no "install.sh still declares its payload as a one-line PLUGIN=(...) array" \
+          "(extraction produced nothing - this gate cannot check the payload)"
+fi
+got_pkg="$(cd "$CS_PKGDIR" && ls -A | LC_ALL=C sort | tr '\n' ' ' | sed 's/ $//')"
 cs_eq "$CS_PKGDIR holds exactly the package payload" "$want_pkg" "$got_pkg"
 for f in $want_pkg; do cs_mode "$CS_PKGDIR/$f" 644 root:root; done
 

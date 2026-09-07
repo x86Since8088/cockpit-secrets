@@ -561,3 +561,86 @@ safe, so `import-commit` at that size — and the sustained half of I54's amplif
 valid large staging survives a successful inspect and can be re-inspected without limit — is
 inference from two measured facts rather than one measured attack. `MAX_ATTACHMENT_BYTES` (32 MiB)
 against `MAX_REQUEST_BYTES` (1 MiB) makes building one slow.
+
+---
+
+## Part 5 · What the 0.5.1 page leaves open
+
+0.5.1 closed the five things 0.5.0's own verification said were still wrong (KNOWN_ISSUES
+I56–I60). These are what it did not close, and one thing it deliberately made *more* visible.
+
+### 5.1 A safe's file path is now on screen, and a path names an account
+
+`list` publishes `path` from 0.5.1, so the safes table can show a **Path** column and the
+details pane shows the path **always**. On this host that reads
+`/home/cptestadm/.local/share/cockpit-secrets/safes/dummy-fake-user-kdbx.kdbx` — which names a
+home directory and therefore an account, and names the host's filesystem layout.
+
+**What is NOT a risk here, measured rather than assumed.** `list` runs at the caller's own euid.
+A registry file that euid cannot open is recorded as a registry error and never becomes a row
+(`chmod 000` over an entry → `unreadable (EACCES)`, and the id is gone from `list`). The system
+registry is 0644 root-owned policy every account can already read; the per-user registry is only
+ever read out of the caller's OWN home. **So every path shown came out of a file the caller
+could already open, and the disclosure over the status quo is zero.** No account learns another
+account's safe from this.
+
+**What IS the residual.** This page gets screenshotted, pasted into tickets, and shown on a
+projector, and a path is the longest and most quotable thing in the row. That is the whole
+reason the column is **off by default** and the reason the reasoning is written into
+`secrets.css` and `secrets.js` so nobody later "fixes" it. The pane's copy is the deliberate
+counterweight: a safe you cannot locate on disk is a safe you cannot back up, cannot repair and
+cannot prove is the one you meant.
+
+**One case has no committed test.** A `%u` registry entry that cannot be resolved for this
+caller gets **no** `path` key at all, rather than the raw unexpanded entry — an unexpanded `%u`
+names no file. That is exercised only in a scratch registry under `unshare --map-root-user`, not
+by anything in the tree.
+
+### 5.2 The URL column's wrap rule is addressed by position
+
+`#sec-entries table.sec td:nth-child(3)` is the one cell allowed `overflow-wrap: anywhere`,
+because it is the one that can hold a 300-character unbreakable token. The renderer writes a
+bare `<td>` — there is no class, id or attribute on the cell — so the rule is coupled to the
+column ORDER, which `listColumns()` takes from the helper's schema when it publishes
+`fields[].in_list` and from `CONTRACT_LIST_COLUMNS` otherwise.
+
+It is pinned rather than hoped: `live-ui.spec.js` item 10 asserts the third header reads "URL".
+If it ever did mis-land, the consequence is degraded and not broken — the table grows and
+scrolls inside its own box. The clean fix is one class in `renderEntries()` and has not been
+made.
+
+### 5.3 The safes table is cramped with every optional column on
+
+Measured with Path, Registry, KDF and Id all ticked: 8 columns in a 669px table, rows 28–30
+lines tall at a 700px frame and below. Nothing overflows and the page never scrolls, so it is
+the same class of defect §18.9 was — found by looking, not by an assertion. Its floor was not
+raised, because its column count is variable by design (4 to 9) and its 30rem floor is right for
+the four it draws by default; picking one wider number for all of them would be an unmeasured
+decision.
+
+### 5.4 Chromium only, in every round
+
+Every measurement in `docs/DESIGN.md` §18 and every live suite run is the cached Playwright
+Chromium. Firefox and WebKit have never rendered this page. The two things that could differ are
+the computed `outline-width` (addressed by using `0.125rem`) and custom-property enumeration in
+`getComputedStyle` (addressed by requiring `getPropertyValue` in tests).
+
+### 5.5 The no-flash guarantee is `theme.js`'s alone
+
+`secrets.js` carries a guarded second copy of the theme resolver, and it is what kept the theme
+**correct** through the whole of 0.5.0, when `install.sh` was deleting `theme.js` on every run.
+It cannot make the theme **early**: it is deferred behind 476 KB, so on a cold cache or a slow
+link the frame paints unthemed inside its window (measured: 161 ms paint against a 3068 ms
+resolve, with `secrets.js` delayed 3 s). A page served by something other than this installer,
+or opened standalone, therefore still has the flash the file was written to remove — bounded to
+the two states `docs/DESIGN.md` §3.2 names, shell Dark with the OS light and the reverse.
+
+### 5.6 `list` is spawned unescalated, always — so an admin-class row is `usable:false` for everyone
+
+Not new in 0.5.1, but it is now written down, because building R5 "gated on access class"
+exactly as the design prescribed produced a feature that could never be met, and the reason took
+a live run to find. `secrets.js` calls `callOnce("list", {}, false)` by design: `list` names what
+EXISTS; whether a safe may be OPENED is decided per verb. A consequence an operator sees is that
+an administrator safe reads `usable:false` in the row even for an administrator, until they open
+it. A consequence a developer must know is that **no per-class gate inside `v_list` can ever
+open for an admin-class safe**.

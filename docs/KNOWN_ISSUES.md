@@ -5,14 +5,16 @@ and Password Safe v3 safes, with severity, root cause, the mitigation that close
 task that owns it. Tasks cite these ids; a task is not done until its cited ids are either
 MITIGATED or explicitly re-classified with a reason.
 
-**55 entries as of 0.4.0.** I43–I54 are the twelve the red-team round against the
-registry-write feature found, and I55 is a thirteenth found by this release's own cleanup —
+**61 entries as of 0.5.1.** I56–I60 are the five the 0.5.0 restyle's own verification
+declared still wrong, closed in 0.5.1; each names the check that goes red when its fix is
+reverted, and each was watched failing. I43–I54 are the twelve the red-team round against the
+registry-write feature found, and I55 is a thirteenth found by 0.4.0's own cleanup —
 the first thing in the project's history to delete a safe and then reuse its id. Every one is
 FIXED, every one has a regression check in
 `tests/integration/registry_writes.py` that was watched going red with its fix reverted, and
 every one has a standing ban in `validate.sh` that was watched firing on a deliberate
-violation. Three items remain genuinely open and are tracked rather than closed (I36, I37,
-I38); one is argued and left standing with a runtime warning (I35).
+violation. Four items remain genuinely open and are tracked rather than closed (I36, I37, I38, I61);
+one is argued and left standing with a runtime warning (I35).
 
 Legend — Sev: **C**ritical / **H**igh / **M**edium / **L**ow.
 Status: OPEN / MITIGATED / BY-DESIGN / WONTFIX. **FIXED** appears on entries added after the
@@ -1630,3 +1632,196 @@ delete-then-create and forget-remove-create — and requires the brand-new safe 
 passphrase just chosen. Reverted, both go red with `locked-out`. **Ban:** `validate.sh` requires
 the `lockout_reset` call in `_land_new_safe` AND in `v_safe_delete`; reverting either fires it,
 watched.
+
+
+---
+
+## The 0.5.0 restyle — the five its own verification said were still wrong
+
+Recorded as hazards rather than as changelog lines because each one is a defect that shipped,
+each was found by a measurement the previous round did not make, and each now has a check that
+goes red without its fix. **All five are closed in 0.5.1 and every closure below names its
+evidence.** The design-side narrative is `docs/DESIGN.md` §18.1, §18.3, §18.9 and §18.10.
+
+### I56 · R5 shipped as dead code — `list` published no `path` · Sev L · FIXED 2026-09-06 (0.5.1)
+The safes table's optional **Path** column and the details pane's always-visible **Path**
+section were both written correctly and were both unreachable, because the field they are
+guarded on did not exist. `optColAvailable()` offers the column only when some row carries
+`path`; the pane's section is behind `if (safe.path)`. The `list` verb's declared response
+named fifteen keys and `path` was not among them, at either access level.
+
+This is a **disclosure-shaped defect read the wrong way round**: the requirement exists so an
+operator can find the file a safe is, and its absence meant a safe you cannot locate on disk —
+cannot back up, cannot repair, cannot prove is the one you meant.
+
+**FIXED in the helper.** `v_list` publishes `path` from `resolve_entry(entry, ctx.ident)["path"]`
+— the same resolution the open path uses, so there is no second source of truth and `%u` is
+expanded from kernel identity, never from the request. The schema declares it.
+
+**The obvious fix was the wrong one, and that is recorded because it passed every offline
+gate.** `docs/DESIGN.md` §18.1 prescribed publishing it "gated on access class". Built that
+way it passed every unit and integration check and then failed live for exactly the safe the
+requirement was written about: `secrets.js` spawns `list` with **no superuser option, always**
+(the verb matrix — `list` names what exists; whether a safe may be OPENED is decided per verb),
+so the euid asking is never root and a class gate refuses every admin-class row at both access
+levels. The gating was withdrawn and §18.1 corrected.
+
+**Why publishing it is safe, measured rather than argued:** `list` runs at the caller's own
+euid, and a registry file that euid cannot open is recorded as a registry error and never
+becomes a row (`chmod 000` over an entry → `unreadable (EACCES)`, id gone from `list`). The
+system registry is 0644 root-owned policy any account can already read; the per-user registry is
+only ever read out of the caller's OWN home. Every row therefore came from a file the caller
+could already read, and `path` is a field of that file. The residual disclosure — a home
+directory names an account, and this page gets screenshotted — is what the off-by-default
+column answers.
+
+**Regression:** `tests/browser/live-ui.spec.js` **item 11**, which drives a system-registry
+safe and a per-user one in one escalated session: the column is absent on first load, neither
+published path appears anywhere in the default table, the chooser offers the box, ticking it
+shows both values in full, the choice survives a sort in both directions, and the pane shows
+each path in full, selectable and wrapping. `tests/browser/ui.spec.js` covers the same shape
+under the stub harness. **Watched failing:** the pre-change helper (sha `68d62ca4…`) was
+temporarily installed and the live page re-driven — *any row has path* false, Path checkbox not
+offered, pane sections `["File header"]` only.
+
+### I57 · `install.sh` deleted `theme.js` from the installed package on every run · Sev L · FIXED 2026-09-06 (0.5.1)
+`PLUGIN` is three things at once — the copy list, the stale-file sweep, and the payload-present
+pre-flight — and `theme.js` was added to `index.html` and not to `PLUGIN`. So section 1 copied
+five files and the sweep immediately after it deleted the fifth, on every single run, while the
+same script's pre-flight syntax-checked the file it was about to remove.
+
+The comment in `index.html` claimed the missing file "404s silently". It does not: Cockpit
+answers with an HTML error page and Chromium logs `Refused to execute script … because its MIME
+type ('text/html') is not executable` on **every page load** — a permanent console error on
+every installed host, and the one cause of `live-ui.spec.js` item 1's failure.
+`securitypolicyviolation` events: **0**, so it was never a policy problem.
+
+**The theme itself was never affected** — `secrets.js` carries a guarded second copy of the
+resolver — but that copy is deferred behind 476 KB and therefore cannot deliver §3.3's
+"no flash by construction". Measured with `secrets.js` delayed 3 s: absent, the frame paints at
+161 ms with `<html class="">` and the fallback does not run until 3068 ms; served, the class is
+on `<html>` at 141 ms before the 169 ms paint.
+
+**FIXED** by adding `theme.js` to `PLUGIN` **and** by a new pre-flight gate that parses
+`index.html` with `html.parser`, collects every attribute that makes the browser fetch a second
+file from the package directory, discards anything with a scheme, an authority, an absolute
+path or a parent segment, and **dies** if a package-local reference is not in `PLUGIN`. It
+refuses rather than warns, because a warning is exactly what the previous round produced and
+nobody acted on.
+
+**Regression:** the gate itself — run against an `index.html` referencing a file `PLUGIN` does
+not carry, it exits 1 naming the file and the element; edge cases (`../base1/cockpit.js`, an
+absolute `/base1/x.js`, an `https://` CDN, a `data:` URI, a subdirectory reference) exercised
+separately. `tests/root/20-verify-install.sh` asserts the installed payload equals `PLUGIN`,
+**derived from `install.sh` rather than restated** — the four-name copy it used to carry is
+what made this hard gate fail the release that legitimately grew the payload, and is itself
+part of what was fixed here.
+
+**Evidence of closure:** on the installed page, driven through the real shell as `cptestadm`,
+**0 console errors from the package and 0 `securitypolicyviolation` events**, with all package
+resources answering 200; a second `install.sh` run reports `= unchanged
+/usr/share/cockpit/secrets/theme.js` and the directory still lists five files, which is the
+proof the copy list and the sweep now agree.
+
+### I58 · The entries table broke words mid-word at the default docked width · Sev L · FIXED 2026-09-06 (0.5.1)
+Found by **looking at a screenshot**; no numeric check caught it, because nothing overflowed
+and the page did not scroll. At a 1400px window with the pane docked the entries table sat at
+its `min-inline-size: 42rem` floor inside a 504px scroller, seven columns at ~96px each, with
+`overflow-wrap: anywhere` on every cell — so the first row rendered **26 lines / 552px** tall
+and `ada.lovelace`, a twelve-character string, was broken mid-word in a **103px** column.
+
+Two separable causes, both fixed:
+
+* **the floor was too low.** 42rem → **60rem**, derived and not chosen: 7 × 2rem of cell padding
+  the sheet already spends (14rem), plus the six columns that may not break a word at their
+  longest unbreakable token (160+144+107+37+78+161 px ≈ 43rem), plus one line for URL (3rem).
+  Checked against reality: the table's own min-content measures 944px, so the 960px floor sits
+  just above it and the two rules agree rather than one silently overriding the other.
+* **`overflow-wrap: anywhere` was applied too widely.** `table.sec td` is now `break-word`,
+  which contributes the whole word to min-content so the layout must give the column its
+  longest word — the two values are not cosmetically equivalent, and that difference is the
+  whole fix. `anywhere` is re-applied to exactly two places: the URL column, whose testbed
+  token measures 2126px, and `#sec-safes table.sec td .mono` (Path and Id).
+
+The URL rule is addressed by POSITION (`td:nth-child(3)`) because the renderer writes a bare
+`<td>`. That coupling is **pinned**: `live-ui.spec.js` item 10 asserts the third header reads
+"URL" and that its cells resolve `anywhere` while Username resolves `break-word`, so a
+reordering schema fails loudly. The clean fix is one class in `renderEntries()` and is left
+open.
+
+**Result:** table 672 → 960px, Username 96 → 176px, first row 26 → 9 lines.
+**Regression:** `live-ui.spec.js` item 10's width half, at four widths. **Watched failing:** a
+reverted `secrets.css` was installed and the unchanged suite run — 118/123, item 10 FAIL, the
+reverted run reporting the Username column at 103px.
+
+### I59 · A visually-hidden span escaped its scroller and scrolled the whole page sideways · Sev L · FIXED 2026-09-06 (0.5.1)
+Pre-existing, in no brief, and invisible to every check §11.5 makes. At a 380px frame the
+**entries** view scrolled the PAGE sideways: `documentElement.scrollWidth` 450 vs `clientWidth`
+380, and `window.scrollTo(2000, 0)` really moved it 70px. No element was outside its own
+scroller.
+
+`.sec-visually-hidden` is `position: absolute`; the entries table puts one inside every boolean
+cell (the word "TOTP" beside the tick); **nothing between that cell and the document was
+positioned**, so those spans' containing block was the INITIAL containing block, `.sec-scroll`
+never clipped them, and `clip: rect(0 0 0 0)` does not remove an element from the root's
+scrollable overflow.
+
+**FIXED** with one declaration — `.sec-scroll { position: relative }` — which makes the
+scroller the containing block. Measured at 380px: 698/380 with `scrollX` 318 → 380/380 with
+`scrollX` 0.
+
+**Regression:** `live-ui.spec.js` item 10 asserts the page did not move by **asking it to
+scroll and reading how far it went**, at every one of four widths — comparing `scrollWidth`
+alone is what missed this for a whole release. **Watched failing:** with the declaration
+removed, the 360px line goes red.
+
+### I60 · `tests/integration/` read the caller's real per-user registry · Sev M · FIXED 2026-09-06 (0.5.1)
+`_env.py` built a hermetic registry and exported `COCKPIT_SECRETS_ETC` and `COCKPIT_SECRETS_VAR`
+— but the helper resolves the **per-user** registry through `user_home()`, whose test seam is a
+third variable, `COCKPIT_SECRETS_HOME`, which `_env.py` did not set. So the caller's real
+`~/.config/cockpit-secrets/safes.d` was read straight into the "hermetic" environment.
+
+It was invisible until the operator registered a real safe of their own on 2026-09-05, and then
+**eight of `run_tests.sh`'s twenty stages aborted at build time**, before a single test body
+ran: `hermetic registry did not load: entries=10 errors=[]`. A whole test suite that stops
+running because of an unrelated fact about the machine is the failure mode this is Medium for —
+the tenth entry was the operator's own safe, and a green-looking `--quick` run would have hidden
+it.
+
+**FIXED** by exporting `COCKPIT_SECRETS_HOME = self.root` beside the two it already set. And
+`assert_loaded` was strengthened from a COUNT to an identity check: it runs `list` and refuses
+any id that is not in `registered_ids()`, read off the files in `safes.d` so
+`corpus_vs_helper.py` rewriting the registry per case still works. The check is deliberately
+**one-directional** — no id may be LOADED that was not WRITTEN — because tests write entries in
+order to watch them be dropped, and an equality would fail those for succeeding.
+
+**Regression:** the assertion itself. **Watched failing:** an `Env` was constructed with only
+the `COCKPIT_SECRETS_HOME` export removed, and `assert_loaded(len(SAFES)+1)` called so the COUNT
+agreed and only the new assertion could catch it → `the hermetic registry is NOT hermetic:
+['pwsafe3'] came from outside …/etc/safes.d`. **Evidence of closure:** `./run_tests.sh` with no
+environment override — **20/20, exit 0** (was 12/20).
+
+---
+
+## Found in 0.5.1, still open
+
+### I61 · An escalated session is still told to turn on administrative access · Sev L · OPEN
+Seen in `tests/browser/artifacts/11-safes-path-off-dark.png`, taken by
+`live-ui.spec.js` item 11 in a session whose Cockpit header reads **Administrative access** (on)
+and where `cockpit.permission({admin:true}).allowed === true`. The details pane for
+`dummy-fake-safe` nevertheless reads:
+
+> this safe is administrator-class; turn on Cockpit's Administrative access and try again
+
+The sentence is the helper's own and it is **correct for the caller it was answering**:
+`secrets.js` spawns `list` with no superuser option, always (see I56 and
+`docs/RESIDUAL-RISK.md` §5.6), so `gate()` sees a non-root euid and returns exactly that. What is
+wrong is the PAGE re-showing it after the operator has already done the thing it asks for. The
+control is not broken — `live-access.spec.js` item 9 opens that same safe in that same state,
+22/22 — so this is advice that has gone stale, not a refusal.
+
+**Not fixed here** because the fix is a judgement about which of two facts the pane should trust
+(`list`'s per-row `reason`, or `cockpit.permission`'s live answer) and it belongs with whoever
+owns `secrets.js`'s pane. The honest shape is probably: suppress a `reason` whose remedy the
+session has already performed, and re-probe instead. **No regression test exists**; the
+screenshot is the evidence.

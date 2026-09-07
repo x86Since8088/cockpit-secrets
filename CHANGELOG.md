@@ -12,6 +12,208 @@ Two conventions worth knowing before reading an entry:
   unlock agent above all). **`secrets-admin health` is the authority on what a
   given installation actually has** — not this file.
 
+## 0.5.1 — 2026-09-06
+
+**The five things 0.5.0's own verification said were still wrong.** 0.5.0 shipped
+the restyle and then said, in `docs/DESIGN.md` §18, exactly what it had not
+delivered. This release closes that list and nothing else: R5, `theme.js`, the
+cramped entries table, the three broken live specs, and the non-hermetic
+integration suite. Each is a hazard in
+[`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md) — **I56–I60** — with its evidence
+and the check that goes red without it.
+
+Every one was **reproduced before it was fixed** and every fix was **watched
+failing with the fix reverted**.
+
+### Fixed
+
+- **R5 is delivered (I56).** `list` publishes `path`, resolved through
+  `resolve_entry(entry, ctx.ident)` so there is no second source of truth and
+  `%u` is expanded from kernel identity and never from the request. The page
+  needed no change: `optColAvailable()` and the pane's `if (safe.path)` simply
+  became true. The **Path column is off by default** and the path is **always in
+  the details pane, in full, selectable and wrapping**.
+  - **The design's own prescription was wrong, and that is recorded rather than
+    quietly dropped.** §18.1 said to gate the new field on access class. Built
+    that way it passed every offline gate and then failed live for the exact
+    safe R5 was written about: `secrets.js` spawns `list` with no superuser
+    option, always, so a class gate refuses every admin-class row at *both*
+    access levels. What makes publishing it safe is a property of the loader,
+    measured: a registry file the caller's euid cannot open never becomes a row,
+    so every path shown came out of a file the caller could already read.
+    `docs/CONTRACT.md` carries the correction and the four `path` rules.
+- **`theme.js` is actually installed (I57).** It was in the page and not in
+  `install.sh`'s `PLUGIN` array — which is the copy list *and* the sweep list —
+  so the installer copied it and deleted it again on every run, and Chromium
+  logged a MIME refusal on every page load. `PLUGIN` now names it, and a new
+  **pre-flight gate** parses `index.html` with `html.parser` and refuses to
+  install a page that references a package-local file the array does not ship.
+  It refuses rather than warns, because a warning is what the previous round
+  produced and nobody acted on.
+- **The entries table is readable at the default docked width (I58).** The floor
+  is 42rem → **60rem**, derived from the columns' own longest unbreakable tokens
+  and written out in the sheet; `table.sec td` is `overflow-wrap: break-word`
+  rather than `anywhere`, with `anywhere` re-applied to exactly the URL column
+  and the safes table's `.mono` cells. Measured on the testbed's worst row:
+  **26 lines → 9**, and `ada.lovelace` no longer breaks mid-word (96px → 176px).
+- **A visually-hidden span no longer scrolls the whole page sideways (I59).**
+  `.sec-scroll { position: relative }`. At a 380px frame the entries view really
+  did scroll the document 318px; `clip: rect(0 0 0 0)` does not remove an
+  absolutely-positioned element from the root's scrollable overflow, and nothing
+  between the cell and the document was a containing block.
+- **`tests/integration/` is hermetic again (I60).** `_env.py` exports
+  `COCKPIT_SECRETS_HOME` beside the two seams it already set, and
+  `assert_loaded` now refuses any id that was LOADED but not WRITTEN instead of
+  counting. `./run_tests.sh` with **no environment override: 20/20, exit 0**
+  (was 12/20 — eight stages aborted at build time because the caller's own
+  per-user registry leaked into the "hermetic" one).
+
+### Changed
+
+- **All three live specs migrated to the pane idiom.** The restyle made an
+  action two gestures — choose the row, then use the pane — and
+  `.sec-safe … button:text-is("Unlock…")` matched nothing in any of them. Rows
+  are `#sec-safes tbody tr.sec-safe` filtered on exact `.sec-safe-id`; the row's
+  control is `button.sec-rowdoor`; Unlock is
+  `#sec-pane-body .sec-safe-actions button.sec-btn.primary`, addressed by
+  STRUCTURE so it survives a change of wording. Three assertions that no longer
+  describe the product were **replaced with what does, each with its reason in
+  the file** — never deleted, and never loosened.
+- **`tests/root/20-verify-install.sh` derives the package payload from
+  `install.sh`** instead of restating it. Its hard "holds exactly the payload"
+  assertion carried its own four-name copy and therefore failed the release that
+  legitimately grew the payload to five. A gate with its own copy of a list is a
+  gate that fails the wrong thing.
+- **`live-ui.spec.js` item 6's attachment step reads the helper's answer instead
+  of assuming acceptance.** A Password Safe v3 database this program creates
+  declares 0x030D and attachments need 0x030F, so the only PWS3 in the testbed
+  cannot take one — by construction and on purpose
+  (`docs/RESIDUAL-RISK.md` §4.11). The item used to assert "the upload was
+  accepted" unconditionally and then throw, aborting the whole psafe3 half at
+  that step the first time it was ever driven against a PWS3 this program had
+  made. It now asserts the refusal is the FORMAT's own `unsupported`, carrying
+  the version the file declares and the version attachments need, asserts the
+  entry is not drawn as if it had an attachment, and continues. Any other
+  refusal is still a failure.
+
+### Added
+
+- **`live-ui.spec.js` item 11 — R5 end to end**, the only committed test that
+  drives R5 against the real helper. It runs last and in a session of its own,
+  and escalates there through Cockpit's own header control, because R5 must be
+  shown for a **system-registry** safe as well as a per-user one and items 1–10
+  are written against a limited-access session. In one session it re-proves
+  **R1 in both directions** (the admin row absent while access is off, present
+  after), **R2**, **R3**, **R4**, all of **R5** (off by default; the published
+  path string absent from the default table; the chooser offers it; both cells
+  hold the helper's own value in full; it survives a sort in both directions;
+  the pane's first section is Path, character-for-character, `user-select` not
+  `none`, wrapping and not elided, with the correct location sentence), and
+  **I11** across the chooser, the pane, the sort, the toggle and a full unlock
+  against a baseline taken before any of it.
+
+### Known issues
+
+- **I61 (new, OPEN).** In a session that has *already* turned administrative
+  access on, the details pane for an admin-class safe still reads "turn on
+  Cockpit's Administrative access and try again". The sentence is the helper's
+  and is correct for the caller that produced it — `list` is always spawned
+  unescalated — but the page re-shows it after the operator has done the thing
+  it asks for. The control works: `live-access.spec.js` item 9 opens that safe
+  in that state. Advice that has gone stale, not a refusal.
+- **Item 6 is a full pass for KDBX and a partial one for PWS3**, and says so in
+  its own report: the attachment chain cannot be driven against a 0x030D file.
+- **Chromium only**, in this round as in every previous one.
+- The residual list for the 0.5.x page is
+  [`docs/RESIDUAL-RISK.md`](docs/RESIDUAL-RISK.md) Part 5, and
+  `docs/DESIGN.md` §18.11.
+
+## 0.5.0 — 2026-09-06
+
+**The page was restyled, and this is the first release where that restyle has
+actually been installed and driven in a real browser.** 0.4.0's page was two
+unrelated layouts — a card grid and a three-column split that, measured, could
+never trigger inside Cockpit's iframe. It is now one workspace with one
+right-docked details pane, one sortable table, and a theme that follows the
+Cockpit shell instead of guessing from `prefers-color-scheme`.
+
+`docs/DESIGN.md` is the specification and now carries an **"As built"** section
+(§18) recording every place the implementation diverged from it. `docs/LIVE-WALKTHROUGH.md`
+carries the 0.5.0 run: the commands, the measured numbers, and the failures.
+
+### Added
+
+- **`theme.js`** — resolves Cockpit's light/dark choice from the shell's own
+  `<html>` and mirrors it onto ours, with a `MutationObserver` that follows a
+  live change. It reads one class off a same-origin document and writes nothing
+  anywhere: no storage API, no network. This fixes the two states a *deliberate*
+  choice produces — shell Dark with the OS in light, and shell Light with the OS
+  in dark — where `prefers-color-scheme` alone is measurably wrong.
+  **See the Known issues entry below: `install.sh` does not ship this file yet.**
+- A **column chooser** for the safes table, and a **details pane** with a real
+  `<button>` toggle carrying `aria-expanded` / `aria-controls`.
+- Skip links, including one to the details pane — R3 puts a long table between
+  the top of the page and the pane, and one keystroke is what makes it reachable.
+
+### Changed
+
+- **The safe list is a real `<table>`** with `<th scope="col">`, a caption,
+  `aria-sort` on the sorted column, and rows activated by Enter or Space. The
+  card grid is gone.
+- **Nothing in a row is an action any more.** Every action moved into the pane,
+  so there is exactly one place a destructive control can live. This is the
+  single change that breaks the live suites (below).
+- **The details pane is docked right** at ≥ 60rem and un-docks below it. The old
+  collapse point was 75rem, which the iframe can effectively never reach: at a
+  1400px window the frame is 1160px.
+- `.sec-safe.unreachable` no longer dims. Opacity is a colour-only carrier that
+  lowers contrast; the "Unreachable" chip and the helper's own sentence say it
+  instead.
+- Focus is restored to the activated row after a re-render, rather than dropping
+  to `<body>`.
+
+### Fixed
+
+- Contrast: every control boundary on the page. Measured from the rendered page,
+  **21 fg/bg pairs in light and 23 in dark, zero below threshold** (lowest 4.97
+  and 6.66). Disabled controls are exempt under WCAG 1.4.3 and are excluded.
+- No horizontal page scroll at the WCAG 200% viewport (700 × 480), at 480px or
+  at 360px; a wide table scrolls inside its own box instead.
+- `prefers-reduced-motion: reduce` is honoured — zero animating and zero
+  transitioning elements.
+
+### Known issues introduced or confirmed by this release
+
+> **All five of these were closed in 0.5.1** (`docs/KNOWN_ISSUES.md` I56–I60).
+> They are left here as written, because the value of a release that lists what
+> it did not deliver is destroyed by editing the list afterwards.
+
+- **R5 (the Path column) is unreachable, and this release does not deliver it.**
+  The `list` verb does not publish `path` — it is not in the verb's declared
+  response and is absent live at every access level — and both the optional
+  column and the pane's Path section are guarded on that field. The controls are
+  written correctly and are dead code against this helper. **The fix is in the
+  helper**: publish `path` from `list`, gated on access class.
+- **`install.sh` does not ship `theme.js`.** `PLUGIN=(manifest.json index.html
+  secrets.js secrets.css)` is both the copy list and the list the package
+  directory is swept down to, so an installed `theme.js` is deleted on every run
+  — while the same script's pre-flight syntax-checks it. `secrets.js` carries a
+  guarded second copy of the resolver, so **the theme itself is unaffected**;
+  the cost is that Cockpit answers the missing request with an HTML error page
+  and the browser logs a script refusal on every page load. One line fixes it.
+- **All three live browser specs need a selector migration**, not just
+  `live-ui.spec.js`. `.sec-safe … button:text-is("Unlock…")` no longer matches,
+  because Unlock moved into the pane. `run-live.sh` is **red**: `live-registry`
+  13/15, `live-ui` 4/8, `live-access` 9/10.
+- **`elevationChanged()` is unexercised.** Cockpit's shell reloads the plugin
+  frame when superuser status changes, so R1's visible behaviour is delivered by
+  that reload rather than by the listener. Not a security gap — a reload destroys
+  the session outright — but not tested code either.
+- **`tests/integration/_env.py` needs one line.** Its hermetic registry is
+  contaminated by the caller's own per-user registry row, which made 8 of 20
+  `run_tests.sh` items fail with `entries=10`. Setting `COCKPIT_SECRETS_HOME`
+  alongside the existing `COCKPIT_SECRETS_ETC` isolates it: **20/20, exit 0**.
+
 ## 0.4.0 — 2026-09-04
 
 **You can now create a safe and adopt an existing one.** Until this release a

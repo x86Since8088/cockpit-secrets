@@ -210,7 +210,9 @@ secrets-admin schema                  -> { version, helper_version, base_version
                                            groups[], fields[], enums{}, constants{},
                                            ui_rules[] }
 secrets-admin list                    -> { safes:[{id,label,format,access,mode,locked,reason,
-                                           usable,registry,origin,manageable}] }
+                                           usable,password_required,needs_keyfile,agent_enabled,
+                                           export_allowed,registry,origin,manageable,path?}],
+                                           registry_errors:int }
 secrets-admin probe    <stdin:{safe}> -> { format, version, kdf, iterations, needs_password,
                                            needs_keyfile, writable, needs_challenge,
                                            challenge_b64, yubikey_slot, warnings:[] }
@@ -791,6 +793,67 @@ their own file.
 | `origin` | `"manual"` \| `"created"` \| `"imported"`, straight from the entry |
 | `manageable` | whether **this caller** could `safe-forget` this entry. It is decoration in the usual way (I3): the helper is what refuses, and it re-derives the answer on the verb |
 
+#### The full row, and `path` — the key R5 needs
+
+The complete shape of one row, which is what the block at the top of "Verbs" now prints:
+
+| key | type | meaning |
+|---|---|---|
+| `id` | string | the registry id. The ONLY thing a caller may send back (I4) |
+| `label` | string | the operator's name for it |
+| `format` | `"kdbx"` \| `"psafe3"` | |
+| `access` | `"admin"` \| `"user"` | the class the helper enforces on every verb (I3) |
+| `mode` | `"rw"` \| `"ro"` | registry read-only, which is one of the three distinct causes of "not writable" |
+| `locked` | bool | **false only while this uid holds a live handle inside this process.** Outside an `open` session it is therefore always true, and that is the guarantee, not a wart |
+| `reason` | string | why the row is not usable. `gate()`'s sentence, or the backend-availability one. Never a path, never a traceback |
+| `usable` | bool | whether this caller could unlock it right now. **Two causes of false** — see `path` below |
+| `password_required` | bool | from the entry; false for a key-file-only safe |
+| `needs_keyfile` | bool | the entry names a `keyfile` **or** a `yubikey_slot` |
+| `agent_enabled` | bool | the per-safe agent opt-in (I18) |
+| `export_allowed` | bool | whether `export` is permitted for this safe at all |
+| `registry` · `origin` · `manageable` | | as the table above |
+| `path` | string, **absent only when unresolvable** | where the file lives |
+
+`registry_errors` is a top-level **count** beside `safes`, never the reasons: `health` is the verb
+that carries those, and a reason names a file.
+
+**`path` is published on every row.** R5 (docs/DESIGN.md §5.6) makes the path a selectable column
+that is OFF by default and a section of the details pane that is always drawn in full, and neither
+could ever render while the helper did not send one (§18.1). Four rules govern it, and the helper's
+`v_list` docstring is the long form of all four:
+
+1. **It is resolved, never recomputed.** The string is `resolve_entry(entry, ident)["path"]` — the
+   same function `unlock`, `probe`, `save` and `safe-forget` resolve through — so the path the
+   page shows is the path the helper would open, with `%u` expanded from the kernel identity and
+   never from the request (I4). There is no second source of truth for it. The **one** case with
+   no answer is a `%u` entry seen from a root helper, which has no login name to substitute; that
+   row omits the key rather than publishing a path containing a literal `%u`. Absent, not `null`:
+   a key that is not there cannot be read as a path this program failed to find.
+2. **It is NOT behind `gate()`, and that was measured rather than assumed.** §18.1 prescribed
+   "gated on access class"; built that way, it makes R5 unreachable for exactly the safe R5 asks
+   to show. `secrets.js` spawns `list` with **no superuser option, always** (the matrix at
+   `secrets.js:3190` — `list` names what exists, and whether a safe may be OPENED is decided per
+   verb), so the euid asking is never root and the class gate refuses every admin-class row at
+   both access levels. Driven live with administrative access ON, the pane for the system safe
+   still drew no Path section. The reasoning that replaces it is a property of the **loader**:
+   `list` runs at the caller's own euid, a registry file that euid cannot open is recorded as a
+   registry error and never becomes a row (measured: `chmod 000` over an entry drops it to
+   `unreadable (EACCES)` and its id leaves `list`), the system registry is 0755/0644 root-owned
+   policy, and the per-user registry is only ever read out of the caller's own home. Every row
+   therefore came from a file the caller could already read, and `path` is a field of that file.
+3. **`usable: false` is not a reason to withhold it** — though its two causes are still worth
+   separating: the class gate refused, or the FORMAT's backend is unavailable on this host. A
+   `mode: "ro"` safe gets its path, because read-only is a statement about writes. A safe whose
+   **file has vanished** gets its path, because that is the case R5 exists for; nothing in this
+   verb stats a file, so it is also not an existence oracle. A per-user entry **shadowed** by a
+   system id is not a row at all — the loader drops it and records a registry error (C4 rule 5) —
+   so the path shown is the system entry's, which is the file that would actually be opened.
+4. **It never reaches the audit log or an error string.** A path names a home directory and
+   therefore an account, and it names this host's filesystem layout; that is why the column is off
+   by default and why the full path lives in a pane the operator opens deliberately. I15 keeps it
+   out of the audit line, whose keys `audit()` asserts against a fixed set on every write, and
+   `reason` above carries only sentences that interpolate no path.
+
 | verb | can return |
 |---|---|
 | `safe-create` | `invalid` (bad id, empty credential with no key file, `access:"user"` while escalated, unknown `format`), `access-denied` (admin gate; managed directory not owned/moded as required), `conflict` (id, minted path or minted entry already exists), `unsupported` (`keyfile_b64` on `psafe3`), `internal` (the created file did not read back — nothing was registered) |
@@ -1091,8 +1154,9 @@ is checkable against a running helper, and the section below records what disagr
 side moved.
 
 Two of the three groups above are unchanged by that: the `schema` verb's `response` map is
-still an abbreviation (group B), and `list`'s map has been widened to name the eleven keys it
-actually returns.
+still an abbreviation (group B), and `list`'s map has been widened to name the keys it
+actually returns — **sixteen** of them as of R5's `path`, and this document's own inline block
+had lagged at ten until that pass re-checked the whole row against the running helper.
 
 ---
 
@@ -1115,6 +1179,9 @@ authoritative for RESPONSE keys and for behaviour.
 | `confirm` on `safe-delete` | **the helper** now reads `delete_confirm`, which is what this document and the schema both published | the code was reading `export`'s field name, so the verb was unreachable through the published interface (I49). `tests/ban_undeclared_fields.py` is the standing gate |
 | `safe-forget` returning no `path` | **the helper** now returns it | this document said the response names the file left behind, and it was right: "we stopped listing it" is only useful if you are told where it went. The path is in the RESPONSE and still never in the audit line |
 | `list` rows missing `origin` and `manageable` | **the helper** now returns both | this document specified them; the entries carry `origin` as of I46, and `manageable` is computed from the same two facts the verb gates on |
+| `list` rows missing `path` — so R5's Path column and the pane's Path section could never render | **the helper** now returns it on every row it can resolve | neither side had specified it: docs/DESIGN.md §5.6 designed both halves of R5 against a field the helper does not publish and never said to check, and it looked as if it worked only because `tests/browser/harness.js` supplies `path` in its canned `list` reply. The live page had never once shown one. The page needed no change; this is `v_list` catching up to the requirement, and the four rules it now follows are above |
+| §18.1's prescription that the new `path` be "gated on access class" | **docs/DESIGN.md §18.1 is wrong** and this document is the correction | built that way and driven live, it delivers R5 for a per-user safe and withholds it for the system safe — the one §18.1 was written about. `secrets.js` spawns `list` unescalated always, by design, so `gate()` refuses admin-class rows at every access level and the Path section can never draw for one. What makes the field safe is the loader (rule 2 above), not the class model |
+| this document's inline `list` block naming ten keys where the helper returns sixteen | **this document** now names all sixteen, plus `registry_errors` | the standing rule — schema is authoritative for requests, this file for responses — only holds if this file is actually re-read against a running helper. `password_required`, `needs_keyfile`, `agent_enabled` and `export_allowed` had been shipping unlisted since before 0.4.0 |
 | `handle` undeclared on `backups`, `breach-check`, `restore-backup` and `export` | **the schema** now declares it on all four | all four resolve their safe through `_entry_for`, which accepts one — so the capability was real, unpublished, and (once the dispatcher started refusing undeclared credential fields) unusable. Verified working inside a real `open` session afterwards |
 | `constants.new_id_pattern` vs `constants.new_id_pattern` | **this document** now cites `new_id_pattern` | the shipped constant name |
 | `constants.create_kdbx_kdf_min` (8 MiB / t=2 / p=1) | **the helper** now publishes `Limits`' own Argon2 WRITE floors (m=19 MiB, t=2, p=1) as the schema `min` | the helper advertised a floor of 8 MiB that the backend then refused. A published bound that is not the enforced bound is worse than no bound |

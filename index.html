@@ -8,19 +8,78 @@
          Cockpit's default policy is default-src 'self' and this package adds
          NO relaxation of it (I9), so an inline stylesheet or an inline script
          element would simply not run and the page would render blank. -->
+    <!-- FIRST, AND NOT DEFERRED. theme.js resolves Cockpit's light/dark choice
+         off the shell's own <html> and puts the answer on ours; running it
+         before the stylesheet is requested means the class is already there
+         when the first rule is matched, so there is no flash by construction
+         rather than by timing. Its executable part is 44 lines; it must not be
+         folded into secrets.js, which is 476 KB and correctly deferred.
+
+         IT IS SHIPPED. install.sh's PLUGIN array installs it, and that array
+         is also the sweep that deletes anything else from the package
+         directory, so the two cannot drift apart; a pre-flight gate there
+         re-reads the references on this page and refuses to install a page
+         asking for a file it does not copy.
+
+         A previous version of this comment claimed that a missing theme.js
+         "404s silently". That was FALSE, and it is the reason the defect
+         survived review: for one release install.sh swept the file away on
+         every run, and Cockpit answered the browser with an HTML error page,
+         not a bare 404, so Chromium logged
+
+           Refused to execute script from '…/theme.js' because its MIME type
+           ('text/html') is not executable, and strict MIME type checking is
+           enabled.
+
+         on EVERY page load — a permanent console error on the page that
+         handles every passphrase on this host, and a failing assertion in
+         tests/browser/live-ui.spec.js item 1.
+
+         The theme itself survives the file's absence: secrets.js carries a
+         guarded second copy of the resolver that runs only when
+         .sec-theme-managed is not already on <html>. That is a fallback for
+         CORRECTNESS, and it is not a substitute for this file, because it is
+         deferred behind 476 KB — the theme cannot resolve until that download
+         and parse have finished, and the frame paints long before they do.
+
+         Measured on this host, both builds driven through the real shell with
+         secrets.js delayed by 3 s to stand in for a cold cache or a slow link:
+
+           theme.js absent   first paint 161 ms, <html class="">  — UNRESOLVED
+                             the resolver did not run until 3068 ms
+           theme.js served   class on <html> at 141 ms, first paint 169 ms
+
+         So the fallback's window is bounded by the size of secrets.js and the
+         speed of the link, and this file's is bounded by nothing: the parser
+         blocks on it before <body> exists. That is what "by construction"
+         means here, and it is the whole reason the file is loaded from <head>
+         rather than folded into the script below.
+
+         What is visibly wrong inside that window is the palette, and only in
+         the two states §3.2 of docs/DESIGN.md names — shell Dark with the OS
+         in light, and shell Light with the OS in dark — because those are the
+         states where secrets.css's prefers-color-scheme fallback disagrees
+         with the answer the shell already computed. -->
+    <script src="theme.js"></script>
     <link rel="stylesheet" href="secrets.css">
     <script src="../base1/cockpit.js"></script>
     <script src="secrets.js" defer></script>
 </head>
 <body>
+    <!-- Two skip links. The second exists because R3 puts a long table between
+         the top of the page and the details pane, and one keystroke to the
+         pane is the only thing that makes it reachable from here. It is
+         rendered only while the pane is open. -->
     <a class="sec-skip" href="#sec-main">Skip to content</a>
+    <a class="sec-skip" id="sec-skip-pane" href="#sec-pane-h" hidden>Skip to details</a>
 
     <div class="sec-page">
 
         <!-- The agent banner (I18). An unlock held by `secrets-agent` outlives
-             the page's own view, so its banner lives ABOVE the view switch and
-             outside every pane the browse/safes views clear: an agent-held safe
-             is visible from wherever the operator happens to be standing.
+             the page's own view, so its banner lives ABOVE the view switch,
+             above the workspace grid, and outside every pane the browse/safes
+             views clear: an agent-held safe is visible from wherever the
+             operator happens to be standing. It is never pane-width.
 
              It is empty, and therefore invisible, whenever nothing is held —
              which is the default configuration, because the agent is off unless
@@ -40,12 +99,26 @@
                 <h1>Secrets</h1>
                 <span id="sec-sub" class="sec-subtle">loading&#8230;</span>
             </div>
+            <!-- Left to right: status chips, Refresh, Lock, a deliberate gap,
+                 then the pane toggle. The gap is not decoration: it is what
+                 stops a mis-aimed click on a frequently-pressed toggle from
+                 landing on the one control that discards an open session. -->
             <div class="sec-topbar-actions">
                 <span id="sec-dirty" class="sec-dirty" hidden></span>
                 <span id="sec-clip" class="sec-clip" hidden></span>
                 <span id="sec-session" class="sec-session" hidden></span>
                 <button type="button" id="sec-lock" class="sec-btn danger" hidden>Lock</button>
                 <button type="button" id="sec-refresh" class="sec-btn">Refresh</button>
+                <span class="sec-topbar-gap" aria-hidden="true"></span>
+                <!-- R4. A real <button>, with aria-expanded and aria-controls,
+                     and an accessible name that names the THING ("Details
+                     pane") rather than the action — the state is carried by
+                     aria-expanded, which is why it is not "Show details"/"Hide
+                     details". The glyph is built in secrets.js: see the note
+                     there about why it is a panel mark and not a hamburger. -->
+                <button type="button" id="sec-pane-toggle" class="sec-btn sec-iconbtn"
+                        aria-expanded="true" aria-controls="sec-pane"
+                        aria-label="Details pane"><span class="sec-iconbtn-text">Details</span></button>
             </div>
         </header>
 
@@ -59,30 +132,59 @@
 
         <div id="sec-banners"></div>
 
-        <main id="sec-main" tabindex="-1">
+        <!-- ONE workspace, ONE right-docked pane (R3).
+             #sec-pane is AFTER #sec-main in the DOM in both layouts and is
+             never visually reordered, so the tab order and the reading order
+             are the same thing at every width. That is why it stacks BELOW the
+             table when the frame is narrow rather than above it. -->
+        <div id="sec-workspace" class="sec-pane-open">
 
-            <section id="sec-safes-view" aria-labelledby="sec-safes-h">
-                <h2 id="sec-safes-h">Safes</h2>
-                <div id="sec-safes" class="sec-safes">
-                    <p class="sec-subtle">Loading the safe registry&#8230;</p>
-                </div>
-            </section>
+            <main id="sec-main" tabindex="-1">
 
-            <section id="sec-browse-view" aria-labelledby="sec-browse-h" hidden>
-                <div class="sec-browse-head">
-                    <h2 id="sec-browse-h">Safe</h2>
-                    <div id="sec-browse-meta" class="sec-browse-meta"></div>
-                </div>
-                <div id="sec-browse-warnings"></div>
-                <div id="sec-browse-tools" class="sec-tools"></div>
-                <div class="sec-split">
-                    <nav id="sec-tree" class="sec-tree" aria-label="Groups"></nav>
-                    <div id="sec-entries" class="sec-entries"></div>
-                    <aside id="sec-detail" class="sec-detail" aria-label="Entry details"></aside>
-                </div>
-            </section>
+                <section id="sec-safes-view" aria-labelledby="sec-safes-h">
+                    <h2 id="sec-safes-h" class="sec-visually-hidden">Safes</h2>
+                    <div id="sec-safes" class="sec-safes">
+                        <p class="sec-subtle">Loading the safe registry&#8230;</p>
+                    </div>
+                </section>
 
-        </main>
+                <section id="sec-browse-view" aria-labelledby="sec-browse-h" hidden>
+                    <div class="sec-browse-head">
+                        <h2 id="sec-browse-h">Safe</h2>
+                        <div id="sec-browse-meta" class="sec-browse-meta"></div>
+                    </div>
+                    <div id="sec-browse-warnings"></div>
+                    <div id="sec-browse-tools" class="sec-tools"></div>
+                    <!-- The groups tree is a column beside the entries table
+                         on a wide frame and a disclosure above it on a narrow
+                         one. Same reasoning as the column chooser: <details>
+                         carries the state, the keyboard behaviour and the
+                         accessibility contract natively, so there is no
+                         overlay, no focus trap and no positioning maths. The
+                         summary is hidden by CSS at >= 60rem and secrets.js
+                         forces `open` there, so the wide layout is the tree
+                         itself with no extra chrome. -->
+                    <div class="sec-browse-split">
+                        <details id="sec-treewrap" class="sec-treewrap" open>
+                            <summary id="sec-treewrap-sum">Groups</summary>
+                            <nav id="sec-tree" class="sec-tree" aria-label="Groups"></nav>
+                        </details>
+                        <div id="sec-entries" class="sec-entries"></div>
+                    </div>
+                </section>
+
+            </main>
+
+            <aside id="sec-pane" class="sec-pane" role="complementary"
+                   aria-labelledby="sec-pane-h">
+                <div class="sec-pane-head">
+                    <button type="button" class="sec-btn link" id="sec-pane-back" hidden>&#8592; Safe details</button>
+                    <h2 id="sec-pane-h" tabindex="-1">No safe selected</h2>
+                </div>
+                <div id="sec-pane-body"></div>
+            </aside>
+
+        </div>
 
         <footer class="sec-footer">
             <p><strong>The passphrase is asked for every time a safe is opened.</strong> There is
@@ -91,7 +193,12 @@
             expire ends it.</p>
             <p><strong>Nothing about a safe is kept in this browser.</strong> The passphrase goes
             into one variable, is written to the helper&#8217;s standard input, and is overwritten.
-            No browser storage area, no cookie and no hidden field is used.</p>
+            No browser storage area, no cookie and no hidden field is used. That ban is also why
+            this page does not remember whether the details pane was open, or which optional
+            columns you chose: both settle to a sensible default on every load and live in
+            ordinary variables for the life of the page. It is a deliberate trade &#8212; the ban
+            is checkable by grep, and a ban with one exception is a ban somebody has to read the
+            code to trust.</p>
             <p><strong>Copying to the clipboard is best-effort.</strong> The clipboard is a shared
             operating-system resource: this page clears it when the countdown ends and when the
             page is hidden, but another application may already have read it, and a clipboard
@@ -127,9 +234,12 @@
             it and counts down to its automatic lock, from every view. If that banner is not
             there, nothing is being held &#8212; the agent is off unless a registry entry opts in,
             and there is nothing for it to hide.</p>
-            <p><strong>What is greyed out here is decoration.</strong> The helper re-derives the
-            caller&#8217;s identity from the kernel and re-checks the access class on every verb;
-            that is what refuses a safe you may not open, not this page.</p>
+            <p><strong>What is greyed out here is decoration, and so is what is hidden.</strong>
+            The helper re-derives the caller&#8217;s identity from the kernel and re-checks the
+            access class on every verb; that is what refuses a safe you may not open, not this
+            page. Administrator safes are listed only while Cockpit&#8217;s administrative access
+            is on, and hiding them is presentation only &#8212; the helper refuses a safe you may
+            not open whether or not this page drew a row for it.</p>
         </footer>
     </div>
 

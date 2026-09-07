@@ -127,6 +127,72 @@
  *                  is on and idle.
  * ------------------------------------------------------------------------
  */
+/* ---------------------------------------------------------------- theme ---
+ * A SECOND COPY of theme.js's resolver, and it runs only if theme.js did not.
+ *
+ * theme.js is the primary path: it is loaded first in <head>, undeferred, so
+ * the class lands before the stylesheet is requested and there is no flash by
+ * construction.
+ *
+ * HISTORY, KEPT BECAUSE IT EXPLAINS WHY THIS COPY EXISTS. theme.js is a file
+ * install.sh's PLUGIN array must name: that array is the list of files it
+ * copies AND the list it sweeps the package directory down to, so for the whole
+ * of 0.5.0 the installer copied theme.js and then swept it straight back off
+ * the host on the same run. The installed page answered the request with
+ * Cockpit's HTML error page and Chromium refused it on MIME type — a console
+ * error on every single load, not the silent 404 the old comment here claimed.
+ * Fixed in 0.5.1: `theme.js` is in PLUGIN, and install.sh now has a pre-flight
+ * that parses index.html's own package-local references and REFUSES to install
+ * a page that asks for a file the array does not ship, so the same omission
+ * cannot recur.
+ *
+ * This guarded copy STAYS, and not out of caution: it is what kept the theme
+ * correct through that outage (measured — with theme.js absent the frame still
+ * resolved sec-light/sec-dark in both directions), and it is the only resolver
+ * for a page loaded standalone or served by something that is not this
+ * installer. What it cannot do is beat first paint: it is deferred behind
+ * 476 KB, so on a cold cache or a slow link the frame paints unthemed inside
+ * its window (161 ms paint vs a 3068 ms resolve, measured). Correctness here,
+ * no-flash-by-construction in theme.js — the two are not substitutes.
+ *
+ * If `.sec-theme-managed` is already on <html>, theme.js ran and this does
+ * nothing at all.
+ *
+ * The reasoning for reading the parent's class rather than shell:style is in
+ * theme.js's header and is not repeated here.
+ */
+(function () {
+    "use strict";
+    var ROOT = document.documentElement;
+    if (ROOT.classList.contains("sec-theme-managed")) return;   /* theme.js ran */
+    var DARK_RE = /(^|\s)pf-(v\d+-)?theme-dark(\s|$)/;
+    function shellRoot() {
+        try {
+            if (window.parent && window.parent !== window)
+                return window.parent.document.documentElement;
+        } catch (e) { /* cross-origin or blocked */ }
+        return null;
+    }
+    function apply() {
+        var host = shellRoot(), dark;
+        if (host) dark = DARK_RE.test(host.className);
+        else dark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+        ROOT.classList.toggle("sec-dark", !!dark);
+        ROOT.classList.toggle("sec-light", !dark);
+        ROOT.classList.add("sec-theme-managed");
+    }
+    apply();
+    var host = shellRoot();
+    if (host) {
+        new MutationObserver(apply).observe(host,
+            { attributes: true, attributeFilter: ["class"] });
+    } else {
+        var mq = window.matchMedia("(prefers-color-scheme: dark)");
+        if (mq.addEventListener) mq.addEventListener("change", apply);
+        else if (mq.addListener) mq.addListener(apply);
+    }
+}());
+
 (function () {
     "use strict";
 
@@ -145,6 +211,42 @@
     var PERM = null;            // cockpit.permission({admin:true})
     var SESSION = null;         // the one open unlock session, or null
     var BROWSE = null;          // the browse view's state for that session
+
+    /* ------------------------------------------------------------------ *
+     * THE DETAILS PANE (R3/R4), THE SORT AND THE COLUMN SELECTION (R2/R5).
+     *
+     * All three live in ordinary variables for the life of the page and are
+     * NOT persisted, deliberately. validate.sh bans all four browser-storage
+     * identifiers as bare words anywhere in this package's JavaScript (I11) —
+     * this comment cannot spell them, which is the ban working — and the live suite
+     * additionally fails a run in which ANY storage key changes. That ban is
+     * the mechanical guarantee that nothing about a safe is left behind in a
+     * browser, and it is checkable by grep — a ban with one exception is a ban
+     * an auditor has to read the code to trust. Remembering a pane position is
+     * not worth spending it. If it is ever revisited the right answer is a
+     * helper-side `ui-prefs` verb, so preferences live on the host under the
+     * same access class and the same audit line as everything else.
+     * ------------------------------------------------------------------ */
+    var PANE = {
+        open: true,          // recomputed from the frame width on first render
+        userToggled: false,  // once the operator touches it, width stops deciding
+        wide: null,          // last known answer to "is the frame >= 60rem"
+        safeId: null,        // the selected registry row, or null
+        mode: "safe"         // "safe" | "entry" — which content the stack shows
+    };
+    /* Optional columns (R5). Fixed ORDER lives in SAFE_OPT_COLS below; this is
+     * only which of them are on. Path is off by default — see the three
+     * reasons where the chooser is built. */
+    var COLS = { path: false, registry: false, kdf: false, modified: false, id: false };
+    /* Whether the chooser's disclosure is open, and which checkbox the operator
+     * was standing on. Toggling a column re-renders the table, which destroys
+     * both — so both are put back. A control that closes itself and drops your
+     * focus every time you use it is a control nobody uses twice. */
+    var COLS_OPEN = false;
+    /* Default sort: Class (administrator first), then the safe's label. Admin
+     * is the DEFAULT access class (I1), so the list reads in the order the
+     * registry defaults do. */
+    var SAFESORT = { key: "class", desc: false };
 
     /* The agent's own state (I18). `rows` is what the helper last said it is
      * holding — never what this page decided; an empty array means the banner
@@ -2689,12 +2791,33 @@
         });
         announce("Clipboard cleared because " + (why || "the countdown ended") + ".");
     }
-    function copyValue(value) {
+    /* THE CLIPBOARD COUNTDOWN IS ARMED FOR SECRETS ONLY.
+     *
+     * It used to be armed for everything this function was handed, including a
+     * registry path — which is not secret, is on screen in full a centimetre
+     * away, and is the sort of thing an operator copies into a shell. A chip
+     * that cries wolf teaches an operator to ignore the one that matters, and
+     * the countdown chip IS the page's statement that something dangerous is
+     * on the clipboard.
+     *
+     * So the caller says. `secret: true` arms the countdown and clears the
+     * clipboard on its deadline; the default is a plain copy with a one-shot
+     * polite confirmation and no chip. There is no third behaviour: a value is
+     * either worth clearing or it is not.
+     *
+     * opts: { secret: bool, what: string }  — `what` names the thing in the
+     * announcement, and never contains the value itself. */
+    function copyValue(value, opts) {
+        opts = opts || {};
         if (!navigator.clipboard || !navigator.clipboard.writeText)
             return Promise.reject(mkErr("unsupported",
                 "This browser does not offer the clipboard API to this page."));
         return navigator.clipboard.writeText(value).then(function () {
-            clipboardArm(uiNum("clipboard_seconds", uiNum("reveal_seconds", 15)));
+            if (opts.secret)
+                clipboardArm(uiNum("clipboard_seconds", uiNum("reveal_seconds", 15)));
+            else
+                announce((opts.what || "Value") + " copied. It is not a secret, so the " +
+                         "clipboard is not being counted down or cleared.");
         });
     }
 
@@ -2762,7 +2885,18 @@
             var left = (deadline - Date.now()) / 1000;
             if (left <= 0) { hideNow("the countdown ended"); return; }
             cd.textContent = "hides in " + fmtSeconds(left);
-            bar.style.width = Math.max(0, Math.min(100, (left / seconds) * 100)) + "%";
+            /* ONE custom property on the track, never a built style string.
+             * The bar's whole geometry lives in secrets.css; this sets a
+             * number. That is the CSP-safe form (I9) and it is also the only
+             * thing that has to change if the bar is ever restyled. */
+            meter.style.setProperty("--sec-remain",
+                Math.max(0, Math.min(100, (left / seconds) * 100)) + "%");
+            /* THE LAST FIVE SECONDS. The numerals go medium-weight and
+             * danger-coloured and the bar follows — but the numeral itself is
+             * still the text carrier, so colour is never alone. */
+            var urgent = left <= 5;
+            cd.className = "sec-countdown" + (urgent ? " urgent" : "");
+            meter.className = "sec-meter" + (urgent ? " urgent" : "");
         }
 
         function showValue(value, secs) {
@@ -2774,7 +2908,9 @@
             seconds = secs;
             deadline = Date.now() + secs * 1000;
             meter.hidden = false;
-            bar.style.width = "100%";
+            meter.className = "sec-meter";
+            cd.className = "sec-countdown";
+            meter.style.setProperty("--sec-remain", "100%");
             if (timer) window.clearInterval(timer);
             timer = window.setInterval(tick, 500);
             tick();
@@ -2811,14 +2947,15 @@
             /* Already on screen: copy the value we are holding, inside the
              * click itself, which is what the clipboard API wants. */
             if (shown !== null) {
-                copyValue(shown).catch(function (e) { errHost.appendChild(errNode(e)); });
+                copyValue(shown, { secret: true })
+                    .catch(function (e) { errHost.appendChild(errNode(e)); });
                 return;
             }
             /* Not on screen: fetch, then write inside the promise chain this
              * click started. If the browser has already dropped the gesture the
              * write rejects and we say so rather than failing silently. */
             fetchValue().then(function (r) {
-                return copyValue(r.value);
+                return copyValue(r.value, { secret: true });
             }).catch(function (e) {
                 errHost.appendChild(errNode(
                     errCode(e) ? e : mkErr("internal",
@@ -2984,11 +3121,27 @@
     /* ================================================================== *
      * The safe list
      * ================================================================== */
+    /* STATE 1 — LOADING. A skeleton, not a spinner, and it NEVER SHIMMERS —
+     * for anyone, not only under reduced motion. A pulsing block behind a
+     * security tool reads as activity that is not happening. A static tint at
+     * the table's real row height says "a table is coming and it will be about
+     * this big", which is the true statement and stops the layout jumping when
+     * the rows arrive. */
+    function skeletonTable(host) {
+        var wrap = el("div", "sec-tablewrap");
+        var sk = el("div", "sec-skeleton");
+        sk.setAttribute("aria-hidden", "true");
+        for (var i = 0; i < 3; i++) sk.appendChild(el("span"));
+        wrap.appendChild(sk);
+        host.appendChild(el("p", "sec-subtle", "Reading the safe registry…"));
+        host.appendChild(wrap);
+    }
+
     function refreshAll() {
         alertBox(null);
         var host = byId("sec-safes");
         clear(host);
-        host.appendChild(el("p", "sec-subtle", "Loading the safe registry…"));
+        skeletonTable(host);
         /* `list` is a plain, unescalated call: it names what exists. Whether
          * the caller may OPEN any given safe is decided by the helper, per
          * verb, from the kernel's idea of who is calling (I3). */
@@ -3125,6 +3278,459 @@
         });
     }
 
+    /* ================================================================== *
+     * GLYPHS
+     *
+     * Every glyph on this page is either a real character in the text run with
+     * a visually-hidden word beside it, or an inline <svg> built here with
+     * createElementNS and painted with `currentColor`. No icon font, no sprite
+     * sheet, no `content: url()`: no new asset, and nothing that could ever
+     * become a CSP question (I9).
+     * ================================================================== */
+    var SVG_NS = "http://www.w3.org/2000/svg";
+    /* Path data only — 16x16 viewBox, stroked, never filled with a colour of
+     * its own. `class` is set by the caller so a state can tint it. */
+    var GLYPHS = {
+        /* A panel docked to the right: a rounded rectangle whose right-hand
+         * third is divided off. This is the pane toggle. */
+        "panel-right": ["M2 3h12v10H2z", "M10.5 3v10"],
+        /* A key, for "held open" and for "hidden by elevation". */
+        "key": ["M9.5 6.5a3 3 0 1 0-2.6 2.98L6 10.5v1.5H4.5V14H2v-2.5l4.9-4.9",
+                "M11 4.5h.01"],
+        /* A safe / box outline, for "no safes registered". */
+        "box": ["M2 4.5h12v9H2z", "M2 4.5 8 2l6 2.5", "M8 8.5h3"],
+        /* A warning triangle, for "the helper did not answer". */
+        "warning": ["M8 2 15 14H1z", "M8 6.5v3.5", "M8 12h.01"],
+        /* A closed padlock, for the lockout state (I16). */
+        "lock": ["M3.5 7.5h9v6h-9z", "M5.5 7.5V5a2.5 2.5 0 0 1 5 0v2.5"]
+    };
+    function svgGlyph(name, cls) {
+        var svg = document.createElementNS(SVG_NS, "svg");
+        svg.setAttribute("viewBox", "0 0 16 16");
+        svg.setAttribute("width", "16");
+        svg.setAttribute("height", "16");
+        svg.setAttribute("aria-hidden", "true");
+        svg.setAttribute("focusable", "false");
+        if (cls) svg.setAttribute("class", cls);
+        (GLYPHS[name] || []).forEach(function (d) {
+            var p = document.createElementNS(SVG_NS, "path");
+            p.setAttribute("d", d);
+            p.setAttribute("fill", "none");
+            p.setAttribute("stroke", "currentColor");
+            p.setAttribute("stroke-width", "1.5");
+            p.setAttribute("stroke-linecap", "round");
+            p.setAttribute("stroke-linejoin", "round");
+            svg.appendChild(p);
+        });
+        return svg;
+    }
+
+    /* ================================================================== *
+     * THE DETAILS PANE (R3) AND ITS TOGGLE (R4)
+     *
+     * One workspace, one pane, and the pane is where every action lives.
+     *
+     * WHY THE TOGGLE IS NOT A HAMBURGER, flagged so it can be overruled in one
+     * line: the three bars mean NAVIGATION MENU everywhere they appear, and
+     * this control docks and undocks a side panel. Using the menu glyph for it
+     * would be the most confusing single choice on the page. R4's actual
+     * requirement — a real <button>, with aria-expanded, with an accessible
+     * name, that collapses and expands the pane — is met in full; only the
+     * glyph differs. To revert: replace the svgGlyph("panel-right") call in
+     * initPane() with document.createTextNode("☰") and leave everything
+     * else exactly as it is.
+     *
+     * COLLAPSED MEANS GONE. There is no sliver. A sliver of a pane whose
+     * content can include a revealed value is a half-open door, and it costs
+     * horizontal space for no information. The affordance that the pane exists
+     * is the toggle, which is always in the topbar and always carries
+     * aria-expanded.
+     * ================================================================== */
+    function paneNode() { return byId("sec-pane"); }
+    function paneBody() { return byId("sec-pane-body"); }
+    function paneHeading() { return byId("sec-pane-h"); }
+    function paneToggle() { return byId("sec-pane-toggle"); }
+
+    /* MEASURED AGAINST THE FRAME, NOT THE WINDOW. Cockpit's sidebar eats the
+     * width: the plugin iframe is 1160px inside a 1400px window and 760px
+     * inside a 1000px one, so a media query in secrets.css evaluates against
+     * 1160, not 1400. The old three-column browse layout collapsed at 75rem
+     * (1200px) and therefore never happened at any ordinary desktop size —
+     * which is why the entry detail rendered as a 208px strip below the fold.
+     * 60rem is reachable where 75rem was not. */
+    function frameIsWide() {
+        return !!(window.matchMedia && window.matchMedia("(min-width: 60rem)").matches);
+    }
+
+    function setPaneOpen(open, opts) {
+        opts = opts || {};
+        var ws = byId("sec-workspace"), pane = paneNode(), tog = paneToggle();
+        PANE.open = !!open;
+        if (ws) {
+            if (PANE.open) ws.classList.add("sec-pane-open");
+            else ws.classList.remove("sec-pane-open");
+        }
+        if (pane) pane.hidden = !PANE.open;
+        if (tog) tog.setAttribute("aria-expanded", PANE.open ? "true" : "false");
+        /* The second skip link only exists while there is something to skip
+         * to. A skip link pointing at a display:none target is a dead end. */
+        var skip = byId("sec-skip-pane");
+        if (skip) skip.hidden = !PANE.open;
+        if (opts.announce) announce(PANE.open ? "Details pane shown." : "Details pane hidden.");
+        if (opts.focus === "pane" && PANE.open && paneHeading()) paneHeading().focus();
+        if (opts.focus === "toggle" && tog) tog.focus();
+    }
+
+    /* The default is recomputed only when the frame CROSSES 60rem, and only
+     * while the operator has not touched the toggle. One boolean. */
+    function syncPaneDefault() {
+        var wide = frameIsWide();
+        if (PANE.wide === wide) return;
+        PANE.wide = wide;
+        if (PANE.userToggled) return;
+        setPaneOpen(wide);
+    }
+
+    function initPane() {
+        var tog = paneToggle();
+        if (tog) {
+            tog.insertBefore(svgGlyph("panel-right"), tog.firstChild);
+            tog.addEventListener("click", function () {
+                PANE.userToggled = true;
+                var opening = !PANE.open;
+                setPaneOpen(opening, { announce: true,
+                                       focus: opening ? "pane" : "toggle" });
+            });
+        }
+        var back = byId("sec-pane-back");
+        if (back) back.addEventListener("click", function () {
+            /* Swaps the pane's CONTENT back to the safe's registry detail
+             * without deselecting the entry, so the forward control returns to
+             * exactly where the operator was. */
+            PANE.mode = "safe";
+            renderPane();
+        });
+        /* Escape inside the pane collapses it and returns focus to the toggle.
+         * This is only safe because THE PANE CONTAINS NO FREE-TEXT ENTRY —
+         * every mutation on this page goes through a modal. If that invariant
+         * is ever broken this handler has to go with it. An open modal's own
+         * handler runs first and swallows the key. */
+        var pane = paneNode();
+        if (pane) pane.addEventListener("keydown", function (ev) {
+            if (ev.key !== "Escape") return;
+            if (document.querySelector(".sec-modal")) return;
+            PANE.userToggled = true;
+            setPaneOpen(false, { announce: true, focus: "toggle" });
+        });
+        PANE.wide = frameIsWide();
+        setPaneOpen(PANE.wide);
+        if (window.matchMedia) {
+            var mq = window.matchMedia("(min-width: 60rem)");
+            var onCross = function () { syncPaneDefault(); syncTreeDisclosure(); };
+            if (mq.addEventListener) mq.addEventListener("change", onCross);
+            else if (mq.addListener) mq.addListener(onCross);
+        }
+        syncTreeDisclosure();
+    }
+
+    /* Selecting a row. The pane opens if it was collapsed — the operator asked
+     * for detail, and a detail request that shows nothing is a bug. Focus
+     * STAYS on the row button: the intent was to choose a safe, and yanking
+     * focus out of the table breaks arrow-key scanning. */
+    function selectSafe(id, opts) {
+        opts = opts || {};
+        PANE.safeId = id;
+        PANE.mode = "safe";
+        if (!PANE.open) setPaneOpen(true);
+        renderPane();
+        /* Re-rendering the table destroys the very node the operator is
+         * standing on, so the door is put back under their finger. Without
+         * this, clicking or Entering a row drops focus to <body> — which loses
+         * their place entirely and is exactly what the arrow keys exist to
+         * avoid. Focus is NOT moved into the pane: the intent was to choose a
+         * safe, not to go and read about one. */
+        var wasOnDoor = !!(document.activeElement &&
+                           document.activeElement.classList &&
+                           document.activeElement.classList.contains("sec-rowdoor"));
+        if (!SESSION) renderSafes();
+        if (wasOnDoor) {
+            var back = document.querySelector(
+                "#sec-safes tbody tr.selected button.sec-rowdoor");
+            if (back) back.focus();
+        }
+        var safe = safeById(id);
+        if (opts.announce !== false && safe)
+            announce("Details for " + (safe.label || safe.id) +
+                     " shown in the details pane.");
+        /* Un-docked the pane is off-screen below the table, so "it appeared
+         * somewhere further down" is not discoverable. Take the operator to it
+         * — but only at that width, and never while it is docked beside them. */
+        if (!frameIsWide() && paneNode()) {
+            var reduce = window.matchMedia &&
+                window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+            try {
+                paneNode().scrollIntoView({ block: "start",
+                                            behavior: reduce ? "auto" : "smooth" });
+            } catch (e) { paneNode().scrollIntoView(); }
+            if (paneHeading()) paneHeading().focus();
+        }
+    }
+
+    function safeById(id) {
+        var found = null;
+        SAFES.forEach(function (s) { if (s.id === id) found = s; });
+        return found;
+    }
+
+    /* ------------------------------------------------------------------ *
+     * R1 — visibility follows elevation.
+     *
+     * User-class safes are always listed. Administrator-class safes are listed
+     * only while cockpit.permission({admin:true}).allowed is true, and the list
+     * reacts to the `changed` event, not only to page load.
+     *
+     * SAY PLAINLY THAT THIS IS COSMETIC. Hiding a row is presentation only:
+     * the helper re-derives who is calling from the kernel and re-checks the
+     * access class inside every verb, and that is what refuses a safe you may
+     * not open — whether or not this page drew a row for it. A page that hides
+     * rows and lets an operator infer that hiding IS the control is lying
+     * about where the security boundary is.
+     *
+     * AND THE TRAP: admin is the DEFAULT access class (I1), so a typical
+     * install is mostly admin safes and an unelevated administrator would
+     * otherwise open this page, see nothing, and conclude the tool is broken.
+     * Whenever this hides anything, the page says so — by COUNT ONLY, never an
+     * id, a label, a format or a path.
+     * ------------------------------------------------------------------ */
+    /* WHAT HAPPENS WHEN ADMINISTRATIVE ACCESS CHANGES UNDER A DRAWN PAGE.
+     *
+     * Granted is easy: rows appear, the count note goes, focus does not move —
+     * moving an operator's focus because a background condition IMPROVED is
+     * hostile.
+     *
+     * Revoked while an admin safe is SELECTED is the case that has to be
+     * specified, and the order below is the specification:
+     *   1. if a session is open on that safe, LOCK IT. Not merely tidy: the
+     *      helper will refuse the next verb anyway, and a page holding a live
+     *      handle it can no longer use is a page showing stale,
+     *      decrypted-looking content.
+     *   2. wipe every revealed value in the DOM and cancel every countdown.
+     *   3. clear the clipboard, with the reason.
+     *   4. the pane STAYS OPEN and switches to its "nothing selected" content.
+     *      It is not closed: collapsing a pane out from under a keyboard user
+     *      moves focus somewhere they did not ask for, and the pane's empty
+     *      state is where the explanation now needs to be.
+     *   5. the toggle keeps whatever aria-expanded it had. The pane's CONTENT
+     *      changed; its disposition did not, and the operator did not touch it.
+     *   6. focus moves to #sec-main only if it was inside the pane or the row
+     *      that is about to be removed. Never to a node about to be removed,
+     *      and never allowed to fall to <body>.
+     *   7. an ASSERTIVE alert, because this interrupts what they were doing.
+     *      It names the safe's LABEL deliberately — they had it selected a
+     *      moment ago, so this discloses nothing they were not already looking
+     *      at, and an anonymous "a safe was locked" is useless.
+     */
+    function elevationChanged() {
+        var hidden = hiddenSafeCount();
+        var sel = PANE.safeId ? safeById(PANE.safeId) : null;
+        var losing = sel && !safeIsVisible(sel);
+        var openLosing = SESSION && !safeIsVisible(SESSION.safe);
+
+        if (!losing && !openLosing) {
+            if (adminAllowed())
+                announce("Administrative access is on." +
+                         (SAFES.length ? " " + visibleSafes().length + " safe" +
+                          (visibleSafes().length === 1 ? " is" : "s are") + " listed." : ""));
+            else if (hidden)
+                announce(hiddenSentence(hidden));
+            return;
+        }
+
+        var name = (openLosing ? SESSION.safe : sel);
+        var label = String(name.label || name.id);
+
+        /* Where focus is standing right now, decided BEFORE anything is
+         * removed. */
+        var inDoomed = false;
+        var active = document.activeElement;
+        if (active) {
+            if (paneNode() && paneNode().contains(active)) inDoomed = true;
+            var row = active.closest ? active.closest("tr.sec-safe") : null;
+            if (row) inDoomed = true;
+        }
+
+        if (openLosing) lockNow("administrative access was turned off");
+        wipeAllValues();
+        clipboardClear("administrative access was turned off");
+
+        PANE.safeId = null;
+        PANE.mode = "safe";
+        /* Note what is NOT done here: setPaneOpen() is not called. */
+        renderPane();
+
+        if (inDoomed && byId("sec-main")) byId("sec-main").focus();
+
+        alertText("Administrative access was turned off. " + label + " was locked and " +
+                  "everything shown from it was cleared. Administrator safes are hidden " +
+                  "until access is on again.", "warn");
+        announce(hiddenSentence(hiddenSafeCount()));
+    }
+
+    function safeIsVisible(safe) { return !isAdminClass(safe) || adminAllowed(); }
+    function visibleSafes() { return SAFES.filter(safeIsVisible); }
+    function hiddenSafeCount() { return SAFES.length - visibleSafes().length; }
+    function hiddenSentence(n) {
+        return n + " administrator safe" + (n === 1 ? " is" : "s are") + " hidden.";
+    }
+
+    /* ------------------------------------------------------------------ *
+     * The State cell (R2, column 4).
+     *
+     * Every state an operator must not miss, as chips, in severity order. At
+     * most two are drawn and the rest become "+N" — a row with six chips is a
+     * row nobody reads, and the pane lists all of them in full.
+     *
+     * EVERY CHIP'S MEANING IS ITS WORD. Colour is a second carrier and never
+     * the only one, which is also why there is no "Normal" chip: nothing to
+     * say is an empty cell.
+     * ------------------------------------------------------------------ */
+    function safeStates(safe) {
+        var p = PROBES[safe.id], out = [];
+        /* Rank 1. safeReachable() is called, never re-derived: an
+         * ADMIN-class safe is NEVER marked unreachable, because `list` is
+         * always spawned unescalated and returns usable:false for every admin
+         * entry for every caller in every session. Reading that verdict as a
+         * refusal is what once disabled the default access class permanently. */
+        if (!safeReachable(safe)) out.push({ label: "Unreachable", kind: "err" });
+        if (p && !p._error && (p.warnings || []).length)
+            out.push({ label: "Warnings (" + p.warnings.length + ")", kind: "warn" });
+        if (p && !p._error && p.writable === false)
+            out.push({ label: "Not writable", kind: "warn" });
+        if (safe.mode === "ro") out.push({ label: "Read-only", kind: "warn" });
+        if (safe.agent_enabled) out.push({ label: "Agent enabled", kind: "warn" });
+        if (safe.needs_keyfile) out.push({ label: "Key file", kind: "" });
+        if (safe.password_required === false) out.push({ label: "Keyed", kind: "" });
+        return out;
+    }
+
+    function safeFormatText(safe) {
+        var p = PROBES[safe.id];
+        var fmt = (p && !p._error && p.format) || safe.format || "?";
+        var ver = (p && !p._error && p.version) ? " " + p.version : "";
+        return String(fmt) + ver;
+    }
+    function safeRegistryText(safe) {
+        if (!safe.registry) return "";
+        var label = safe.registry;
+        var opts = (SCHEMA && SCHEMA.enums && SCHEMA.enums.registry_source) || [];
+        opts.forEach(function (o) {
+            if (o && String(o.value) === String(safe.registry)) label = o.label || label;
+        });
+        return String(label);
+    }
+    function safeKdfText(safe) {
+        var p = PROBES[safe.id];
+        if (!p || p._error) return "";
+        var bits = [];
+        if (p.kdf) bits.push(String(p.kdf));
+        if (p.iterations) bits.push(p.iterations + " iterations");
+        return bits.join(" · ");
+    }
+    function safeModifiedText(safe) {
+        var p = PROBES[safe.id];
+        var v = safe.modified !== undefined ? safe.modified
+              : (p && !p._error ? p.modified : undefined);
+        return v === undefined || v === null ? "" : fmtWhen(v);
+    }
+    function safeClassText(safe) { return isAdminClass(safe) ? "Administrator" : "Yours"; }
+
+    /* The fixed order of the optional columns. It is fixed by design and NOT
+     * by the order the operator ticked the boxes: a table whose columns move
+     * under you is a table you have to re-read every time. */
+    var SAFE_OPT_COLS = [
+        { key: "path", label: "Path",
+          hint: "Where each safe's file lives. Off by default.",
+          value: function (s) { return s.path ? String(s.path) : ""; },
+          mono: true },
+        { key: "registry", label: "Registry",
+          hint: "Who says this file is a safe — root-owned policy, or an entry you wrote.",
+          value: safeRegistryText },
+        { key: "kdf", label: "KDF",
+          hint: "From the file header. Empty until the safe has been checked.",
+          value: safeKdfText },
+        { key: "modified", label: "Modified",
+          hint: "When the file last changed.",
+          value: safeModifiedText, num: true },
+        { key: "id", label: "Id",
+          hint: "The id on its own, so a large registry can be sorted by it.",
+          value: function (s) { return String(s.id); }, mono: true }
+    ];
+
+    /* A column is OFFERED only when at least one currently visible row could
+     * fill it. A helper that does not publish `modified` never shows a dead
+     * checkbox, and nothing has to be special-cased for it. */
+    function optColAvailable(col, rows) {
+        if (col.key === "path") return rows.some(function (s) { return !!s.path; });
+        if (col.key === "id") return rows.length > 0;
+        return rows.some(function (s) { return !!col.value(s); });
+    }
+
+    function safeSortValue(safe, key) {
+        switch (key) {
+        case "class":  return isAdminClass(safe) ? "0" : "1";
+        case "format": return safeFormatText(safe).toLowerCase();
+        case "state":  {
+            var st = safeStates(safe);
+            /* Severity rank: the worst chip decides, and "nothing to say"
+             * sorts last rather than first. */
+            return st.length ? String(safeStates(safe).length ? 0 : 9) +
+                               st[0].label.toLowerCase() : "9";
+        }
+        case "safe":   return String(safe.label || safe.id).toLowerCase();
+        default: {
+            var col = null;
+            SAFE_OPT_COLS.forEach(function (c) { if (c.key === key) col = c; });
+            return col ? String(col.value(safe)).toLowerCase() : "";
+        }
+        }
+    }
+
+    function sortSafes(rows) {
+        var key = SAFESORT.key, desc = SAFESORT.desc;
+        return rows.slice().sort(function (a, b) {
+            var x = safeSortValue(a, key), y = safeSortValue(b, key);
+            if (x !== y) return (x < y ? -1 : 1) * (desc ? -1 : 1);
+            /* The stable tie-break is always the label, so two administrator
+             * safes never swap places between renders. */
+            var la = String(a.label || a.id).toLowerCase();
+            var lb = String(b.label || b.id).toLowerCase();
+            if (la === lb) return 0;
+            return la < lb ? -1 : 1;
+        });
+    }
+
+    /* ------------------------------------------------------------------ *
+     * The empty / limited / broken states.
+     *
+     * One component so they read as a family; five instances, each
+     * unmistakably itself. States 2 and 3 differ in THREE ways at once —
+     * heading, glyph, and the presence or absence of buttons — because an
+     * operator must never have to read carefully to tell "you cannot see them"
+     * from "there are none".
+     * ------------------------------------------------------------------ */
+    function stateBlock(opts) {
+        var box = el("div", "sec-state" + (opts.flush ? " flush" : ""));
+        if (opts.glyph) box.appendChild(svgGlyph(opts.glyph, "glyph " + (opts.glyphKind || "")));
+        if (opts.heading) box.appendChild(el("h3", null, opts.heading));
+        (opts.body || []).forEach(function (p) {
+            box.appendChild(typeof p === "string" ? el("p", null, p) : p);
+        });
+        return box;
+    }
+
+    /* ================================================================== *
+     * The safes table (R2)
+     * ================================================================== */
     function renderSafes() {
         var host = byId("sec-safes");
         clear(host);
@@ -3133,61 +3739,131 @@
         var esc = escalationBanner();
         if (esc) banner.appendChild(esc);
 
+        var rows = visibleSafes();
+        var hidden = hiddenSafeCount();
+
         if (!SAFES.length) {
-            /* THE EMPTY STATE HAS TO OFFER THE WAY OUT OF ITSELF.
+            /* STATE C — THE REGISTRY IS GENUINELY EMPTY, and the empty state
+             * has to offer the way out of itself.
              *
              * This is the first thing a new operator sees, and until there was
              * a way to make a safe from the page it was a dead end with an
              * instruction to go and hand-write two files as root. The controls
              * that fix that belong HERE, above the explanation — an empty list
              * that hides the button for filling it is the worst place to hide
-             * it. */
+             * it. `.sec-empty` is kept as the wrapper: the suites select on it. */
             var empty = el("div", "sec-empty");
-            empty.appendChild(el("p", null,
-                "There are no safes yet. Make one, or register a safe file you already have."));
             var acts = el("div", "sec-tools");
             var offered = registryActions(acts);
-            if (offered) empty.appendChild(acts);
             var where = registryDirs();
-            empty.appendChild(el("p", null,
+            var body = ["Make one, or register a safe file you already have."];
+            var st = stateBlock({ glyph: "box", heading: "No safes are registered",
+                                  body: body });
+            if (offered) st.appendChild(acts);
+            st.appendChild(el("p", "sec-subtle",
                 "Safes are declared by the registry" +
                 (where.system ? " in " + where.system : "") +
                 "; `secrets-admin health` reports why an entry was dropped." +
                 (offered ? "" :
                     " This helper publishes no verb for creating or importing one, so a " +
                     "safe still has to be registered on the host.")));
+            empty.appendChild(st);
             host.appendChild(empty);
+            renderPane();
             return;
         }
 
-        /* Admin first, because admin is the DEFAULT access class (I1) and the
-         * list should read in the same order the registry defaults do. */
-        var classes = [
-            { key: "admin", label: "Administrator safes",
-              note: "The default class. Root-owned files; every verb is spawned with " +
-                    "Cockpit's administrative access, which has to be ON in this session " +
-                    "already, and the helper refuses the verb unless it is running as root." },
-            { key: "user", label: "Your own safes",
-              note: "Opened by the helper running as you, with no escalation at all. The file " +
-                    "must be owned by you." }
+        if (!rows.length) {
+            /* STATE B — NOTHING VISIBLE, BUT ADMIN SAFES EXIST. A full panel,
+             * not a footnote: the region is otherwise empty and an empty region
+             * needs an explanation.
+             *
+             * NO ACTION BUTTON. Measured on this host: a channel opened with
+             * superuser:"require" is refused immediately with `access-denied`
+             * and no dialog is drawn anywhere — Cockpit's escalation dialog
+             * belongs to the shell and no package page can raise it. A button
+             * that cannot work is worse than no button. */
+            host.appendChild(stateBlock({
+                glyph: "key", heading: "Nothing is visible while access is limited",
+                body: [
+                    hiddenSentence(hidden) +
+                        " Turn on Administrative access with the “Limited access” " +
+                        "control in the Cockpit header.",
+                    "Hiding them is presentation only — the helper re-checks the access " +
+                        "class on every operation, from the kernel's idea of who is calling."
+                ]
+            }));
+            renderPane();
+            return;
+        }
+
+        var wrap = el("div", "sec-tablewrap");
+        var bar = el("div", "sec-toolbar");
+        if (hidden) {
+            /* STATE A — some visible, some hidden. ONE QUIET LINE. It is not
+             * an alert and must not be styled as one: it is a true, unalarming
+             * fact about a completely normal configuration, and a
+             * warning-coloured box on every load of an unelevated session is
+             * how a page teaches people to ignore its warnings. Count only. */
+            bar.appendChild(el("p", "sec-hidden-note",
+                hiddenSentence(hidden) +
+                " Turn on Administrative access in the Cockpit header to see them."));
+        } else {
+            bar.appendChild(el("span", "sec-spacer"));
+        }
+        bar.appendChild(el("span", "sec-spacer"));
+        columnChooser(bar, rows);
+        wrap.appendChild(bar);
+
+        var scroll = el("div", "sec-scroll");
+        var t = el("table", "sec sec-safes-table");
+        var cap = el("caption", null,
+            rows.length + " safe" + (rows.length === 1 ? "" : "s"));
+        t.appendChild(cap);
+
+        var cols = [
+            { key: "safe",   label: "Safe",   sortable: true },
+            { key: "class",  label: "Class",  sortable: true },
+            { key: "format", label: "Format", sortable: true },
+            { key: "state",  label: "State",  sortable: true }
         ];
-        var seen = {};
-        classes.forEach(function (cls) {
-            var rows = SAFES.filter(function (s) {
-                var k = isAdminClass(s) ? "admin" : "user";
-                if (k !== cls.key) return false;
-                seen[s.id] = 1;
-                return true;
-            });
-            if (!rows.length) return;
-            var block = el("section", "sec-class-block");
-            block.appendChild(el("h3", null, cls.label));
-            block.appendChild(el("p", "sec-class-note sec-subtle", cls.note));
-            var grid = el("div", "sec-safes");
-            rows.forEach(function (s) { grid.appendChild(safeCard(s)); });
-            block.appendChild(grid);
-            host.appendChild(block);
+        SAFE_OPT_COLS.forEach(function (c) {
+            if (COLS[c.key] && optColAvailable(c, rows)) cols.push(c);
         });
+
+        var thead = el("thead"), htr = el("tr");
+        cols.forEach(function (c) {
+            var th = el("th");
+            th.scope = "col";
+            if (c.sortable === false) { th.textContent = c.label; htr.appendChild(th); return; }
+            /* aria-sort is the ACCESSIBLE carrier and the glyph is the visual
+             * one. Neither is colour. */
+            th.setAttribute("aria-sort", SAFESORT.key === c.key
+                ? (SAFESORT.desc ? "descending" : "ascending") : "none");
+            var b = el("button", null, c.label);
+            b.type = "button";
+            if (SAFESORT.key === c.key) {
+                var g = el("span", null, SAFESORT.desc ? " ▼" : " ▲");
+                g.setAttribute("aria-hidden", "true");
+                b.appendChild(g);
+            }
+            b.addEventListener("click", function () {
+                if (SAFESORT.key === c.key) SAFESORT.desc = !SAFESORT.desc;
+                else { SAFESORT.key = c.key; SAFESORT.desc = false; }
+                renderSafes();
+            });
+            th.appendChild(b);
+            htr.appendChild(th);
+        });
+        thead.appendChild(htr);
+        t.appendChild(thead);
+
+        var tb = el("tbody");
+        sortSafes(rows).forEach(function (s) { tb.appendChild(safeRow(s, cols)); });
+        t.appendChild(tb);
+        scroll.appendChild(t);
+        wrap.appendChild(scroll);
+        host.appendChild(wrap);
 
         var tools = el("div", "sec-tools");
         /* Making a safe exist comes FIRST in this row, before the diagnostics.
@@ -3209,103 +3885,411 @@
                 function () { verbDialog(name, {}, null); }));
         });
         if (tools.childNodes.length) host.appendChild(tools);
+
+        renderPane();
     }
 
-    function safeCard(safe) {
+    /* ------------------------------------------------------- the column chooser (R5) ---
+     * A general chooser, not a one-off checkbox for Path — every optional
+     * column is offered the same way and the mechanism does not care which one
+     * anybody adds next.
+     *
+     * A <details> rather than a popup menu: it needs no focus trap, no
+     * outside-click handler, no positioning maths and no aria-expanded
+     * bookkeeping (the element carries all of that natively); it degrades
+     * correctly with CSS off; and at 200% zoom it reflows instead of
+     * overflowing a viewport. It pushes the table down when open, which is
+     * honest and costs nothing.
+     *
+     * WHY PATH IS OFF BY DEFAULT — all three reasons, so nobody later "fixes" it:
+     *   1. IT DISCLOSES. A path names a home directory and therefore an
+     *      account, and it names the host's filesystem layout. This page gets
+     *      screenshotted; the default view should not carry that.
+     *   2. IT DOES NOT SCAN. It is by a wide margin the longest value in the
+     *      row and the only one that must wrap. One Path column turns a
+     *      four-line table into a twelve-line one.
+     *   3. IT IS THE WRONG QUESTION AT THIS MOMENT. Choosing which safe to open
+     *      is done by label, class and format. "Which file is this, exactly" is
+     *      a question that arises when something is WRONG — which is exactly
+     *      when the operator opens the details pane, where it always is.
+     * And the counterweight, which is why it is not simply omitted: a safe you
+     * cannot locate on disk is a safe you cannot back up, cannot repair and
+     * cannot prove is the one you meant. It is ALWAYS in the pane, in full.
+     */
+    function columnChooser(host, rows) {
+        var offered = SAFE_OPT_COLS.filter(function (c) { return optColAvailable(c, rows); });
+        if (!offered.length) return;
+        var on = offered.filter(function (c) { return COLS[c.key]; }).length;
+        var d = el("details", "sec-columns");
+        d.open = COLS_OPEN;
+        d.addEventListener("toggle", function () { COLS_OPEN = d.open; });
+        var sum = el("summary", null,
+            "Columns" + (on ? " · " + on + " extra" : ""));
+        d.appendChild(sum);
+        /* Escape closes the disclosure and returns focus to the summary.
+         * <details> does not do that natively and a keyboard user who opened it
+         * would otherwise have to tab back out through every checkbox. */
+        d.addEventListener("keydown", function (ev) {
+            if (ev.key !== "Escape" || !d.open) return;
+            ev.stopPropagation();
+            d.open = false;
+            sum.focus();
+        });
+        var fs = el("fieldset", "sec-radios");
+        fs.appendChild(el("legend", null, "Optional columns"));
+        var list = el("div", "sec-checklist");
+        offered.forEach(function (c) {
+            var lab = el("label", "sec-check");
+            var cb = el("input");
+            cb.type = "checkbox";
+            cb.name = "col-" + c.key;
+            cb.checked = !!COLS[c.key];
+            cb.addEventListener("change", function () {
+                COLS[c.key] = cb.checked;
+                /* No Apply button: the table re-renders immediately, and the
+                 * change is announced because a column appearing four rows
+                 * below the control is not something a screen reader notices. */
+                announce(c.label + " column " + (cb.checked ? "shown" : "hidden") + ".");
+                renderSafes();
+                var back = document.querySelector(
+                    '.sec-columns input[name="col-' + c.key + '"]');
+                if (back) back.focus();
+            });
+            lab.appendChild(cb);
+            lab.appendChild(document.createTextNode(" " + c.label));
+            if (c.hint) lab.appendChild(el("span", "hint", c.hint));
+            list.appendChild(lab);
+        });
+        fs.appendChild(list);
+        if (on) fs.appendChild(btn("Reset to defaults", "link", function () {
+            SAFE_OPT_COLS.forEach(function (c) { COLS[c.key] = false; });
+            announce("Optional columns reset.");
+            renderSafes();
+        }));
+        d.appendChild(fs);
+        host.appendChild(d);
+    }
+
+    /* One row. `.sec-safe` on the <tr> and `.sec-safe-id` on the id text are
+     * kept from the old card markup on purpose: they are what the browser
+     * suites address a safe by, in some fifty-five places, and they are a
+     * better selector than anything that would replace them.
+     *
+     * NOTHING IN THE ROW IS AN ACTION. Every action lives in the pane, so
+     * there is exactly one place a destructive control can be, exactly one
+     * place its disabled/reason logic lives, and a row can never be a thing
+     * you accidentally DO something to — a row is a thing you SELECT. */
+    function safeRow(safe, cols) {
+        var selected = PANE.safeId === safe.id;
+        var tr = el("tr", "sec-safe clickable" +
+                    (selected ? " selected" : "") +
+                    (safeReachable(safe) ? "" : " unreachable"));
+        cols.forEach(function (c, idx) {
+            var td = el("td");
+            if (idx === 0) {
+                var b = el("button", "sec-rowdoor");
+                b.type = "button";
+                b.setAttribute("aria-current", selected ? "true" : "false");
+                b.appendChild(el("span", "sec-safe-label", safe.label || safe.id));
+                b.appendChild(el("span", "sec-safe-id", safe.id));
+                b.addEventListener("click", function (ev) {
+                    ev.stopPropagation();
+                    selectSafe(safe.id);
+                });
+                /* Arrow keys move focus between rows; Home/End jump to the
+                 * ends. This calls .focus() on a sibling — it does not change
+                 * the tab count and it needs no roving tabindex, because a
+                 * registry is a handful of rows and each one is an ordinary
+                 * tab stop in DOM order. */
+                b.addEventListener("keydown", rowArrowKeys);
+                td.appendChild(b);
+            } else if (c.key === "class") {
+                td.appendChild(badge(safeClassText(safe), isAdminClass(safe) ? "warn" : ""));
+            } else if (c.key === "format") {
+                td.appendChild(badge(safeFormatText(safe), ""));
+            } else if (c.key === "state") {
+                var st = safeStates(safe);
+                if (st.length) {
+                    var chips = el("div", "sec-chips");
+                    st.slice(0, 2).forEach(function (s) {
+                        chips.appendChild(badge(s.label, s.kind));
+                    });
+                    if (st.length > 2)
+                        chips.appendChild(btn("+" + (st.length - 2), "link tiny", function (ev) {
+                            if (ev) ev.stopPropagation();
+                            selectSafe(safe.id);
+                        }));
+                    td.appendChild(chips);
+                }
+                /* else: an EMPTY CELL, not a "Normal" chip. Nothing to say is
+                 * not a state worth a word. */
+            } else {
+                var v = c.value ? c.value(safe) : "";
+                if (c.num) td.className = "num";
+                /* A class, not a style property. Anything that can be a class
+                 * is a class: the stylesheet owns appearance and this file owns
+                 * structure, and the only values that reach CSS from here are
+                 * the two genuinely dynamic numbers (--sec-remain, --sec-depth). */
+                if (c.mono && v) td.appendChild(el("span", "mono", v));
+                else td.textContent = v;
+            }
+            tr.appendChild(td);
+        });
+        tr.addEventListener("click", function () { selectSafe(safe.id); });
+        return tr;
+    }
+
+    /* Down/Up move focus to the next/previous row's door, Home/End to the
+     * first/last. Enter and Space activate natively, because the door is a real
+     * <button>. This calls .focus() on a sibling: it does not change the tab
+     * count, so every row stays an ordinary tab stop in DOM order and no roving
+     * tabindex is needed. */
+    function rowArrowKeys(ev) { rowArrowKeysIn(ev, "tbody .sec-rowdoor"); }
+    function entryArrowKeys(ev) {
+        rowArrowKeysIn(ev, "tbody tr > td:first-child > button.sec-btn.link");
+    }
+    function rowArrowKeysIn(ev, sel) {
+        var dirs = { ArrowDown: 1, ArrowUp: -1, Home: 0, End: 0 };
+        if (!(ev.key in dirs)) return;
+        var table = ev.currentTarget.closest("table");
+        if (!table) return;
+        var doors = Array.prototype.slice.call(table.querySelectorAll(sel));
+        var i = doors.indexOf(ev.currentTarget);
+        if (i < 0) return;
+        var to;
+        if (ev.key === "Home") to = 0;
+        else if (ev.key === "End") to = doors.length - 1;
+        else to = i + dirs[ev.key];
+        if (to < 0 || to >= doors.length) return;
+        ev.preventDefault();
+        doors[to].focus();
+    }
+
+    /* ================================================================== *
+     * The pane's four contents.
+     * ================================================================== */
+    function renderPane() {
+        var body = paneBody(), head = paneHeading(), back = byId("sec-pane-back");
+        if (!body || !head) return;
+        clear(body);
+        if (back) back.hidden = true;
+
+        /* (c) A safe is OPEN. The pane becomes the entry detail, and the
+         * safe's own identity lives in the compact strip above the entries
+         * table. Two docked panes is not a design, it is a failure to choose:
+         * with a safe open the thing an operator looks at over and over is the
+         * entry, and it is the thing that most needs the width. The registry
+         * detail stays one click away on #sec-pane-back. */
+        if (SESSION && BROWSE) {
+            if (back) back.hidden = (PANE.mode !== "entry");
+            if (PANE.mode === "safe") {
+                head.textContent = SESSION.safe.label || SESSION.safe.id;
+                body.appendChild(paneSafeBody(SESSION.safe, { open: true }));
+                return;
+            }
+            head.textContent = "Entry";
+            var det = el("div", "sec-detail");
+            det.id = "sec-detail";
+            body.appendChild(det);
+            /* Re-rendering the pane must not lose the entry that was in it —
+             * this runs on an elevation change and on a view swap, neither of
+             * which is a reason to blank what the operator was reading. */
+            var sel = null;
+            (BROWSE.rows || []).forEach(function (r) {
+                if (r.uuid === BROWSE.selected) sel = r;
+            });
+            if (sel) renderDetail(sel);
+            else det.appendChild(el("p", "sec-subtle",
+                "Choose an entry from the table to see it here."));
+            return;
+        }
+
+        var safe = PANE.safeId ? safeById(PANE.safeId) : null;
+        if (safe && !safeIsVisible(safe)) safe = null;
+
+        if (!safe) {
+            /* (a) NOTHING SELECTED — the default on load. An empty pane that
+             * teaches beats an empty pane that apologises, so the three facts
+             * #sec-sub compresses into the topbar get a readable home here. */
+            head.textContent = "No safe selected";
+            var st = stateBlock({ flush: true, body: [
+                "Choose a safe from the table to see its registry entry, its file header, " +
+                "and what it will take to open it."
+            ] });
+            var dl = el("dl", "sec-kv");
+            function kv(k, v) {
+                dl.appendChild(el("dt", null, k));
+                dl.appendChild(el("dd", null, v));
+            }
+            if (SCHEMA)
+                kv("Helper", (SCHEMA.helper_version || SCHEMA.version || "?") + " · " +
+                             Object.keys(verbTable()).length + " verbs");
+            kv("Reveal window", fmtSeconds(uiNum("reveal_seconds", 15)));
+            var where = registryDirs();
+            var dirs = [];
+            if (where.system) dirs.push(where.system);
+            if (where.user) dirs.push(where.user);
+            if (dirs.length) kv("Registry", dirs.join("  ·  "));
+            st.appendChild(dl);
+            body.appendChild(st);
+            return;
+        }
+
+        head.textContent = safe.label || safe.id;
+        body.appendChild(paneSafeBody(safe, {}));
+    }
+
+    /* (b) A safe is selected and locked — the normal state. And (d), the
+     * unreachable one, which is the same content with the helper's own refusal
+     * raised into an alert and the actions disabled. */
+    function paneSafeBody(safe, opts) {
+        opts = opts || {};
         var reachable = safeReachable(safe);
-        var card = el("div", "sec-safe" + (reachable ? "" : " unreachable"));
-        card.appendChild(el("h4", null, safe.label || safe.id));
-        card.appendChild(el("div", "sec-safe-id", safe.id));
+        var box = el("div");
 
-        var badges = el("div", "sec-safe-badges");
-        badges.appendChild(badge(safe.format || "?", ""));
-        badges.appendChild(badge(isAdminClass(safe) ? "admin" : "user",
-                                 isAdminClass(safe) ? "warn" : ""));
-        if (safe.mode === "ro") badges.appendChild(badge("read-only", "warn"));
-        card.appendChild(badges);
+        /* 1 · IDENTITY. The id in monospace beneath the label, then the two
+         * chips that decide what an operation on this safe will need. */
+        box.appendChild(el("div", "sec-safe-id", safe.id));
+        var chips = el("div", "sec-safe-badges sec-chips");
+        chips.appendChild(badge(safeClassText(safe), isAdminClass(safe) ? "warn" : ""));
+        chips.appendChild(badge(safeFormatText(safe), ""));
+        if (safeRegistryText(safe)) chips.appendChild(badge(safeRegistryText(safe), ""));
+        safeStates(safe).forEach(function (s) { chips.appendChild(badge(s.label, s.kind)); });
+        box.appendChild(chips);
 
-        /* What the registry already told us in the list row, before any probe:
-         * whether a passphrase is still demanded and whether a key is
-         * registered. Both are facts about the entry, not about the file. */
-        /* WHICH REGISTRY THIS ENTRY CAME FROM. The helper's own ui_rules ask
-         * for it, and the reason is the trust model: a system entry is
-         * root-owned policy and a user entry is one the caller wrote
-         * themselves, so "who says this file is a safe" is a different answer
-         * for the two and an operator should be able to see which. It is drawn
-         * only when the row says — an older helper that does not report it gets
-         * no badge rather than a guessed one. */
-        if (safe.registry) {
-            var rlabel = safe.registry, ropts =
-                (SCHEMA && SCHEMA.enums && SCHEMA.enums.registry_source) || [];
-            ropts.forEach(function (o) {
-                if (o && String(o.value) === String(safe.registry)) rlabel = o.label || rlabel;
-            });
-            badges.appendChild(badge(String(rlabel), ""));
+        /* 2 · THE PATH — always, in full, wrapping, selectable, never
+         * ~-abbreviated. A safe you cannot locate on disk is a safe you cannot
+         * back up, cannot repair and cannot prove is the one you meant. */
+        if (safe.path) {
+            box.appendChild(el("h4", "sec-pane-section", "Path"));
+            box.appendChild(el("code", "sec-path", String(safe.path)));
+            var prow = el("div", "sec-actgroup");
+            /* NOT a secret, so this must NOT arm the clipboard countdown —
+             * see copyValue(). A chip that cries wolf teaches an operator to
+             * ignore the one that matters. */
+            prow.appendChild(btn("Copy path", "tiny", function (ev) {
+                var b = ev && ev.currentTarget;
+                copyValue(String(safe.path), { what: "The path" }).then(function () {
+                    if (b) { b.textContent = "Copied"; window.setTimeout(function () {
+                        b.textContent = "Copy path"; }, 2000); }
+                }).catch(function (e) { alertBox(errNode(e)); });
+            }));
+            box.appendChild(prow);
+            /* What the LOCATION means. THREE CASES, AND NEVER A GUESS: the
+             * sentence is decided by the access class and the registry the
+             * entry came from — the two facts that actually determine how the
+             * helper opens the file — and not by pattern-matching a path.
+             * Anything the helper has not told us about gets the path alone
+             * and no editorial. */
+            var kconst = (SCHEMA && SCHEMA.constants) || {};
+            var sysSafes = kconst.safes_dir || kconst.system_safes_dir || null;
+            var note = "";
+            if (!isAdminClass(safe))
+                note = "A safe of your own. The helper opens it running as you, with no " +
+                       "escalation at all, and the file must be owned by you.";
+            else if (String(safe.registry || "system") === "system" ||
+                     (sysSafes && String(safe.path).indexOf(sysSafes) === 0))
+                note = "Declared by the system registry and owned by root. Every operation " +
+                       "on it is spawned with Cockpit's administrative access, and the " +
+                       "helper refuses the verb unless it is running as root.";
+            if (note) box.appendChild(el("p", "sec-subtle", note));
         }
-        if (safe.password_required === false) badges.appendChild(badge("keyed", "warn"));
-        if (safe.needs_keyfile) badges.appendChild(badge("key file", ""));
-        if (safe.agent_enabled) badges.appendChild(badge("agent enabled", "warn"));
 
+        /* 3 · HEADER FACTS, from the probe. */
         var p = PROBES[safe.id];
+        box.appendChild(el("h4", "sec-pane-section", "File header"));
         if (p && p._error) {
-            card.appendChild(errNode(p._error));
+            box.appendChild(errNode(p._error));
         } else if (p) {
-            if (p.version) badges.appendChild(badge(String(p.format || safe.format) + " " + p.version, ""));
-            if (p.writable === false) badges.appendChild(badge("not writable", "warn"));
-            var bits = [];
-            if (p.kdf) bits.push("KDF " + p.kdf);
-            if (p.iterations) bits.push(p.iterations + " iterations");
-            if (p.needs_keyfile) bits.push("key file required");
-            if (p.needs_password === false) bits.push("no passphrase required");
-            if (bits.length) card.appendChild(el("div", "sec-safe-probe", bits.join(" · ")));
-            /* Warnings are rendered VERBATIM from the helper. The KDBX3 "this
-             * file is not authenticated" banner (I20) reaches the operator this
-             * way, worded by the code that knows why. */
+            var dl = el("dl", "sec-kv");
+            function kv(k, v) {
+                dl.appendChild(el("dt", null, k));
+                dl.appendChild(el("dd", null, v));
+            }
+            kv("Format", safeFormatText(safe));
+            if (p.kdf || p.iterations) {
+                kv("KDF", safeKdfText(safe));
+                /* The KDF value carries `.sec-safe-probe` — the class the
+                 * browser suites wait on to know a probe has landed. It is on
+                 * the value itself rather than on a second, duplicate summary
+                 * line: the same facts printed twice, a centimetre apart, is
+                 * how a panel stops being read. */
+                dl.lastChild.className = "sec-safe-probe";
+            }
+            if (p.writable !== undefined) kv("Writable", p.writable === false ? "no" : "yes");
+            if (p.needs_keyfile !== undefined)
+                kv("Key file", p.needs_keyfile ? "required" : "not required");
+            if (p.needs_password !== undefined)
+                kv("Passphrase", p.needs_password === false ? "not required" : "required");
+            box.appendChild(dl);
+            /* 4 · WARNINGS, verbatim from the helper. The KDBX3 "this file is
+             * not authenticated" banner (I20) reaches the operator this way,
+             * worded by the code that knows why. */
             (p.warnings || []).forEach(function (w) {
-                card.appendChild(el("div", "sec-alert warn", String(w)));
+                box.appendChild(el("div", "sec-alert warn", String(w)));
             });
+        } else {
+            box.appendChild(el("p", "sec-subtle", "The file header has not been read yet."));
         }
 
+        /* (d) UNREACHABLE — the helper's own sentence as VISIBLE TEXT, not
+         * only as a title. A title is invisible to touch, to most screen
+         * readers in browse mode, and to anyone who does not hover. */
+        if (safe.reason)
+            box.appendChild(el("div", reachable ? "sec-subtle" : "sec-alert err",
+                               String(safe.reason)));
+
+        box.appendChild(safeActions(safe, opts));
+        return box;
+    }
+
+    /* THE CONSEQUENCE LADDER, laid out (§7.2).
+     *
+     *   [ Unlock… ]                          primary, alone on its row
+     *   [ Backups… ] [ Check this safe ]     rung 0
+     *   ───────────────────────────────      a real rule
+     *   Destructive                          an eyebrow
+     *   [ Export… ] [ Forget… ] [ Delete… ]  role="group"
+     *
+     * Both carriers at once: a visible rule and eyebrow for sighted operators,
+     * a labelled role="group" for assistive technology. Rung 2 and 3 controls
+     * are never adjacent to rung 0 or 1 controls, and no filled red button
+     * appears anywhere. */
+    function safeActions(safe, opts) {
+        var reachable = safeReachable(safe);
         var acts = el("div", "sec-safe-actions");
-        var open = btn("Unlock…", "primary", function () { unlockDialog(safe); });
-        if (!reachable) {
-            open.disabled = true;
-            open.title = String(safe.reason || "");
+
+        var primary = el("div", "sec-actgroup");
+        if (!opts.open) {
+            var open = btn("Unlock…", "primary", function () { unlockDialog(safe); });
+            if (!reachable) {
+                open.disabled = true;
+                open.title = String(safe.reason || "");
+            }
+            primary.appendChild(open);
         }
-        acts.appendChild(open);
+        acts.appendChild(primary);
+
+        var read = el("div", "sec-actgroup");
         /* The backup ring is readable without unlocking anything: it is a list
          * of files, not of secrets, and the moment an operator needs it is
          * usually the moment the safe will not open. */
         if (reachable && verbFor("backups"))
-            acts.appendChild(btn("Backups…", "", function () { backupsDialog(safe); }));
-        /* Export from the list, for the safes whose registry row allows it. The
-         * dialog asks for the passphrase like every other single-shot verb —
-         * being allowed to export is not being allowed to skip the unlock. */
-        if (reachable && exportAllowed(safe))
-            acts.appendChild(btn("Export…", "danger", function () { exportDialog(safe); }));
-        /* NOT gated on `reachable`. It used to be, and that was the bug: the
-         * only state this button exists for is the one in which an unescalated
-         * list reports an admin safe unusable, so the guard removed it exactly
-         * when it was needed.
+            read.appendChild(btn("Backups…", "", function () { backupsDialog(safe); }));
+        /* NOT gated on `reachable`, and not gated on there being no probe yet.
+         * The only state this control exists for is the one in which an
+         * unescalated list reports an admin safe unusable; gating it on either
+         * removed it exactly when it was needed, and cancelling Cockpit's
+         * prompt used to make it disappear forever because an error is a probe.
          *
-         * Nor is it gated on there being no probe yet, which was the SAME bug
-         * one step further on. Cancelling Cockpit's prompt leaves an error in
-         * PROBES; an error is a probe; so the control that exists to raise that
-         * prompt disappeared the first time an operator dismissed it, and the
-         * permission listener would not re-probe either because the slot was
-         * occupied. The card was left with a refusal it could not retry.
-         *
-         * The rule now: an admin-class safe always has a way to ask again, and
-         * it says which of the two it is doing. */
+         * NOTE, and it is a real consequence of R1: while administrative
+         * access is off, an admin-class safe is not listed at all, so this
+         * control cannot be reached in the state it was built for. The count
+         * note and the escalation banner are what an operator sees instead. */
+        var p = PROBES[safe.id];
         if (isAdminClass(safe) && (!p || p._error)) {
             var again = !!(p && p._error);
             var chk = btn(again ? "Check again" : "Check this safe", "", function () {
-                /* Asks the helper, escalated, whether this safe can be opened
-                 * right now. It does NOT raise Cockpit's password dialog: no
-                 * page can (see escalationBanner). While administrative access
-                 * is off this answers "access-denied" and says where to turn it
-                 * on, which is a fact worth having and is why the control is
-                 * still drawn in that state. */
                 probeSafe(safe, true);
             });
             chk.title = adminAllowed()
@@ -3314,28 +4298,34 @@
                 : "Opens nothing, and does not ask you for a password — Cockpit only does " +
                   "that from the “Limited access” control in its header. This reports what " +
                   "the helper says while administrative access is off.";
-            acts.appendChild(chk);
+            read.appendChild(chk);
         }
-        /* Taking a safe off this page, and destroying it. LAST on the card and
-         * in that order, deliberately: Forget is the ordinary one and the
-         * reversible one, Delete is the only irreversible action in this whole
-         * program, and it is not going to sit next to Unlock. Both are behind
-         * "does the helper publish the verb" like everything else here. */
+        if (read.childNodes.length) acts.appendChild(read);
+
+        /* The destructive group. Export is rung 2 (durable disclosure), Delete
+         * is rung 3 (irreversible), and Forget is deliberately NOT on the
+         * ladder at all — it is reversible, so it wears a default button. A
+         * reversible action in the irreversible costume is how the costume
+         * stops meaning anything. */
+        var dgroup = el("div", "sec-actgroup destructive");
+        dgroup.setAttribute("role", "group");
+        dgroup.setAttribute("aria-label", "Destructive actions");
+        if (reachable && exportAllowed(safe))
+            dgroup.appendChild(btn("Export…", "danger", function () { exportDialog(safe); }));
         if (verbFor("safeForget"))
-            acts.appendChild(btn("Forget…", "", function () { forgetDialog(safe); }));
+            dgroup.appendChild(btn("Forget…", "", function () { forgetDialog(safe); }));
         if (verbFor("safeDelete"))
-            acts.appendChild(btn("Delete…", "danger", function () { deleteDialog(safe); }));
-        card.appendChild(acts);
-        /* The helper's own sentence, whenever it sent one. For a safe this
-         * caller genuinely cannot reach it is the refusal; for an admin-class
-         * one it is the instruction — "turn on Cockpit's Administrative access
-         * and try again" — and dropping it there would leave an operator with
-         * an enabled button and no warning that Cockpit is about to ask them
-         * for a password. It was previously printed only for unreachable
-         * cards, which is why making admin cards reachable has to widen it. */
-        if (safe.reason)
-            card.appendChild(el("div", "sec-subtle", String(safe.reason)));
-        return card;
+            dgroup.appendChild(btn("Delete…", "danger", function () { deleteDialog(safe); }));
+        if (dgroup.childNodes.length) {
+            acts.appendChild(el("hr", "sec-actsplit"));
+            acts.appendChild(el("p", "sec-eyebrow", "Destructive"));
+            acts.appendChild(dgroup);
+            if (verbFor("safeForget"))
+                acts.appendChild(el("p", "sec-actnote",
+                    "Forget removes the registry entry only. The file and its backups stay " +
+                    "where they are, and registering it again brings it back."));
+        }
+        return acts;
     }
 
     /* ================================================================== *
@@ -3745,18 +4735,39 @@
     }
 
     /* A live countdown for locked-out, using the helper's own number (I16). */
+    /* THE FOURTH DEADLINE, and it gets the same treatment as the other three
+     * (reveal, clipboard, upload): tabular numerals as the text carrier, a
+     * single-hue bar as the second carrier, the geometry set through ONE custom
+     * property, and the last five seconds in the danger colour with the numeral
+     * still saying it. Four deadlines that look like four different things is
+     * four things to learn. */
     function lockoutCountdown(host, seconds) {
         var line = el("div", "sec-countdown");
+        var meter = el("div", "sec-meter");
+        meter.appendChild(el("span"));
+        meter.setAttribute("aria-hidden", "true");
         host.appendChild(line);
-        var deadline = Date.now() + seconds * 1000;
+        host.appendChild(meter);
+        var total = Math.max(1, Number(seconds) || 1);
+        var deadline = Date.now() + total * 1000;
+        meter.style.setProperty("--sec-remain", "100%");
         var t = window.setInterval(function () {
             var left = Math.ceil((deadline - Date.now()) / 1000);
             if (left <= 0) {
                 window.clearInterval(t);
+                line.className = "sec-countdown";
                 line.textContent = "You can try again now.";
-                announce("The lockout has expired.");
+                meter.hidden = true;
+                /* It must not re-enable SILENTLY: the sentence is said once,
+                 * politely, so an operator who looked away is told. */
+                announce("The lockout has expired. You can try again now.");
                 return;
             }
+            meter.style.setProperty("--sec-remain",
+                Math.max(0, Math.min(100, (left / total) * 100)) + "%");
+            var urgent = left <= 5;
+            line.className = "sec-countdown" + (urgent ? " urgent" : "");
+            meter.className = "sec-meter" + (urgent ? " urgent" : "");
             line.textContent = "Locked out for another " + fmtSeconds(left) + ".";
         }, 500);
     }
@@ -3865,6 +4876,20 @@
         setDirty(0);
         show(byId("sec-browse-view"), false);
         show(byId("sec-safes-view"), true);
+        /* The pane's content stack goes back to the safe it was showing. The
+         * pane's DISPOSITION is untouched: the view changed under the operator
+         * but they did not ask for the pane to move, and collapsing one out
+         * from under a keyboard user sends focus somewhere they did not ask
+         * for. */
+        PANE.mode = "safe";
+        PANE.safeId = lockedSafeId;
+        renderSafes();
+        /* The view changed under the operator, so land them at the top of the
+         * new one rather than wherever the old one's DOM used to be. Never on
+         * <body>: that loses their place entirely. */
+        var door = document.querySelector("#sec-safes tbody .sec-rowdoor");
+        if (door) door.focus();
+        else if (byId("sec-main")) byId("sec-main").focus();
         var msg = "Locked" + (reason ? " — " + reason : "") + ".";
         if (hadDirty) msg += " Unsaved changes were discarded; the safe on disk is unchanged.";
         alertText(msg, "info");
@@ -3922,6 +4947,14 @@
                 "This safe is open read-only. The helper decides that — a KDBX3 file has " +
                 "no authenticated encryption, and a safe whose round trip would drop a field " +
                 "is refused write access rather than quietly amputated."));
+
+        /* The pane becomes the ENTRY detail from here on. The safe's own
+         * registry detail is one click away on #sec-pane-back, which swaps the
+         * content back WITHOUT deselecting the entry. */
+        PANE.safeId = BROWSE.safe.id;
+        PANE.mode = "entry";
+        if (!PANE.open) setPaneOpen(true);
+        renderPane();
 
         renderTools();
         loadTree();
@@ -4048,6 +5081,27 @@
         });
     }
 
+    /* The groups tree is a column at >= 60rem and a disclosure below it. The
+     * summary is hidden by CSS at the wide size, so `open` is forced there —
+     * a hidden summary on a closed <details> would hide the tree entirely.
+     * Below it, the summary names the group in play, because a collapsed
+     * disclosure that does not say what it is filtering by is a filter an
+     * operator forgets is on. */
+    function syncTreeDisclosure() {
+        var d = byId("sec-treewrap");
+        if (!d) return;
+        var wide = frameIsWide();
+        if (wide) d.open = true;
+        var sum = byId("sec-treewrap-sum");
+        if (!sum) return;
+        var name = "";
+        if (BROWSE && BROWSE.group)
+            (BROWSE.groups || []).forEach(function (g) {
+                if (g.uuid === BROWSE.group) name = String(g.name || g.uuid);
+            });
+        sum.textContent = "Groups" + (name ? " · " + name : " · All entries");
+    }
+
     /* ---------------------------------------------------------- tree --- */
     function loadTree() {
         if (!SESSION) return;
@@ -4058,6 +5112,7 @@
             clear(host);
             BROWSE.groups = (res && res.groups) || [];
             renderTree(host, BROWSE.groups);
+            syncTreeDisclosure();
         }).catch(function (e) {
             clear(host);
             host.appendChild(errNode(e));
@@ -4098,7 +5153,12 @@
                 var li = el("li");
                 var b = el("button");
                 b.type = "button";
-                b.style.paddingLeft = (0.35 + depth * 0.75) + "rem";
+                /* ONE custom property, not a built style string. The STEP
+                 * lives in secrets.css on the spacing scale
+                 * (`calc(var(--sec-s-1) + var(--sec-depth) * var(--sec-s-2))`),
+                 * so the geometry is in the stylesheet where it belongs and
+                 * nothing here assembles CSS text. */
+                b.style.setProperty("--sec-depth", String(depth));
                 b.appendChild(document.createTextNode(g.name === undefined ? g.uuid : String(g.name)));
                 if (g.count !== undefined) b.appendChild(el("span", "count", "(" + g.count + ")"));
                 b.setAttribute("aria-current", BROWSE.group === g.uuid ? "true" : "false");
@@ -4137,6 +5197,22 @@
     }
 
     /* ------------------------------------------------------- entries --- */
+    /* Is this entry past its expiry? The helper decides whenever it says so —
+     * a boolean `expired` is taken verbatim. Otherwise a date-shaped `expires`
+     * or `expiry` is compared with now, and anything unparseable is NOT
+     * treated as expired: marking an entry expired because a field did not
+     * parse would be this page inventing a fact, which is the one thing it may
+     * not do. */
+    function entryExpired(row) {
+        if (!row) return false;
+        if (typeof row.expired === "boolean") return row.expired;
+        var v = row.expires !== undefined ? row.expires : row.expiry;
+        if (v === undefined || v === null || v === "") return false;
+        var t = Date.parse(String(v));
+        if (isNaN(t)) return false;
+        return t < Date.now();
+    }
+
     function serverSorts() { return argNames("entries").indexOf("sort") >= 0; }
 
     function loadEntries() {
@@ -4227,16 +5303,59 @@
                 var td = el("td");
                 var v = r[c.name];
                 if (idx === 0) {
-                    /* The first column is the keyboard door into the entry. */
+                    /* AN EXPIRED ENTRY — three carriers, never colour alone: a
+                     * decorative glyph BEFORE the title, the WORD "Expired" in
+                     * a chip after it, and the same word in the button's
+                     * accessible name. Never strikethrough: struck-through text
+                     * is unreadable at 14px and it reads as DELETED, which an
+                     * expired entry is not.
+                     *
+                     * The glyph and the chip are in the CELL and not inside the
+                     * button, deliberately: the live suite addresses an entry
+                     * by `button.sec-btn.link:text-is("<title>")` in fourteen
+                     * places, so the button's text content has to stay exactly
+                     * the title. That constraint is also why this stays a
+                     * `.sec-btn.link` rather than becoming a `.sec-rowdoor`. */
+                    var expired = entryExpired(r);
+                    if (expired) {
+                        var g = el("span", null, "⚠ ");
+                        g.setAttribute("aria-hidden", "true");
+                        td.appendChild(g);
+                    }
+                    /* The keyboard door into the entry. */
                     var b = el("button", "sec-btn link", txt(v) || "(untitled)");
                     b.type = "button";
+                    b.setAttribute("aria-current",
+                                   BROWSE.selected === r.uuid ? "true" : "false");
+                    if (expired)
+                        b.setAttribute("aria-label", (txt(v) || "(untitled)") + ", expired");
                     b.addEventListener("click", function (ev) {
                         ev.stopPropagation();
                         selectEntry(r);
                     });
+                    /* Arrow keys move between rows here exactly as they do in
+                     * the safes table — one row idiom across both. */
+                    b.addEventListener("keydown", entryArrowKeys);
                     td.appendChild(b);
+                    if (expired) td.appendChild(badge("Expired", "warn"));
                 } else if (typeof v === "boolean") {
-                    td.appendChild(badge(v ? "yes" : "no", v ? "ok" : ""));
+                    /* A tick plus a hidden word for true, and AN EMPTY CELL for
+                     * false. `badge("yes")`/`badge("no")` spent a whole chip on
+                     * a boolean and filled the table with the word "no", which
+                     * is the least informative thing a cell can contain. */
+                    if (v) {
+                        var tick = el("span", null, "✓");
+                        tick.setAttribute("aria-hidden", "true");
+                        td.appendChild(tick);
+                        td.appendChild(el("span", "sec-visually-hidden", c.label));
+                    }
+                } else if (c.name === "username") {
+                    /* JUDGEMENT CALL, stated: a username is COMPARED, not read.
+                     * `admin1` beside `admin l` is a difference an operator has
+                     * to be able to see at a glance, and a proportional face
+                     * hides exactly that. It is not a secret: no well, no
+                     * countdown, no mask. */
+                    td.appendChild(el("span", "mono", txt(v)));
                 } else {
                     /* Whatever the helper sent. It never sends a password or any
                      * other protected value in an entries[] row — reveal is the
@@ -4258,7 +5377,13 @@
          * mutation and an operator sees an attachment they have just deleted.
          * Only when the selected entry is on THIS page of results — a search
          * that filters it out should leave the pane alone rather than blank it. */
-        if (BROWSE.selected) {
+        if (BROWSE.selected && byId("sec-detail")) {
+            /* …and only while the pane is actually SHOWING the entry detail.
+             * If the operator has swapped it to the safe's registry entry with
+             * "← Safe details", a background re-render must not drag them back
+             * — that is the one thing that control exists to let them avoid.
+             * byId("sec-detail") is the test: the host only exists in entry
+             * mode. */
             var sel = null;
             rows.forEach(function (r) { if (r.uuid === BROWSE.selected) sel = r; });
             if (sel) renderDetail(sel);
@@ -4286,12 +5411,32 @@
     /* -------------------------------------------------------- detail --- */
     function selectEntry(row) {
         BROWSE.selected = row.uuid;
+        /* The entry detail lives in the docked pane (R3). Selecting an entry
+         * while the pane is showing the safe's registry detail swaps it back —
+         * the operator asked to look at an entry. */
+        PANE.mode = "entry";
+        if (!PANE.open) setPaneOpen(true);
         renderEntries();
         renderDetail(row);
     }
 
+    /* #sec-detail is the entry-detail host and it lives INSIDE #sec-pane-body,
+     * created by renderPane(). It is addressed by id — and kept under that id —
+     * because that is what the browser suites wait on, thirty-odd times, and a
+     * rename would buy nothing. If the pane is currently showing something
+     * else, asking for the host is what switches it. */
+    function detailHost() {
+        var h = byId("sec-detail");
+        if (h) return h;
+        PANE.mode = "entry";
+        if (!PANE.open) setPaneOpen(true);
+        renderPane();
+        return byId("sec-detail");
+    }
+
     function renderDetail(row) {
-        var host = byId("sec-detail");
+        var host = detailHost();
+        if (!host) return;
         clear(host);
         host.appendChild(el("h3", null, txt(row.title) || "(untitled)"));
 
@@ -4317,8 +5462,56 @@
             dl.appendChild(el("dt", null, k.replace(/_/g, " ")));
             var dd = el("dd");
             var v = row[k];
-            if (typeof v === "boolean") dd.appendChild(badge(v ? "yes" : "no", v ? "ok" : ""));
-            else dd.textContent = txt(v);
+            if (typeof v === "boolean") {
+                /* A tick and a hidden word for true, nothing at all for false.
+                 * `yes`/`no` chips spend a whole mark on a boolean and fill the
+                 * panel with the word "no". */
+                if (v) {
+                    var tk = el("span", null, "✓");
+                    tk.setAttribute("aria-hidden", "true");
+                    dd.appendChild(tk);
+                    dd.appendChild(el("span", "sec-visually-hidden", "yes"));
+                } else {
+                    dd.appendChild(el("span", "sec-visually-hidden", "no"));
+                }
+            } else if (k === "url" && txt(v)) {
+                /* A URL INSIDE A SAFE IS ATTACKER-CONTROLLED DATA (threat model
+                 * A3, "a malicious or corrupted safe file"). Rendering it as an
+                 * anchor would let a safe's contents navigate the operator's
+                 * browser on one mis-click, so it is presented as TEXT, in the
+                 * code idiom, with a copy control — and the operator decides.
+                 * This is a security decision wearing layout clothes. */
+                dd.appendChild(el("code", "sec-path", txt(v)));
+                dd.appendChild(btn("Copy", "tiny", function (ev) {
+                    var b = ev && ev.currentTarget;
+                    copyValue(txt(v), { what: "The URL" }).then(function () {
+                        if (b) { b.textContent = "Copied"; window.setTimeout(function () {
+                            b.textContent = "Copy"; }, 2000); }
+                    }).catch(function () { /* best effort */ });
+                }));
+            } else if (txt(v).split("\n").length > 8) {
+                /* A long multi-line value is CLAMPED, not scrolled. A scroll box
+                 * inside a pane inside a page is three nested scrolls and the
+                 * middle one is always the one the wheel does not reach.
+                 *
+                 * Note which values reach this branch: only ones the helper put
+                 * in the entries[] row, which is metadata by contract. Anything
+                 * in revealFields() is a protected value and goes through
+                 * revealWidget with its own well and countdown; it never gets
+                 * here and this clamp does not apply to it. */
+                var lines = txt(v).split("\n");
+                var pre = el("div", "sec-pre", lines.slice(0, 8).join("\n"));
+                dd.appendChild(pre);
+                dd.appendChild(btn("Show the whole " + k.replace(/_/g, " ") +
+                                   " (" + lines.length + " lines)", "link",
+                    function (ev) {
+                        pre.textContent = txt(v);
+                        if (ev && ev.currentTarget && ev.currentTarget.parentNode)
+                            ev.currentTarget.parentNode.removeChild(ev.currentTarget);
+                    }));
+            } else {
+                dd.textContent = txt(v);
+            }
             dl.appendChild(dd);
         });
         host.appendChild(dl);
@@ -4363,6 +5556,7 @@
              * "custom:<name>", so a row that names its custom fields gets a
              * control each; one that does not gets an explicit way to ask. */
             var custom = customFieldRows(row);
+            var saidUnprotected = false;
             if (custom.length) {
                 host.appendChild(el("h4", null, "Custom fields"));
                 custom.forEach(function (cf) {
@@ -4380,11 +5574,29 @@
                      * not. revealWidget() returns its node directly, so the
                      * badge goes into that node's own head row. */
                     var cfHead = w.querySelector(".sec-reveal-head");
-                    if (cfHead && cf.protected === true)
-                        cfHead.insertBefore(badge("protected", "ok"), cfHead.lastChild);
-                    else if (cfHead && cf.protected === false)
-                        cfHead.insertBefore(badge("not protected", "warn"), cfHead.lastChild);
+                    var label = cfHead && cfHead.querySelector(".sec-reveal-label");
+                    /* The chip QUALIFIES the name, so it reads BEFORE it, and it
+                     * carries a filled or hollow dot as well as the word — the
+                     * difference between an exported field that is in the clear
+                     * and one that is not should not rest on a colour. */
+                    if (cfHead && cf.protected === true) {
+                        var okChip = badge("● protected", "ok");
+                        cfHead.insertBefore(okChip, label || cfHead.firstChild);
+                    } else if (cfHead && cf.protected === false) {
+                        var noChip = badge("○ not protected", "warn");
+                        cfHead.insertBefore(noChip, label || cfHead.firstChild);
+                    }
                     host.appendChild(w);
+                    /* ONCE PER ENTRY, under the first unprotected field — not
+                     * once per field. Repeating a warning on every row is how a
+                     * warning becomes wallpaper. */
+                    if (cf.protected === false && !saidUnprotected) {
+                        saidUnprotected = true;
+                        host.appendChild(el("div", "hint",
+                            "A field that is not protected is stored in the clear inside the " +
+                            "file. Anyone holding the file can read it without the passphrase, " +
+                            "and an export carries it as it stands."));
+                    }
                 });
             }
             if (revealFields().length)
@@ -4415,24 +5627,39 @@
         renderHistory(host, row);
 
         /* --- actions: from the schema, so a new entry verb appears here --- */
+        /* THE SAME LADDER AS THE SAFE'S OWN ACTIONS. Rung 2 and 3 controls are
+         * never adjacent to rung 0 controls: the destructive ones sit after a
+         * visible rule, under an eyebrow, inside a labelled role="group", so
+         * the separation is carried for sighted operators and for assistive
+         * technology at once. */
         host.appendChild(el("h4", null, "Actions"));
         var acts = el("div", "sec-tools");
-        ["edit", "move", "rm"].forEach(function (v) {
-            if (!hasVerb(v)) return;
-            var b = btn(verbLabel(v), (verbSpec(v).danger ? "danger " : "") + "tiny", function () {
-                verbDialog(v, { uuid: row.uuid }, afterMutation, row);
+        var dangerActs = el("div", "sec-actgroup destructive");
+        dangerActs.setAttribute("role", "group");
+        dangerActs.setAttribute("aria-label", "Destructive actions");
+        function entryBtn(name, into) {
+            var spec = verbSpec(name) || {};
+            var b = btn(verbLabel(name), (spec.danger ? "danger " : "") + "tiny", function () {
+                verbDialog(name, { uuid: row.uuid }, afterMutation, row);
             });
             if (!BROWSE.writable) { b.disabled = true; b.title = "This safe is open read-only."; }
-            acts.appendChild(b);
+            into.appendChild(b);
+        }
+        ["edit", "move", "rm"].forEach(function (v) {
+            if (!hasVerb(v)) return;
+            entryBtn(v, (verbSpec(v) || {}).danger ? dangerActs : acts);
         });
         Object.keys(verbTable()).sort().forEach(function (name) {
             if (isHandled(name)) return;
             if (verbScope(name) !== "entry") return;
-            acts.appendChild(btn(verbLabel(name), "tiny", function () {
-                verbDialog(name, { uuid: row.uuid }, afterMutation, row);
-            }));
+            entryBtn(name, (verbSpec(name) || {}).danger ? dangerActs : acts);
         });
-        host.appendChild(acts);
+        if (acts.childNodes.length) host.appendChild(acts);
+        if (dangerActs.childNodes.length) {
+            host.appendChild(el("hr", "sec-actsplit"));
+            host.appendChild(el("p", "sec-eyebrow", "Destructive"));
+            host.appendChild(dangerActs);
+        }
     }
 
     /* The keys an entries[] row might use to name its custom fields.
@@ -6010,9 +7237,18 @@
         }
 
         var box = el("div", "sec-agent-banner");
-        box.appendChild(el("h2", null, AGENT.rows.length === 1
-            ? "A safe is unlocked"
-            : AGENT.rows.length + " safes are unlocked"));
+        /* THE WORD "Unlocked" AND A KEY GLYPH, not amber alone. This is the one
+         * state in the program where a safe is open while nobody is looking at
+         * it, and a banner whose entire message is a background colour is a
+         * banner that means nothing in greyscale, at a glance, or to a good
+         * fraction of the people who will use this page. */
+        var h = el("h2");
+        h.appendChild(svgGlyph("key"));
+        h.appendChild(el("span", null, "Unlocked"));
+        h.appendChild(el("span", "sec-subtle", AGENT.rows.length === 1
+            ? "— a safe is held open by the agent"
+            : "— " + AGENT.rows.length + " safes are held open by the agent"));
+        box.appendChild(h);
         AGENT.rows.forEach(function (r) {
             var line = el("div", "sec-agent-row");
             line.appendChild(el("span", "sec-agent-name", String(r.label || r.safe || "safe")));
@@ -7312,7 +8548,11 @@
 
                 function paint(sent) {
                     var pct = W.total ? Math.floor((sent / W.total) * 100) : 0;
-                    fill.style.width = Math.max(0, Math.min(100, pct)) + "%";
+                    /* Same idiom as every other deadline on this page: one
+                     * custom property on the track, geometry in the
+                     * stylesheet, no style string anywhere. */
+                    bar.style.setProperty("--sec-remain",
+                        Math.max(0, Math.min(100, pct)) + "%");
                     bar.setAttribute("aria-valuenow", String(pct));
                     line.textContent = fmtBytes(sent) + " of " + fmtBytes(W.total) +
                         " — " + pct + "%";
@@ -8067,6 +9307,11 @@
             refreshAgent();
         });
         byId("sec-lock").addEventListener("click", function () { confirmLock(); });
+        /* The pane and its toggle (R3/R4) exist before anything is fetched, so
+         * the page has its shape from the first frame and the layout does not
+         * jump when the registry lands. */
+        initPane();
+        renderPane();
         bindLifetime();
 
         PERM = cockpit.permission({ admin: true });
@@ -8086,7 +9331,17 @@
              * still reading these caches. Only the re-render of the list is
              * skipped while it is not the visible view. */
             var dropped = dropStaleForEscalation();
+            /* R1 — VISIBILITY FOLLOWS ELEVATION, LIVE.
+             *
+             * Administrator safes are listed only while administrative access
+             * is on, so this event is also the moment rows appear and
+             * disappear. Everything that has to happen when they disappear is
+             * in elevationChanged(), which runs BEFORE the re-render so that a
+             * safe being locked and its values wiped is not racing the DOM that
+             * is about to stop showing it. */
+            elevationChanged();
             if (!SESSION) renderSafes();
+            else renderPane();
             if (adminAllowed()) {
                 /* Administrative access has just come on. The admin-class safes
                  * were deliberately not probed while it was off — one Cockpit
@@ -8104,7 +9359,13 @@
         });
 
         /* The schema is fetched first and everything else waits for it: this
-         * page has nothing of its own to draw. */
+         * page has nothing of its own to draw. Retry re-runs THIS and nothing
+         * else — re-running init() would bind every listener a second time and
+         * open a second cockpit.permission. */
+        loadSchema();
+    }
+
+    function loadSchema() {
         callOnce("schema", {}, false).then(function (res) {
             SCHEMA = res || {};
             var sub = byId("sec-sub");
@@ -8120,13 +9381,23 @@
             startAgentWatch();
         }).catch(function (e) {
             byId("sec-sub").textContent = "";
+            /* STATE 4 — THE HELPER DID NOT ANSWER. A different glyph, a
+             * different heading and a Retry, so it can never be mistaken for
+             * "there are no safes" or for "you cannot see them". */
             var host = byId("sec-safes");
             clear(host);
-            host.appendChild(errNode(e));
-            host.appendChild(el("p", "sec-subtle",
+            var st = stateBlock({ glyph: "warning", glyphKind: "err",
+                                  heading: "The helper did not answer" });
+            st.appendChild(errNode(e));
+            st.appendChild(el("p", null,
                 "This page renders only what " + HELPER + " describes through its schema verb, " +
                 "so there is nothing to show until the helper answers. Install it with " +
                 "install.sh from this package."));
+            var again = el("div", "actions");
+            again.appendChild(btn("Retry", "primary", function () { loadSchema(); }));
+            st.appendChild(again);
+            host.appendChild(st);
+            renderPane();
         });
     }
 

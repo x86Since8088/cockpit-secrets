@@ -154,6 +154,18 @@ in both places.
     ok   /usr/share/cockpit/secrets holds exactly the package payload
          -> index.html manifest.json secrets.css secrets.js
     ok   ... each of the four is 644 root:root
+
+**This transcript is 0.4.0's and the payload has since grown.** From 0.5.1 the
+package is **five** files — `theme.js` joined it, and `install.sh`'s `PLUGIN`
+array is the one place that says so. Re-run against 0.5.1 the same two lines read
+
+    ok   /usr/share/cockpit/secrets holds exactly the package payload
+         -> index.html manifest.json secrets.css secrets.js theme.js
+    ok   ... each of the five is 644 root:root
+
+and `20-verify-install.sh` now DERIVES that list from `install.sh` rather than
+restating it, which is what stopped it failing the release that grew the payload
+(`docs/KNOWN_ISSUES.md` I57). The transcript above is left as it was recorded.
     ok   /usr/local/lib/cockpit-secrets/schema holds exactly the source's *.json
 
 ### Nothing from `tests/` was installed — PASS

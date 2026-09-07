@@ -255,11 +255,69 @@ async function tickConfirms(frame) {
     return boxes.length;
 }
 
-/* The card for one safe, addressed by the id the page prints on it. The
- * container is `.sec-safe` and `.sec-safe-id` holds the id verbatim, so this
- * cannot match a safe whose LABEL happens to contain another safe's id. */
+/* The ROW for one safe, addressed by the id the page prints in it. `.sec-safe`
+ * and `.sec-safe-id` were both carried over from the old card markup on
+ * purpose — they are what all three browser suites address a safe by — and the
+ * id text is matched exactly, so this cannot match a safe whose LABEL happens
+ * to contain another safe's id. Scoped to the table body because `.sec-safe-id`
+ * now appears in the details pane too. */
 function cardFor(id) {
-    return `#sec-safes .sec-safe:has(.sec-safe-id:text-is("${id}"))`;
+    return `#sec-safes tbody tr.sec-safe:has(.sec-safe-id:text-is("${id}"))`;
+}
+
+/* THE 0.5.0 RESTYLE MOVED EVERY ACTION OFF THE ROW AND INTO THE PANE.
+ *
+ * `cardFor(id) + ' button:text-is("Unlock…")'` addressed a button that existed
+ * on a card and does not exist on a row: secrets.js's safeRow() says "nothing
+ * in the row is an action. Every action lives in the pane". So every action is
+ * two gestures now — choose the row, then use the pane — and these two helpers
+ * are that pair for this suite.
+ *
+ * Choosing a row re-opens the pane if it was collapsed (selectSafe() in
+ * secrets.js does it), so neither of these has to care which state R4's toggle
+ * was left in; safeSelected() waits on the pane showing THIS id rather than on
+ * a timeout, so a mis-aimed click fails naming the safe instead of silently
+ * acting on another one. */
+/* THIS SUITE ONLY EVER TOUCHES THE TWO SAFES IT MAKES.
+ *
+ * Every id here is a literal — CREATED and IMPORTED — and nothing iterates the
+ * registry, so the operator's own `pwsafe3` was already out of reach by
+ * construction. This turns that from an argument into a check, at the one
+ * place an id becomes a click: R4 DELETES a safe and R3 FORGETS one, and
+ * neither is a mistake anybody gets to make twice. */
+const OWNED = [CREATED, IMPORTED];
+function guard(id) {
+    if (OWNED.indexOf(String(id)) < 0)
+        throw new Error("refused: “" + id + "” is not one of this suite's own safes (" +
+                        OWNED.join(", ") + "). It creates and destroys safes, and it may " +
+                        "not aim that at anything it did not make — least of all the " +
+                        "operator's own (tests/browser/TESTBED.md).");
+    return id;
+}
+
+async function selectSafe(frame, id) {
+    guard(id);
+    await frame.click(cardFor(id) + " button.sec-rowdoor");
+    await frame.waitForFunction((wanted) => {
+        const pane = document.getElementById("sec-pane");
+        if (!pane || pane.hidden) return false;
+        const n = pane.querySelector(".sec-safe-id");
+        return !!n && n.textContent.trim() === wanted;
+    }, id, { timeout: 20000 });
+}
+
+/* One action on one safe. `label` is matched inside `.sec-safe-actions` only,
+ * so a word that also appears in the pane's prose cannot be clicked instead.
+ * Unlock is addressed by its `primary` class rather than by its text, because
+ * safeActions() builds exactly one primary control and it is Unlock — that
+ * survives a change of wording and the loss of the ellipsis. */
+async function safeAction(frame, id, label) {
+    await selectSafe(frame, id);
+    const sel = label === "Unlock…"
+        ? "#sec-pane-body .sec-safe-actions button.sec-btn.primary"
+        : `#sec-pane-body .sec-safe-actions button:text-is("${label}")`;
+    await frame.waitForSelector(sel, { state: "visible", timeout: 20000 });
+    await frame.click(sel);
 }
 
 /* Wait for the list to have re-read and be showing this safe (or not). The
@@ -270,7 +328,8 @@ async function waitForCard(frame, id, present, timeout) {
         const host = document.getElementById("sec-safes");
         if (!host) return false;
         const ids = Array.prototype.map.call(
-            host.querySelectorAll(".sec-safe-id"), (n) => n.textContent.trim());
+            host.querySelectorAll("tbody tr.sec-safe .sec-safe-id"),
+            (n) => n.textContent.trim());
         return ids.indexOf(wanted) >= 0 === want;
     }, [id, !!present], { timeout: timeout || 30000 });
 }
@@ -519,7 +578,7 @@ async function itemCreate(rec, frame, page, newPass) {
 
     /* AND IT OPENS — which is the whole point. Through the page, by clicking
      * Unlock and typing the passphrase, not through a spawn. */
-    await frame.click(cardFor(CREATED) + ' button:text-is("Unlock…")');
+    await safeAction(frame, CREATED, "Unlock…");
     await frame.waitForSelector((M + " input[type=password]"), { timeout: 20000 });
     await frame.fill((M + " input[type=password]"), newPass);
     await clickIn(frame, M + ' button:text-is("Unlock")');
@@ -681,7 +740,7 @@ async function itemImport(rec, frame, page) {
     }
 
     /* And it opens, with the fixture's real contents. */
-    await frame.click(cardFor(IMPORTED) + ' button:text-is("Unlock…")');
+    await safeAction(frame, IMPORTED, "Unlock…");
     await frame.waitForSelector((M + " input[type=password]"), { timeout: 20000 });
     await frame.fill((M + " input[type=password]"), FIXTURE_PASS);
     await clickIn(frame, M + ' button:text-is("Unlock")');
@@ -707,7 +766,7 @@ async function itemForget(rec, frame, page) {
     const before = p ? await statPath(frame, p) : null;
     it.ok(!!before, "the file is there before the forget (" + before + ")");
 
-    await frame.click(cardFor(IMPORTED) + ' button:text-is("Forget…")');
+    await safeAction(frame, IMPORTED, "Forget…");
     await frame.waitForSelector(".sec-modal", { timeout: 20000 });
     const warn = await modalText(frame);
     it.ok(/file stays on disk/i.test(warn),
@@ -752,7 +811,7 @@ async function itemDelete(rec, frame, page) {
     const p = dir ? path.posix.join(dir, CREATED + ".kdbx") : null;
     it.ok(!!(p && await statPath(frame, p)), "the file is there before the delete");
 
-    await frame.click(cardFor(CREATED) + ' button:text-is("Delete…")');
+    await safeAction(frame, CREATED, "Delete…");
     await frame.waitForSelector(".sec-modal", { timeout: 20000 });
     const danger = await modalText(frame);
     it.ok(/no undo|cannot be undone/i.test(danger),
