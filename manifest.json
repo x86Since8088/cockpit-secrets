@@ -1,0 +1,35 @@
+{
+    "version": "1.0.0",
+    "requires": {
+        "cockpit": "266"
+    },
+    "superuser": "try",
+    "conditions": [
+        {"path-exists": "/usr/local/sbin/secrets-admin"}
+    ],
+    "menu": {
+        "index": {
+            "label": "Secrets",
+            "order": 57,
+            "docs": [
+                {
+                    "label": "KDBX file format",
+                    "url": "https://keepass.info/help/kb/kdbx.html"
+                },
+                {
+                    "label": "Password Safe v3 format",
+                    "url": "https://github.com/pwsafe/pwsafe/blob/master/docs/formatV3.txt"
+                }
+            ],
+            "keywords": [
+                {
+                    "matches": ["secrets", "keepass", "kdbx", "keepassxc",
+                                "password safe", "psafe3", "pwsafe", "vault",
+                                "passphrase", "password", "credential",
+                                "safe", "unlock", "totp", "otp", "key file",
+                                "attachment"]
+                }
+            ]
+        }
+    }
+}

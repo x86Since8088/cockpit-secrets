@@ -1,0 +1,27 @@
+{
+  "id": "example-admin",
+  "label": "EXAMPLE - copy this file, do not use it (admin class)",
+  "format": "kdbx",
+  "path": "/etc/cockpit-secrets/safes/example-admin.kdbx",
+  "access": "admin",
+  "owner": null,
+  "groups": [
+    "sudo"
+  ],
+  "mode": "ro",
+  "password_required": true,
+  "keyfile": null,
+  "yubikey_slot": null,
+  "agent": {
+    "enabled": false,
+    "idle_seconds": 300,
+    "max_seconds": 3600
+  },
+  "export_allowed": false,
+  "export_dir": null,
+  "breach_corpus": null,
+  "backup": {
+    "keep": 10,
+    "dir": null
+  }
+}

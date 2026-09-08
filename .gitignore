@@ -9,9 +9,32 @@
 *.p12
 *.lock
 *.plk
+
+# The throwaway fixture safes ARE committed: every passphrase in
+# tests/fixtures/manifest.json is published on purpose and none of these files
+# holds a real credential. Without these negations the blanket bans above eat
+# them and the suite ships with nothing to test against.
 !tests/fixtures/**/*.kdbx
 !tests/fixtures/**/*.psafe3
 !tests/fixtures/**/*.key
+# `.keyx` is a DIFFERENT extension from `.key` and the pattern above does not
+# match it. Two of the fixtures are key-file safes; without this line their key
+# files are ignored, they are committed unopenable, and the failure only shows
+# up as an unlock that cannot be made to work.
+!tests/fixtures/**/*.keyx
+
+# The malformed corpus is GENERATED, not curated: `tests/corpus/gen_corpus.py
+# --build --clean` rebuilds all 67 cases in about 3.5 s from the committed
+# fixtures. Ignoring the whole directory is deliberate — committing the
+# `.expect.json` sidecars while the data files they describe were silently
+# ignored (which is what the blanket bans above did) is worse than committing
+# neither, because `--check` then reports a corpus that is not there.
+tests/corpus/files/
+
+# Built artefact: tests/oracle/build.sh rebuilds it offline from the module
+# cache in seconds. 3.5 MB of Go binary does not belong in a source tree.
+tests/oracle/pws3_oracle
+
 secrets.log
 audit/
 backups/
@@ -21,3 +44,6 @@ __pycache__/
 .playwright/
 test-results/
 _test_output.txt
+
+# Test-only: a deployed plugin reads [install path]/.env, never this one.
+.env

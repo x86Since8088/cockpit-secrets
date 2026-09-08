@@ -1,0 +1,314 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://edt1/cockpit-secrets/schema/safe-registry.schema.json",
+  "title": "cockpit-secrets safe registry entry",
+  "description": "One JSON object per file in the SYSTEM registry /etc/cockpit-secrets/safes.d/*.json (directory 0755 root:root, files 0644 root:root) or in a PER-USER registry ~/.config/cockpit-secrets/safes.d/*.json (directory 0700, files 0600, owned by that user). The registry is the ONLY source of safes: verbs take the 'id' from here and never a path from the caller (I4). An entry that fails this schema is DROPPED and logged by secrets-admin -- never partially applied, and never defaulted to the permissive access class (I1). The same schema validates both registries, but the per-user one is read ONLY by a helper running unescalated as that user, every entry loaded from it is FORCED to access:'user' whatever the file says, and a system entry with the same id always wins -- see docs/CONTRACT.md, 'The per-user registry'. This file is written by hand, and (since 0.4.0) by the safe-create and safe-import verbs; the three provenance keys at the bottom are the only ones those verbs add.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["id", "label", "format", "path"],
+
+  "properties": {
+    "id": {
+      "$comment": "The name every verb uses to reach this safe, and the name written into the audit log and the backup ring. It is matched literally, so a duplicate id across two files in ONE registry directory means the lexically LAST file silently wins -- keep them unique. (Across the two registries there is no silent winner: the system entry wins and the shadowed per-user entry is reported in health.registry_errors[].) Slashes, spaces, '..' and upper case are refused because this string reaches file names and log lines; allowing them would put path traversal into the one identifier the whole access model is keyed on. DELIBERATE ASYMMETRY: this pattern still accepts '.' and '_' because entries written by hand before 0.4.0 use them, and TIGHTENING IT HERE WOULD DROP THOSE ENTRIES -- silently deleting a working safe from an operator's list on upgrade. The safe-create / safe-import verbs MINT ids against the stricter '^[a-z0-9][a-z0-9-]{1,62}$' (published as constants.safe_id_pattern) because a minted id becomes a file name this program chose; the looser pattern here is what the loader will still READ.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 63,
+      "pattern": "^[a-z0-9][a-z0-9._-]*$"
+    },
+
+    "label": {
+      "$comment": "Human text shown in the safe list. Purely cosmetic -- nothing is keyed on it. Set it wrong and an operator picks the wrong safe out of the list, which is how a passphrase gets typed into the wrong prompt.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+
+    "format": {
+      "$comment": "Selects the backend adapter. Set it wrong and unlock fails at the header check with 'invalid' -- it does NOT silently try the other backend, because guessing a format from bytes an attacker supplied is how a parser bug becomes reachable. 'kdbx' covers KeePass 2.x / KeePassXC (3.x is opened read-only, I20); 'psafe3' is Password Safe v3.",
+      "type": "string",
+      "enum": ["kdbx", "psafe3"]
+    },
+
+    "path": {
+      "$comment": "Absolute path to the safe file, resolved ONLY here and never from a request (I4). It must be absolute: a relative path would resolve against a working directory the helper does not control. '..' is refused for the same reason. The file itself must be a regular file, mode 0600, owned by root for the admin class or by the caller for the user class -- the helper checks that by fstat on the fd it opened O_NOFOLLOW, so pointing this at a symlink gets 'access-denied', not a followed link (I5). Point it at a world-readable file and the helper refuses to open it at all.",
+      "type": "string",
+      "minLength": 2,
+      "allOf": [
+        { "pattern": "^/" },
+        { "not": { "pattern": "(^|/)\\.\\.(/|$)" } }
+      ]
+    },
+
+    "access": {
+      "$comment": "THE ACCESS CLASS, AND THE MOST DANGEROUS FIELD IN THIS FILE. 'admin' means the helper refuses the verb unless euid == 0 and the real caller is in one of 'groups'; the plugin calls it with superuser:'require'. 'user' means the helper runs unescalated as the logged-on user and the safe file must be owned by that user. OMITTING THIS KEY MEANS 'admin' -- the default is the restrictive class on purpose (I1), because a typo in this file must fail closed. Setting 'user' on a root-owned safe does not make it readable; it makes every unlock fail with 'access-denied'. Setting 'admin' on a safe in a user's home directory is worse: it asks a root helper to open a file in a directory that user controls, and only the O_NOFOLLOW/fstat/parent-directory guards stand between that and a symlink attack. IN A PER-USER REGISTRY THIS KEY IS NOT HONOURED: every entry loaded from ~/.config/cockpit-secrets/safes.d/ is forced to 'user', and one that declares 'admin' is DROPPED and logged rather than obeyed -- otherwise a file the user can write would be a file that names its own access class, which is the whole trust root handed over in one line.",
+      "type": "string",
+      "enum": ["admin", "user"],
+      "default": "admin"
+    },
+
+    "owner": {
+      "$comment": "For the 'user' class only: which user this entry belongs to, as a uid, a login name, or the literal '%u' meaning 'each user gets their own safe at this path'. Ignored for the admin class. Set it to the wrong user and the fstat ownership check rejects every unlock with 'access-denied'. null means 'the caller', which is the usual answer.",
+      "anyOf": [
+        { "type": "null" },
+        { "type": "string", "pattern": "^(%u|[0-9]{1,10}|[a-z_][a-z0-9_.-]{0,31}\\$?)$" }
+      ],
+      "default": null
+    },
+
+    "groups": {
+      "$comment": "Additional gate for the admin class: the REAL caller behind the escalation (SUDO_UID/PKEXEC_UID, else getuid) must be in one of these groups. Empty or absent falls back to the host's admin group (sudo/wheel). Listing a broad group here widens who can open a root-owned safe -- it is an OR, not an AND, so one permissive entry in this list is the effective policy. It never grants anything on its own: euid must still be 0.",
+      "type": "array",
+      "uniqueItems": true,
+      "maxItems": 16,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 32,
+        "pattern": "^[a-zA-Z_][a-zA-Z0-9_.-]*\\$?$"
+      },
+      "default": []
+    },
+
+    "mode": {
+      "$comment": "'rw' allows the mutation verbs; 'ro' makes every write verb return 'access-denied' before anything is serialized. Set 'ro' on any safe a desktop client also has open, and on anything you are not prepared to restore from the backup ring. Note that 'rw' here is a permission, not a promise: a KDBX3 file stays read-only regardless (no authenticated encryption, I20), and so does any safe whose parse-serialize-parse round trip would drop a field (I22).",
+      "type": "string",
+      "enum": ["rw", "ro"],
+      "default": "rw"
+    },
+
+    "password_required": {
+      "$comment": "Whether the unlock prompt demands a passphrase. TRUE IS THE DEFAULT AND THE POINT OF THIS PROGRAM: the passphrase is prompted on every unlock, by construction, because one helper process handles one operation and caches nothing. Setting false is the ONLY exemption, it is refused by this schema unless 'keyfile' or 'yubikey_slot' names a real key (see the allOf below), and the helper re-checks it -- a schema is a validator, not an enforcement point. false with a keyfile means anyone who can read that key file can open this safe with no passphrase at all; that is the trade you are making.",
+      "type": "boolean",
+      "default": true
+    },
+
+    "keyfile": {
+      "$comment": "Absolute path to a KeePass key file, read HELPER-SIDE only -- never a path from a request (I4). It must be absolute and free of '..' for the same reasons as 'path', and it should be 0600 and owned by whoever the access class says opens this safe. Putting a key file next to the safe it opens defeats the point of having one: an attacker who gets the safe gets the key in the same directory. null means no key file.",
+      "anyOf": [
+        { "type": "null" },
+        {
+          "type": "string",
+          "minLength": 2,
+          "allOf": [
+            { "pattern": "^/" },
+            { "not": { "pattern": "(^|/)\\.\\.(/|$)" } }
+          ]
+        }
+      ],
+      "default": null
+    },
+
+    "yubikey_slot": {
+      "$comment": "YubiKey HMAC-SHA1 challenge-response slot (1 or 2) for KDBX. null means none. If the hardware or the ykman/libykpers binding is absent the verb returns 'unsupported' -- it NEVER falls back to passphrase-only, because a silent downgrade of a second factor is indistinguishable from not having one. Setting a slot the key is not programmed for makes every unlock fail with 'bad-credential'.",
+      "anyOf": [
+        { "type": "null" },
+        { "type": "integer", "enum": [1, 2] }
+      ],
+      "default": null
+    },
+
+    "agent": {
+      "$comment": "The opt-in unlock agent (I18) -- an unlocked safe held behind an AF_UNIX socket so several operations share one passphrase prompt. OFF BY DEFAULT AND IT SHOULD USUALLY STAY OFF: enabling it recreates exactly the property this project exists to avoid, a safe that is open when nobody is looking at it. When on, the handle is bound by SO_PEERCRED to the uid that created it, and both timeouts are enforced by the agent and cannot be extended past 'max_seconds' by any client. Setting idle_seconds high is the mistake that matters: it is the window in which a stolen session reads the safe without knowing the passphrase.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "$comment": "false (the default) means no socket is created and no state outlives the helper process.",
+          "type": "boolean",
+          "default": false
+        },
+        "idle_seconds": {
+          "$comment": "Hard idle timeout. The agent locks this many seconds after the LAST use, not after the unlock. Above a few minutes you are running an unlocked password safe as a service.",
+          "type": "integer",
+          "minimum": 30,
+          "maximum": 3600,
+          "default": 300
+        },
+        "max_seconds": {
+          "$comment": "Absolute lifetime, counted from the unlock and not extendable by any amount of activity. Must be >= idle_seconds to mean anything; JSON Schema cannot compare two fields, so the helper re-checks that and drops the entry if it is inverted.",
+          "type": "integer",
+          "minimum": 60,
+          "maximum": 86400,
+          "default": 3600
+        }
+      },
+      "default": { "enabled": false, "idle_seconds": 300, "max_seconds": 3600 }
+    },
+
+    "export_allowed": {
+      "$comment": "Whether the admin-only export verb may run against this safe (I21). false is the default and the safe answer. Export writes EVERY SECRET IN THIS SAFE AS PLAINTEXT to a file on this host -- it is an exfiltration channel with a friendly name. Even when true, export is refused for a non-admin caller, is written 0600 into an operator-configured directory (never a path from the request), and is audited by file name.",
+      "type": "boolean",
+      "default": false
+    },
+
+    "export_dir": {
+      "$comment": "Where this safe's exports land, overriding the host default under COCKPIT_SECRETS_VAR/exports. Absolute and free of '..' for the same reasons as 'path', and refused under /tmp or /var/tmp -- an export is the whole safe in the clear and a world-writable directory is not a place to put one. The helper creates it 0700 and every file inside it 0600. Setting it while export_allowed is false is refused rather than ignored: the two together are one decision, and a directory configured for a safe that cannot be exported is somebody's half-finished intent. null means the host default.",
+      "anyOf": [
+        { "type": "null" },
+        {
+          "type": "string",
+          "minLength": 2,
+          "allOf": [
+            { "pattern": "^/" },
+            { "not": { "pattern": "(^|/)\\.\\.(/|$)" } },
+            { "not": { "pattern": "^/(tmp|var/tmp|dev/shm)(/|$)" } }
+          ]
+        }
+      ],
+      "default": null
+    },
+
+    "breach_corpus": {
+      "$comment": "An OFFLINE corpus of leaked password hashes (HIBP 'SHA1:count' lines) for the breach-check verb, overriding breach-corpus.txt under the registry root. Absolute and free of '..'. breach-check has no network client at all -- there is no online fallback and never will be one, because a page that phones a third party about the passwords it is holding is the exfiltration channel I21 exists to close. Absent means the feature answers available:false and stops; it never means 'ask the internet'.",
+      "anyOf": [
+        { "type": "null" },
+        {
+          "type": "string",
+          "minLength": 2,
+          "allOf": [
+            { "pattern": "^/" },
+            { "not": { "pattern": "(^|/)\\.\\.(/|$)" } }
+          ]
+        }
+      ],
+      "default": null
+    },
+
+    "backup": {
+      "$comment": "The retention ring written before the first byte of every save (I12). It is the ONLY undo this program has: a save that succeeds is not reversible any other way. Setting keep too low means a corruption you notice on the third save has already aged out of the ring.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "keep": {
+          "$comment": "Generations retained; the oldest is pruned once this many exist. Each generation is a full copy of the safe at 0600, so a large safe times a large keep is real disk.",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100,
+          "default": 10
+        },
+        "dir": {
+          "$comment": "Absolute directory for the ring, or null for '<path>.bak.d'. Must be absolute, must not contain '..', and must NOT be under /tmp or /var/tmp -- the helper refuses those: a backup is exactly as sensitive as the safe, and those directories are world-writable and frequently a different filesystem. Point it at a directory only root can read for an admin safe.",
+          "anyOf": [
+            { "type": "null" },
+            {
+              "type": "string",
+              "minLength": 2,
+              "allOf": [
+                { "pattern": "^/" },
+                { "not": { "pattern": "(^|/)\\.\\.(/|$)" } }
+              ]
+            }
+          ],
+          "default": null
+        }
+      },
+      "default": { "keep": 10, "dir": null }
+    },
+
+    "origin": {
+      "$comment": "PROVENANCE, and it is a RECORD rather than a permission. 'manual' (the default, and what every entry written before 0.4.0 means) is 'an administrator hand-wrote this entry and put the file there'; 'created' means safe-create minted both the file and this entry; 'imported' means safe-import staged an uploaded file, opened it with a credential the uploader supplied, and then minted both. Set it wrong and you have lied to the operator about where a safe came from -- which matters most in the safe-delete confirmation, where 'this program made this file' is the sentence that makes destroying it feel reasonable. It does NOT decide whether safe-delete will run: that gate is the DERIVED one (the entry's 'path' must equal the path this program would mint for this id and access class today), precisely so a hand-edited 'origin' cannot talk the helper into unlinking a file it did not create. Omitting the key means 'manual', which is the honest default for a file this program did not write.",
+      "type": "string",
+      "enum": ["manual", "created", "imported"],
+      "default": "manual"
+    },
+
+    "created_utc": {
+      "$comment": "When THIS ENTRY was written by safe-create or safe-import, UTC, RFC-3339 with a literal trailing 'Z'. It is not the safe file's mtime, not when the database inside it was first made, and it is never updated by a save -- an entry that says 2026-09-04 next to a safe modified this morning is correct, not stale. Set it wrong and the only cost is a misleading answer to 'when did this safe appear on this host'; the audit log is the authority for that and this is the convenience copy. null (and absence) means 'not recorded', which is what a hand-written entry says.",
+      "anyOf": [
+        { "type": "null" },
+        {
+          "type": "string",
+          "minLength": 20,
+          "maxLength": 27,
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,6})?Z$"
+        }
+      ],
+      "default": null
+    },
+
+    "source": {
+      "$comment": "THE HEADER SUMMARY READ AT IMPORT TIME, AND NOTHING MORE. safe-import's inspect step parses the UNAUTHENTICATED header of the staged bytes -- format, version, cipher, KDF and its parameters are readable by anyone holding the file, which is why that step needs no credential at all -- and this key records what it said, so an operator can later see what they adopted without unlocking it. Three things it is NOT, each of which is a way to get this wrong: it is not re-verified afterwards, so it goes stale the moment the safe is rewritten with different parameters by another client; it is not authenticated, so on a tampered file it records what an attacker wrote; and NOTHING is keyed on it -- the backend reads the real header on every unlock and does not consult this. The damage from a wrong value is therefore an operator who believes a safe is stronger (or a different format) than it is. null, and absence, mean 'not recorded' and are correct for a hand-written or created-here entry.",
+      "anyOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["inspected_utc"],
+          "properties": {
+            "format_version": {
+              "$comment": "The version string the header declared, e.g. '4.1' or '0x030F'. Cosmetic; the backend re-reads it.",
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32
+            },
+            "cipher": {
+              "$comment": "The cipher named in the header, e.g. 'aes256-cbc', 'chacha20', 'twofish-cbc'. Cosmetic; the backend re-reads it. Recording a cipher this build cannot open does not make it openable -- unlock still answers with the backend's own reason.",
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32
+            },
+            "kdf": {
+              "$comment": "The KDF named in the header, e.g. 'argon2id', 'argon2d', 'aes-kdf', 'sha256-iterated'. Cosmetic; the backend re-reads it.",
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32
+            },
+            "kdf_params": {
+              "$comment": "The KDF's declared cost, as the header stated it -- BEFORE the Limits clamps, so a value here may legitimately exceed what this host will derive. Every key is optional and every one is an integer, and additionalProperties is false: THE HELPER MUST DROP A PARAMETER IT HAS NO KEY FOR HERE RATHER THAN WRITE IT, because writing an unknown key makes the whole entry fail validation on the next load and the operator's safe disappears from the list. A new KDF gains its key in this file in the same change as the backend that reports it, never after.",
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "memory_kib": { "type": "integer", "minimum": 0 },
+                "time":       { "type": "integer", "minimum": 0 },
+                "parallelism":{ "type": "integer", "minimum": 0 },
+                "rounds":     { "type": "integer", "minimum": 0 },
+                "iterations": { "type": "integer", "minimum": 0 }
+              }
+            },
+            "bytes": {
+              "$comment": "Size of the file as imported. Compare it with the file today to see that something has rewritten the safe since; that is all it is for.",
+              "type": "integer",
+              "minimum": 0
+            },
+            "sha256_at_import": {
+              "$comment": "Lower-case hex SHA-256 of the bytes AS UPLOADED, which safe-import verified against the digest the operator declared before it would inspect them. IT IS NOT A TAMPER CHECK FOR LATER: the first save rewrites the file and this digest stops matching, correctly and permanently. Its one job is answering 'is the file on this host the file I uploaded' at a moment when nothing has written to it yet. Treating a mismatch as evidence of tampering on a safe that has been used is a misreading of this field, not a finding.",
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "inspected_utc": {
+              "$comment": "When the header above was read, UTC, RFC-3339 with a literal trailing 'Z'. Required, because a header summary with no timestamp invites being read as current.",
+              "type": "string",
+              "minLength": 20,
+              "maxLength": 27,
+              "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,6})?Z$"
+            }
+          }
+        }
+      ],
+      "default": null
+    }
+  },
+
+  "allOf": [
+    {
+      "$comment": "password_required:false is INVALID unless some other key is registered. Without a keyfile or a yubikey_slot it would mean 'this safe opens with nothing at all', which is not a configuration, it is an unlocked file. The four branches are: (1) password_required is explicitly true; (2) it is absent, which defaults to true; (3) a non-null keyfile path is registered; (4) a non-null yubikey_slot is registered. Note that \"keyfile\": null does NOT satisfy branch 3 -- the branch requires a string -- which is the whole reason this is written as anyOf over typed branches rather than as a 'required' list. The helper re-checks this rule at load time; the schema refusing it first is belt and braces (I1, and Task 7's rule 2).",
+      "anyOf": [
+        {
+          "required": ["password_required"],
+          "properties": { "password_required": { "const": true } }
+        },
+        {
+          "not": { "required": ["password_required"] }
+        },
+        {
+          "required": ["keyfile"],
+          "properties": { "keyfile": { "type": "string" } }
+        },
+        {
+          "required": ["yubikey_slot"],
+          "properties": { "yubikey_slot": { "type": "integer" } }
+        }
+      ]
+    }
+  ]
+}

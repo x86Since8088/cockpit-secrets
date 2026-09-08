@@ -1,0 +1,10 @@
+# Evidence from one run of tests/browser/run-live.sh against this host's live
+# Cockpit: screenshots, console logs, and the JSON result files.
+#
+# Never committed, and the reason is not tidiness. A screenshot taken between
+# "Reveal" and the countdown ending is a screenshot OF A PASSWORD, and the
+# console log of a live session names this host's safes. The suite writes them
+# 0600 for the same reason. Keep the directory (so the runner has somewhere to
+# write) and ignore everything in it.
+*
+!.gitignore
