@@ -1,0 +1,83 @@
+# cockpit-secrets .envdefault
+#
+# deploy.sh seeds this to [install path]/.env, MISSING-ONLY: an existing .env is
+# never overwritten, because it is what the operator decided. When a new version
+# adds a key, deploy.sh says so and install.sh refuses until you add it.
+#
+# GRAMMAR (docs/DEPLOY-CONTRACT.md section 4.1) - a strict subset of what sh,
+# systemd's EnvironmentFile and Python all accept, so one file feeds all three:
+#   KEY=value | KEY="value with spaces" | KEY=
+#   Keys match ^[A-Z][A-Z0-9_]*$. No `export`. Full-line comments only - a
+#   trailing # is part of the value. NO $, no ${...}, no $(...), no backticks:
+#   there is no interpolation. Write the value out in full, or let the consumer
+#   join the two halves.
+#
+# ===========================================================================
+# THIS FILE NEVER CONTAINS A SECRET. Not a passphrase, not a key, not a token.
+# ===========================================================================
+# It carries LOCATIONS AND SETTINGS. It is mode 0644 root:root on purpose
+# (section 4.2, JC-8): 0600 would force the user-class helper - the one that
+# runs as the logged-on user, not root - to escalate in order to read a
+# directory name, which is a worse trade than an operator learning where the
+# payload lives. deploy.sh REFUSES to write a .env whose key looks like a
+# credential and whose value is not a path to one, and that refusal is what
+# makes 0644 safe rather than merely convenient.
+#
+# Safe FILES, key files and passphrases live in SECRETS_ETC_DIR/safes at 0700
+# root:root. They are named by the registry, never by this file.
+#
+# A .env in the SOURCE checkout is TEST-ONLY. It exists so the suite and a dev
+# install have something to read, it is in .gitignore, and no deployed plugin
+# ever reads one - the helper resolves its configuration through
+# /etc/cockpit-secrets/install.conf and has no "look beside me" step at all
+# (section 4.3).
+#
+# ---------------------------------------------------------------------------
+# WHY THESE ARE NOT UNDER THE INSTALL PATH
+# ---------------------------------------------------------------------------
+# Every location below is in /etc, /var/lib or /var/log rather than in
+# /opt/cockpit-secrets. An upgrade replaces the payload WHOLESALE, so nothing
+# an upgrade replaces may hold state - and backup policy, logrotate, SELinux
+# labelling and restorecon already know those three trees. They do not know
+# /opt/cockpit-secrets/state, and a second state directory where /var/lib would
+# have done is a backup that silently does not cover you.
+#
+# install.sh REFUSES if any value here disagrees with the constant compiled
+# into secrets-admin. Two places that can hold a location is one place too
+# many, and a split between them would be invisible until a safe went missing.
+
+# The registry root: <this>/safes.d holds one *.json per safe, and that
+# directory IS the access-control policy for every safe on this host. The
+# helper refuses to trust it at all if it, or any entry in it, is group- or
+# other-writable (KNOWN_ISSUES I1). <this>/safes holds admin-class safe files
+# at 0700. Both survive an upgrade and an uninstall.
+SECRETS_ETC_DIR=/etc/cockpit-secrets
+
+# Runtime state. <this>/state holds the per-(uid, safe) lockout counters (I16) -
+# uninstalling must not be a way to clear a lockout, which is why this is
+# outside the payload. <this>/exports is the export destination (I21): if
+# anybody ever ran the export verb, a file in there is AN ENTIRE SAFE IN
+# PLAINTEXT. Look in it before you remove anything, and shred rather than rm.
+SECRETS_VAR_DIR=/var/lib/cockpit-secrets
+
+# The audit log: who opened what, and when. It carries no value and no path
+# (I15), but it is still a map of who holds what, so it is 0700 and it outlives
+# the tool.
+SECRETS_LOG_DIR=/var/log/cockpit-secrets
+
+# Where the helper imports backends/ and schema/ from. install.sh links the
+# payload's lib/ here per file; secrets-admin looks here after failing to find
+# the package beside itself, which is what makes the repo layout and the
+# installed layout both work with no code change.
+SECRETS_LIB_DIR=/usr/local/lib/cockpit-secrets
+
+# Shipped documentation - the per-user registry example lives here. It is
+# documentation, NOT policy: a per-user entry in the system registry would be an
+# entry naming a path in somebody's home directory, read by a root helper.
+SECRETS_EXAMPLE_DIR=/usr/local/share/cockpit-secrets/examples
+
+# The unit directory (--with-agent only). JC-11: the project picks one and
+# records it, so --uninstall on a host installed by a different version still
+# finds the units. User units go in <this>/user, the system template in
+# <this>/system. Nothing here is ever enabled by an installer.
+SECRETS_UNIT_DIR=/usr/local/lib/systemd

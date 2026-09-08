@@ -44,3 +44,6 @@ __pycache__/
 .playwright/
 test-results/
 _test_output.txt
+
+# Test-only: a deployed plugin reads [install path]/.env, never this one.
+.env

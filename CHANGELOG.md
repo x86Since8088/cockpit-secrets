@@ -1,3 +1,34 @@
+## 0.5.2 - 2026-09-07
+
+Install classification is now decided by LAYOUT, not by a development-root path
+prefix, and this plugin was deployed to its real install path on edt1.
+
+- `install.sh` decides dev vs deployed by asking whether its own directory is
+  what a sibling `payload` symlink resolves to. The old test compared `$SRC`
+  against a hardcoded development root and got a checkout sitting ANYWHERE ELSE
+  wrong: such a checkout classified itself `deployed`, so it skipped the
+  group-writable warning, wrote INSTALL_KIND=deployed for a host that was not
+  self-sustaining, and dropped "the checkout is not touched" from
+  `--uninstall`. Reproduced before the change and confirmed fixed after.
+- Because that literal is gone, pre-flight check 9 now scans `install.sh`
+  itself. The carve-out that exempted it is removed. Both of the check's own
+  patterns are split so the scanner cannot match itself; the string it searches
+  for is unchanged, so nothing is weakened.
+- `owned_by_us` recognises a dev link by `$SRC` rather than by "anywhere
+  under the development root", which is tighter: it no longer adopts a link
+  belonging to a different checkout of the same project.
+- The uninstall notice and the dev warning ask the LINK TARGET's layout, so
+  they stay correct when the deployed installer tears down links a dev install
+  made.
+- Deployed to /opt/cockpit-secrets on edt1. The registry, safes, audit log and
+  lockout state under /etc and /var were kept, not rewritten; the operator's
+  pwsafe3 safe and registry entry and the three dummy-fake safes are unchanged,
+  verified by hash before and after.
+- Gate re-run after every change: check.sh OK, validate.sh OK, run_tests.sh OK
+  with 20/20 groups and zero FAIL lines.
+A recursive grep of the deployed tree for the development root or the retired
+checkout path now returns nothing at all.
+
 # Changelog
 
 Notable changes to cockpit-secrets. Versions are `MAJOR.MINOR.PATCH`; `VERSION`
