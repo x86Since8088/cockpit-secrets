@@ -447,6 +447,216 @@ if compgen -G "*.js" >/dev/null; then
     else pass "no source file contains a NUL byte"; fi
 else skip "no sources to scan for NUL bytes"; fi
 
+# ------------------------------------------- deployment bans (DEPLOY-CONTRACT) ---
+head_ "Deployment bans (docs/DEPLOY-CONTRACT.md)"
+
+# The declared payload, read from install.sh's manifest block - the same single
+# source deploy.sh reads. If this file restated it the two could disagree, and a
+# gate that scans a different list from the one that ships is a gate that passes
+# the wrong files.
+dc_manifest="$(sed -n '/^# BEGIN-MANIFEST/,/^# END-MANIFEST/p' install.sh)"
+if [[ -z "$dc_manifest" ]]; then
+    fail "install.sh has no BEGIN-MANIFEST block - deploy.sh and this gate both read it"
+else
+    eval "$dc_manifest"
+
+    # The manifest block is read by THREE parsers: bash's eval here, deploy.ps1's
+    # line-oriented reader, and this file. Only bash joins a continuation line, so
+    # a multi-line array assignment silently handed the other two a truncated
+    # STRING where an array was meant - REQUIRED_ENV came back as 64 characters
+    # instead of 6 keys, and every check that iterated it quietly did nothing.
+    # One line per assignment, enforced here so it cannot come back.
+    if printf '%s\n' "$dc_manifest" | grep -qE '^[A-Z_]+=\([^)]*$'; then
+        fail "a BEGIN-MANIFEST assignment does not close on one line - the non-bash parsers read it as a truncated string"
+        printf '%s\n' "$dc_manifest" | grep -nE '^[A-Z_]+=\([^)]*$' | sed 's/^/        /'
+    else
+        pass "every BEGIN-MANIFEST assignment fits on one line (all three parsers agree)"
+    fi
+
+    # The dev root, split so this file's own mention cannot match itself and
+    # turn the check below into a permanent self-inflicted failure.
+    DC_DEV="/srv/smb/share/sc/ai-orchestrator""-group"
+
+    dc_shipped=("${PAGE[@]}" "$ENVDEFAULT")
+    for h in "${HELPERS[@]}"; do
+        [[ -e "bin/$h" ]] && dc_shipped+=("bin/$h") || dc_shipped+=("$h")
+    done
+    for l in "${LIBS[@]}"; do
+        [[ -d "$l" ]] && dc_shipped+=("$l") || dc_shipped+=("${l#lib/}")
+    done
+    [[ -d agent ]] && dc_shipped+=(agent)
+    # Shipped docs land on production hosts like any other artifact.
+    for d in README.md LICENSE; do [[ -f "$d" ]] && dc_shipped+=("$d"); done
+
+    # THE STANDING BAN THE DEPLOYMENT WORK ADDS: no deployed artifact may
+    # contain a dev-tree or retired path. install.sh is excluded because
+    # section 3.1 REQUIRES it to carry the dev root as a literal - that is how
+    # it classifies the install, and how --uninstall knows to tell an operator
+    # that their checkout is not being touched. The ban is on artifacts that
+    # would carry a dead path into production.
+    #
+    # Had this check existed in samba-ad-lab it would have caught all thirteen
+    # occurrences there, including the two that are broken right now: a Cockpit
+    # manifest condition naming a file that does not exist (which makes the
+    # plugin SILENTLY ABSENT), and a SECRET_DIR that makes every build create an
+    # empty secrets directory at a dead path.
+    if hits=$(grep -RIn -e '/opt/sc/git' -e "$DC_DEV" -- "${dc_shipped[@]}" 2>/dev/null); then
+        fail "a deployed artifact hardcodes a dev-tree or retired path - it belongs in .env"
+        printf '%s\n' "$hits" | sed 's/^/        /' | head -8
+    else
+        pass "no deployed artifact names a dev-tree or retired path"
+    fi
+
+    # section 4.4 grep 1 - no shipped file names a source .env.
+    if grep -RIn -e 'source/\.env' -- "${dc_shipped[@]}" 2>/dev/null | grep -q .; then
+        fail "a shipped file names a source .env (that file is TEST-ONLY)"
+    else pass "no shipped file names a source .env"; fi
+
+    # section 4.4 grep 2 - nothing resolves .env relative to itself.
+    if grep -RIn -e 'dirname.*\.env' -e '__file__.*\.env' -e 'BASH_SOURCE.*\.env' \
+            -- "${dc_shipped[@]}" 2>/dev/null | grep -q .; then
+        fail "a shipped file resolves .env relative to itself"
+    else pass "nothing resolves .env relative to itself"; fi
+
+    # section 4.4 grep 3 - a config reader goes through install.conf, or reads
+    # nothing. secrets-admin takes the second branch: its data seams are its own
+    # compiled constants, and install.sh's pre-flight 7b refuses when .env and
+    # those constants disagree, so the two cannot silently diverge.
+    dc_bad=""
+    for h in "${HELPERS[@]}"; do
+        hp="bin/$h"; [[ -e "$hp" ]] || hp="$h"
+        grep -qE 'load_env|\.env\b' "$hp" 2>/dev/null || continue
+        grep -q 'install\.conf' "$hp" || dc_bad+="$hp "
+    done
+    if [[ -n "$dc_bad" ]]; then fail "reads .env but never mentions install.conf: $dc_bad"
+    else pass "every config reader goes through install.conf (or reads nothing)"; fi
+
+    # section 4.1 - .envdefault must parse under the one grammar, and declare
+    # every REQUIRED_ENV key.
+    if [[ -f "$ENVDEFAULT" ]]; then
+        if python3 - "$ENVDEFAULT" <<'PYGRAMMAR' 2>&1
+import re, sys
+path = sys.argv[1]
+for n, raw in enumerate(open(path, encoding="utf-8"), 1):
+    line = raw.strip()
+    if not line or line.startswith("#"):
+        continue
+    if "=" not in line:
+        sys.exit("%s:%d: not KEY=VALUE" % (path, n))
+    k, v = (x.strip() for x in line.split("=", 1))
+    if not re.fullmatch(r"[A-Z][A-Z0-9_]*", k):
+        sys.exit("%s:%d: bad key %r" % (path, n, k))
+    if len(v) >= 2 and v[0] == v[-1] == '"':
+        v = v[1:-1]
+    if any(c in v for c in "$`"):
+        sys.exit("%s:%d: %s contains $ or ` (no interpolation, section 4.1)" % (path, n, k))
+PYGRAMMAR
+        then pass "$ENVDEFAULT parses under the section 4.1 grammar"
+        else fail "$ENVDEFAULT violates the section 4.1 grammar"; fi
+
+        dc_missing=""
+        for k in "${REQUIRED_ENV[@]}"; do
+            grep -qE "^[[:space:]]*$k=" "$ENVDEFAULT" || dc_missing+="$k "
+        done
+        if [[ -n "$dc_missing" ]]; then fail "$ENVDEFAULT does not declare REQUIRED_ENV: $dc_missing"
+        else pass "$ENVDEFAULT declares all ${#REQUIRED_ENV[@]} REQUIRED_ENV key(s)"; fi
+
+        # section 4.2 - A DEPLOYED .env MUST NEVER CONTAIN A SECRET. This is
+        # what makes mode 0644 safe rather than merely convenient, and in a
+        # project whose entire job is passphrases it is the ban that matters
+        # most. Checked on the committed default, because that is what a fresh
+        # deploy copies.
+        dc_leak=""
+        while IFS='=' read -r k v; do
+            [[ "$k" =~ (PASS|PASSWORD|SECRET|TOKEN|KEY|CREDENTIAL|PASSPHRASE) ]] || continue
+            [[ "$k" =~ _(FILE|PATH|DIR|NAME|ID)$ ]] && continue
+            [[ -z "$v" ]] && continue
+            dc_leak+="$k "
+        done < <(grep -v '^[[:space:]]*#' "$ENVDEFAULT" | grep '=' || true)
+        if [[ -n "$dc_leak" ]]; then fail "$ENVDEFAULT holds a secret-shaped VALUE: $dc_leak"
+        else pass "$ENVDEFAULT holds no secret-shaped value"; fi
+    else fail "$ENVDEFAULT is missing - section 5 requires one wherever etcdefaults/ exists"; fi
+
+    # section 8.4 - a Cockpit condition may test only paths this project's own
+    # install.sh creates. An unmet condition makes the package SILENTLY ABSENT:
+    # no page, no menu entry, no error anywhere the operator will look. A
+    # missing sibling must produce an in-page diagnosis naming the file and the
+    # .env key, never a disappearance.
+    if [[ -f manifest.json ]]; then
+        if python3 - manifest.json "${HELPERS[@]}" <<'PYCOND'
+import json, sys
+m = json.load(open(sys.argv[1]))
+allowed = {"/usr/local/sbin/%s" % h for h in sys.argv[2:]}
+for c in m.get("conditions", []):
+    p = c.get("path-exists") if isinstance(c, dict) else None
+    if p and p not in allowed:
+        sys.exit("condition tests %s, which install.sh does not create" % p)
+PYCOND
+        then pass "section 8.4 manifest conditions test only what install.sh creates"
+        else fail "section 8.4 a manifest condition tests a path install.sh does not create"; fi
+    fi
+
+    # section 2.4 - the recursive-removal ban. rm -rf on a path that is a
+    # symlink into the checkout, with one trailing slash, deletes the checkout.
+    # install.sh must contain NO recursion at all; deploy.sh gets exactly two -
+    # the $NEW.tmp staging dir it just created, and remove_old_payload, which
+    # asserts three times against a $ROOT_REAL resolved once.
+    # Heredoc bodies are TEXT PRINTED TO THE OPERATOR, not commands this script
+    # runs, and install.sh's uninstall notice legitimately shows the operator
+    # the `rm -rf` they would type by hand to remove their own data. Stripping
+    # heredoc bodies before the scan makes this check MORE precise rather than
+    # excusing a pattern - an exception list would have had to grow every time
+    # the advice was reworded, and a check with an exception list is a check
+    # with a blind spot.
+    strip_heredocs() {
+        awk '
+            inhere { if ($0 == term || $0 == "\t" term) inhere = 0; next }
+            {
+                line = $0
+                if (match(line, /<<-?[[:space:]]*'\''?"?[A-Za-z_][A-Za-z0-9_]*'\''?"?/)) {
+                    t = substr(line, RSTART, RLENGTH)
+                    gsub(/^<<-?[[:space:]]*/, "", t); gsub(/['\''"]/, "", t)
+                    term = t; inhere = 1
+                }
+                print NR ":" line
+            }
+        ' "$1"
+    }
+    dc_off=""
+    for sf in install.sh deploy.sh; do
+        [[ -f "$sf" ]] || continue
+        while IFS= read -r line; do dc_off+="$sf: $line"$'\n'; done \
+            < <(strip_heredocs "$sf" \
+                | grep -E 'rm[[:space:]]+-[a-zA-Z]*r|find[[:space:]].*-delete|rsync.*--delete' \
+                | grep -vE '^[0-9]+:[[:space:]]*#' \
+                | { if [[ "$sf" == deploy.sh ]]; then grep -vE 'rm -rf -- "\$NEW\.tmp"|rm -rf -- "\$real"'; else cat; fi; })
+    done
+    if [[ -n "$dc_off" ]]; then
+        fail "a recursive removal outside remove_old_payload"
+        printf '%s' "$dc_off" | sed 's/^/        /' | head -6
+    else pass "no recursive removal outside remove_old_payload"; fi
+
+    # section 6.1 - neither script may touch cockpit.socket (Cockpit is live on
+    # this host), and install.sh may never enable or start a unit. Matched on a
+    # COMMAND, not a comment: both scripts say in prose that they leave it
+    # alone, and a check that cannot tell prose from a systemctl call is a check
+    # that gets disabled.
+    if grep -RIn 'cockpit\.socket' install.sh deploy.sh 2>/dev/null \
+            | grep -E 'systemctl|service |systemd-run' | grep -q .; then
+        fail "install.sh or deploy.sh acts on cockpit.socket"
+    else pass "neither script touches cockpit.socket"; fi
+
+    if grep -nE '^[^#]*systemctl( --user)? (enable|start|restart)' install.sh | grep -q .; then
+        fail "install.sh enables or starts a unit - that is deploy.sh's, behind a flag"
+    else pass "install.sh never enables or starts a unit"; fi
+
+    # section 0 - install.sh LINKS the payload; it never copies it. A page file
+    # arriving by `install` rather than `ln` is the old model coming back.
+    if grep -nE '^[^#]*install .*-m 0644 .*\$SRC/\$f' install.sh | grep -q .; then
+        fail "install.sh copies a page file instead of linking it"
+    else pass "install.sh links the payload rather than copying it"; fi
+fi
+
 # ------------------------------------------------------------ unit tests ----
 head_ "Unit tests"
 if compgen -G "tests/test_*.py" >/dev/null; then

@@ -1,61 +1,66 @@
 #!/usr/bin/env bash
 #
-# install.sh - install cockpit-secrets: the Cockpit page, the secrets-admin verb
-#              helper and its backends, the registry directories, and - only when
-#              asked for by name - the optional unlock agent's systemd USER unit.
+# install.sh - the IN-PLACE install, BY SYMLINK, of cockpit-secrets: the Cockpit
+#              page, the secrets-admin verb helper, its backends and schema, the
+#              registry directories, and - only when asked for by name - the
+#              optional unlock agent's systemd units.
+#
+# IT DOES NOT COPY THE PAYLOAD. It links the files this directory ships into the
+# places Cockpit, /usr/local/sbin and systemd look. Run it from a dev checkout
+# and the page is symlinks into the checkout, so editing secrets.js changes what
+# the browser loads on the next reload. Run the IDENTICAL script from
+# /opt/cockpit-secrets/payload and the links point at a tree with no
+# relationship to the share. The script is the same; only where it is run from
+# differs. Nothing below branches on which of the two it is in order to decide
+# WHAT to link - only to record which it did.
 #
 # MUST BE RUN AS ROOT. /usr/share/cockpit, /usr/local/sbin and /etc are
-# root-owned, and every mode and owner below is set explicitly rather than
-# inherited from whatever umask happens to be in force. It refuses to run
-# unescalated rather than half-installing a package Cockpit would then serve
-# with the wrong permissions - a registry directory an unprivileged user can
-# write is a registry that grants itself root (docs/KNOWN_ISSUES.md I1).
+# root-owned, and every mode below is set explicitly rather than inherited from
+# whatever umask happens to be in force. It refuses to run unescalated rather
+# than half-installing a program that holds passphrases: a registry directory an
+# unprivileged user can write is a registry that grants itself root (I1).
 #
 #   sudo ./install.sh                     # install
 #   sudo ./install.sh --with-agent        # ... and the opt-in unlock agent (I18)
 #   sudo ./install.sh --uninstall         # remove the software, KEEP registry + safes
+#   sudo ./install.sh --env-file PATH     # override where .env is read from
 #   sudo DESTDIR=/tmp/stage ./install.sh  # stage into a package build root
 #   ./install.sh --help
 #
 # What it touches, and nothing else. This list is checked, not promised: the
-# library root is asserted against it at the end of every run (section 5b
-# below), and tests/root/20-verify-install.sh audits the whole set from outside,
-# as a separate root job - a run that checked its own work would report the mode
-# it intended in both places.
+# library root is asserted against it at the end of every run, and
+# tests/root/20-verify-install.sh audits the whole set from outside, as a
+# separate root job - a run that checked its own work would report the mode it
+# intended in both places. Every location below comes from .env, and install.sh
+# REFUSES if a value there disagrees with the constant compiled into
+# secrets-admin.
 #
-#   /usr/share/cockpit/secrets/                  0755 root:root, files 0644
-#   /usr/local/sbin/                             0755 root:root   created if absent
-#   /usr/local/sbin/secrets-admin                0755 root:root
-#   /usr/local/lib/cockpit-secrets/              0755 root:root
-#   /usr/local/lib/cockpit-secrets/backends/     0755, *.py 0644 and NOTHING else
-#   /usr/local/lib/cockpit-secrets/schema/       0755, *.json 0644
-#   /etc/cockpit-secrets/                        0755 root:root
-#   /etc/cockpit-secrets/safes.d/                0755 root:root   the registry
-#   /etc/cockpit-secrets/safes/                  0700 root:root   admin-class safe files
-#   /var/log/cockpit-secrets/                    0700 root:root   audit.log
-#   /var/lib/cockpit-secrets/                    0700 root:root
-#   /var/lib/cockpit-secrets/state/              0700 root:root   lockout counters (I16)
-#   /var/lib/cockpit-secrets/exports/            0700 root:root   export destination (I21)
-#   /usr/local/lib/cockpit-secrets/agent/        --with-agent only
-#   /usr/local/lib/cockpit-secrets/secrets-agent --with-agent only, if the source
-#                                                tree ships one (0755; today it
-#                                                ships modules and no executable)
-#   /usr/local/lib/systemd/user/                 --with-agent only
-#   /usr/local/lib/systemd/user/secrets-agent.*  --with-agent only
-#   /usr/local/lib/systemd/system/               --with-agent only
-#   /usr/local/lib/systemd/system/secrets-agent@.*  --with-agent only, NOT enabled
+#   /usr/share/cockpit/secrets/          a REAL directory of per-file symlinks
+#   /usr/local/sbin/secrets-admin        -> payload/bin/secrets-admin
+#   SECRETS_LIB_DIR/backends/*.py        -> payload/lib/backends/*.py
+#   SECRETS_LIB_DIR/schema/*.json        -> payload/lib/schema/*.json
+#   SECRETS_ETC_DIR/                     0755  the registry root
+#   SECRETS_ETC_DIR/safes.d/             0755  the registry itself
+#   SECRETS_ETC_DIR/safes/               0700  admin-class safe files
+#   SECRETS_LOG_DIR/                     0700  audit.log
+#   SECRETS_VAR_DIR/{state,exports}/     0700  lockout counters (I16), exports (I21)
+#   SECRETS_EXAMPLE_DIR/user-safes.d/    0755  shipped documentation, not policy
+#   /etc/cockpit-secrets/install.conf    0644  the machine's record of this install
+#   SECRETS_UNIT_DIR/{user,system}/      --with-agent only, rendered, NOT enabled
 #
 # --uninstall removes every one of those EXCEPT the data locations it names on
-# the way out: /etc/cockpit-secrets (the registry and the safe files),
-# /var/log/cockpit-secrets (the audit log), /var/lib/cockpit-secrets/state
-# (lockout counters) and /var/lib/cockpit-secrets/exports (which may hold
-# PLAINTEXT exports - see docs/OPERATIONS.md, "The exports directory").
+# the way out: the registry and the safe files, the audit log, the lockout
+# counters and the exports directory - which may hold PLAINTEXT exports.
 #
 # What it never does:
 #
+#   - copy the payload. It links. deploy.sh is the only thing that copies.
 #   - restart, reload or otherwise disturb Cockpit. cockpit.socket is a live
 #     service on this host and rescans its package directory on the next page
 #     load anyway.
+#   - enable, start or stop ANY unit. That is deploy.sh's, and ultimately the
+#     operator's (I18).
+#   - write .env. deploy.sh seeds it, missing-only. This script only reads it.
 #   - write over any *.json already in safes.d/. An operator's registry entry is
 #     the access-control policy for a safe; clobbering one would silently change
 #     who can open what. Examples are seeded as *.json.example, which the
@@ -64,83 +69,135 @@
 #   - open, read, move or modify any safe file, backup or key file.
 #   - print the contents of anything. Root work on this host goes through the
 #     /srv/jobs runner and its output.log is group-readable.
-#   - enable or start the agent. That is a per-user systemd decision and it is
-#     the operator's to make, deliberately (I18).
 #
 # There is no `set -x` anywhere in this tree (I15). A traced shell would put
 # every path and every argument it sees into that group-readable job log.
 #
 set -Eeuo pipefail
 
-SRC="$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")" && pwd)"
-NAME="secrets"
+# ===========================================================================
+# BEGIN-MANIFEST
+#
+# THE ONE DECLARATION (docs/DEPLOY-CONTRACT.md section 7.1). deploy.sh and
+# validate.sh read this exact block out of this exact file rather than restating
+# it. Two lists that can disagree is the failure being designed out; restating
+# the payload in the deploy script is the obvious way to re-introduce it.
+#
+# This array is FOUR things at once: the link list, the stale-file sweep, the
+# payload-present check, and what deploy.sh copies. They cannot disagree with
+# each other because they are all reading these lines. What they CAN disagree
+# EVERY ASSIGNMENT BELOW MUST FIT ON ONE LINE. bash's `eval` does not care, but
+# deploy.ps1 and validate.sh read this block with a line-oriented parser, and a
+# continuation line silently produced a 64-character STRING where an array was
+# meant. The parsers now refuse a line they cannot read rather than guess - but
+# the constraint is cheaper to obey than to detect.
+#
+# What they CAN disagree
+# with is index.html, and for a release they did - `theme.js` was added to the
+# page and not to the array, so the installer swept it back off the host on
+# every single run. Pre-flight check 2 is what makes that impossible now.
+# ---------------------------------------------------------------------------
+PROJECT="cockpit-secrets"        # the repo dir, and the /opt/<project> name
+NAME="secrets"                   # the Cockpit package, /usr/share/cockpit/<name>
+
+PAGE=(manifest.json index.html secrets.js secrets.css theme.js)
+
+# Verb helpers linked into /usr/local/sbin. secrets.js pins this one in a
+# top-of-file literal constant, which is what lets pre-flight check 3 see it.
+HELPERS=(secrets-admin)
+
+# Python packages linked per-file into SECRETS_LIB_DIR. In the payload they are
+# under lib/; in a dev checkout they sit at the repo root beside secrets-admin.
+# That is JC-5's one tolerated asymmetry and src_lib() below is where it lives.
+LIBS=(lib/backends lib/schema)
+
+# Units for the base install: none. The agent's are opt-in and declared below.
+UNITS=()
+
+# Seed data for SECRETS_ETC_DIR. Managed CONTENT, not settings - zero or many
+# registry entries, each a distinct object with a schema that the software
+# validates and acts on. That is exactly the section 5 test for etcdefaults/
+# rather than .envdefault, and this project has both.
+SEEDS=(etcdefaults)
+
+ENVDEFAULT=.envdefault
+
+# --with-agent only (I18). USER units and the SYSTEM template are separate
+# lists with separate destinations, and the separation is load-bearing: a
+# single recursive glob would drop secrets-agent@.service into the user unit
+# directory, where systemd reads User=%i and SocketUser=%i in a per-user
+# manager that cannot honour either - silently wrong, and wrong about identity,
+# which is the one thing this agent exists to get right.
+AGENT_UNITS=(secrets-agent.socket secrets-agent.service)
+AGENT_SYS_UNITS=(secrets-agent@.socket secrets-agent@.service)
+
+# Keys .env must define, non-empty, or the install refuses (check 7).
+REQUIRED_ENV=(SECRETS_ETC_DIR SECRETS_VAR_DIR SECRETS_LOG_DIR SECRETS_LIB_DIR SECRETS_EXAMPLE_DIR SECRETS_UNIT_DIR)
+# END-MANIFEST
+# ===========================================================================
+
+# readlink -f FIRST, then dirname (section 3.1). Resolving the dirname of an
+# unresolved $0 makes a script invoked through a symlink look for its payload in
+# the LINK's directory, which is how an installer installs the wrong tree.
+SELF="$(readlink -f -- "${BASH_SOURCE[0]}")"
+SRC="$(cd -- "$(dirname -- "$SELF")" && pwd)"
+SRC_REAL="$(readlink -f -- "$SRC")"
 VERSION="$(cat "$SRC/VERSION" 2>/dev/null || echo 0.0.0)"
+
+# The install root is the payload's parent: /opt/cockpit-secrets for
+# /opt/cockpit-secrets/payload-0.5.1. .env is a SIBLING of the payload, never a
+# child of it - the only way "seed .env in the install path" and "an upgrade
+# never touches operator config" can both hold (section 1.3).
+ROOT="$(cd -- "$SRC/.." && pwd)"
+ROOT_REAL="$(readlink -f -- "$ROOT")"
+
+# WHICH KIND OF INSTALL IS THIS? Decided by LAYOUT, never by a path prefix.
+# Used ONLY to record and to warn (section 3.1) - never to decide what gets
+# linked; dev and prod must not grow different link logic.
+#
+# deploy.sh writes <install path>/payload-<version>/ and points a sibling
+# `payload` symlink at it; swapping that symlink IS an upgrade or rollback. So
+# this is a DEPLOYED payload exactly when our own directory is what that
+# symlink resolves to. A checkout has no such symlink.
+#
+# This replaces an older `$SRC == $DEV_ROOT/*` test that named the share
+# literally and was WRONG for a checkout anywhere else: such a checkout called
+# itself `deployed`, skipping the group-writable warning, recording
+# INSTALL_KIND=deployed for a host that was not self-sustaining, and dropping
+# "the checkout is not touched" from --uninstall. Layout cannot drift when a
+# tree moves, and it leaves no dev-root literal here - which is why check 9
+# now scans this installer too, with no carve-out.
+# NB: computed from $SRC, never from $ROOT - in some of these installers ROOT
+# is derived FROM KIND, so reading it here would be a use-before-assignment
+# that silently classified every deployed payload as `dev`.
+# Two ways to be a deployed payload. The first is the normal one: the `payload`
+# alias points at us. The second covers a PREVIOUS payload being run directly -
+# a rollback done without swapping the alias first - which is still a deployed
+# tree, not a checkout, and must not be told to go and create a test .env.
+if [[ "$(readlink -f -- "$SRC/../payload" 2>/dev/null)" == "$SRC" ]] \
+   || { [[ "${SRC##*/}" == payload-* ]] && [[ -L "$SRC/../payload" ]]; }
+then KIND=deployed
+else KIND=dev
+fi
 
 # Modes are always given to `install` explicitly; this umask only covers the
 # handful of shell redirections below, so nothing can land group-readable by
 # accident.
 umask 022
-
 DESTDIR="${DESTDIR:-}"
-
-# The runtime location of the helper's Python packages. The helper resolves its
-# library root as: the directory holding secrets-admin (the repo layout, where
-# backends/ and schema/ sit beside it), else this path. Installed layout and
-# repo layout therefore both work with no code change - see README.md,
-# "Installed layout".
-LIBDIR_RUNTIME="/usr/local/lib/cockpit-secrets"
-
-PKGDIR="$DESTDIR/usr/share/cockpit/$NAME"
-SBINDIR="$DESTDIR/usr/local/sbin"
-HELPER_DST="$SBINDIR/secrets-admin"
-LIBDIR="$DESTDIR$LIBDIR_RUNTIME"
-ETCDIR="$DESTDIR/etc/cockpit-secrets"
-SAFESD="$ETCDIR/safes.d"
-SAFESDIR="$ETCDIR/safes"
-LOGDIR="$DESTDIR/var/log/cockpit-secrets"
-STATEDIR="$DESTDIR/var/lib/cockpit-secrets/state"
-EXPORTDIR="$DESTDIR/var/lib/cockpit-secrets/exports"
-EXAMPLEDIR="$DESTDIR/usr/local/share/cockpit-secrets/examples"
-USERUNITDIR="$DESTDIR/usr/local/lib/systemd/user"
-SYSUNITDIR="$DESTDIR/usr/local/lib/systemd/system"
-
-# The Cockpit package payload, flat. This ONE array is three things at once: the
-# copy list in section 1, the stale-file sweep immediately after it, and the
-# payload-present check in the pre-flight. They cannot disagree with each other
-# because they are all reading this line.
-#
-# What they CAN disagree with is index.html, and for a release they did.
-# `theme.js` was added to the page and not to this array, so section 1 copied
-# four files and then swept the fifth straight back off the installed host on
-# every single run. The pre-flight below now reads the page's own <script> and
-# <link> references and refuses an install where the page asks for a file this
-# array does not ship.
-PLUGIN=(manifest.json index.html secrets.js secrets.css theme.js)
-
 ACTION="install"
 WITH_AGENT=0
+ENV_FILE=""
 
-# --------------------------------------------------------------- reporting ---
-# Every mutation is recorded so the run can end with an exact list of what
-# changed, rather than a wall of scrolling `install` output an operator has to
-# reconstruct after the fact.
-CHANGES=()
-KEPT=()
-WARNINGS=()
+# install.conf is at a FIXED path, deliberately not under SECRETS_ETC_DIR: it is
+# what tells a reader where SECRETS_ETC_DIR is, so deriving its own location
+# from that key would be circular. It is `install.conf` and not `.env` because
+# .env is the operator's and this is the machine's, and nothing good comes of
+# one file being both.
+INSTALL_CONF="$DESTDIR/etc/$PROJECT/install.conf"
 
-changed() { CHANGES+=("$*"); printf '  + %s\n' "$*"; }
-kept()    { KEPT+=("$*");    printf '  = %s\n' "$*"; }
-warn()    { WARNINGS+=("$*"); printf '  ! %s\n' "$*" >&2; }
-note()    { printf '  %s\n' "$*"; }
-die()     { printf 'install.sh: %s\n' "$*" >&2; exit 1; }
-
-# --help is the header block, from line 2 to the `set -x` note. Addressed by
-# that note rather than by a line number: the header grew this round and a
-# hard-coded `2,51p` silently truncated it mid-sentence, which is the failure
-# mode where a usage message stops matching the program.
 usage() {
-    sed -n '2,/^# There is no .set -x. anywhere/p' "${BASH_SOURCE[0]}" \
-        | sed '$d' | sed 's/^# \?//'
+    sed -n '2,/^# There is no .set -x. anywhere/p' "$SELF" | sed '$d' | sed 's/^# \?//'
     exit "${1:-0}"
 }
 
@@ -148,144 +205,384 @@ while (($#)); do
     case "$1" in
         --uninstall)  ACTION="uninstall"; shift ;;
         --with-agent) WITH_AGENT=1; shift ;;
+        --env-file)   ENV_FILE="${2:?--env-file needs a path}"; shift 2 ;;
         -h|--help)    usage 0 ;;
         *) printf 'install.sh: unknown option: %s\n\n' "$1" >&2; usage 1 ;;
     esac
 done
 
+# --------------------------------------------------------------- reporting ---
+# Every mutation is recorded so the run ends with an exact list of what changed,
+# rather than a wall of scrolling output an operator reconstructs afterwards.
+CHANGES=(); KEPT=(); WARNINGS=()
+changed() { CHANGES+=("$*"); printf '  + %s\n' "$*"; }
+kept()    { KEPT+=("$*");    printf '  = %s\n' "$*"; }
+warn()    { WARNINGS+=("$*"); printf '  ! %s\n' "$*" >&2; }
+note()    { printf '  %s\n' "$*"; }
+die()     { printf 'install.sh: %s\n' "$*" >&2; exit 1; }
+
 # Refuse before touching anything. Half an install of a program that holds
 # passphrases is worse than none: the page would load and every verb would fail
 # on a permission the operator cannot see.
-[[ $EUID -eq 0 ]] || die "must be run as root (on this host: submit it to the /srv/jobs runner). Nothing was changed."
+if [[ -z "$DESTDIR" && $EUID -ne 0 ]]; then
+    die "must be run as root (on this host: submit it to the /srv/jobs runner). Nothing was changed."
+fi
 
-# ======================================================================
-# uninstall
-# ======================================================================
-if [[ $ACTION == uninstall ]]; then
-    echo "Uninstalling cockpit-secrets"
+# ===========================================================================
+# .env - READ, never written. Only deploy.sh seeds it (section 4.2).
+# ===========================================================================
+# The section 4.1 grammar in awk: KEY=value, KEY="value", full-line comments
+# only, no export, no interpolation. A strict subset of what sh, systemd's
+# EnvironmentFile and Python all accept, which is why one file feeds all three.
+env_get() {  # env_get <file> <key>  -> value on stdout, empty if absent
+    [[ -f "$1" ]] || return 0
+    awk -v want="$2" '
+        /^[[:space:]]*#/ { next }
+        /^[[:space:]]*$/ { next }
+        {
+            eq = index($0, "="); if (eq == 0) next;
+            k = substr($0, 1, eq - 1); v = substr($0, eq + 1);
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", k);
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", v);
+            if (k != want) next;
+            if (length(v) >= 2 && substr(v,1,1) == "\"" && substr(v,length(v),1) == "\"")
+                v = substr(v, 2, length(v) - 2);
+            val = v;
+        }
+        END { if (val != "") print val }
+    ' "$1"
+}
 
-    for target in "$PKGDIR" "$LIBDIR/backends" "$LIBDIR/schema" "$LIBDIR/agent"; do
-        if [[ -d $target ]]; then rm -rf -- "$target"; changed "removed $target"
-        else note "not present: $target"; fi
-    done
-    for target in "$HELPER_DST" "$LIBDIR/secrets-agent"; do
-        if [[ -e $target ]]; then rm -f -- "$target"; changed "removed $target"
-        else note "not present: $target"; fi
-    done
+env_lint() {  # refuse anything outside the section 4.1 grammar
+    local f=$1 n=0 line k v
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        n=$((n + 1))
+        [[ "$line" =~ ^[[:space:]]*(#.*)?$ ]] && continue
+        [[ "$line" == *=* ]] || die "$f:$n: not KEY=VALUE"
+        k="${line%%=*}"; v="${line#*=}"
+        k="${k#"${k%%[![:space:]]*}"}"; k="${k%"${k##*[![:space:]]}"}"
+        v="${v#"${v%%[![:space:]]*}"}"; v="${v%"${v##*[![:space:]]}"}"
+        [[ "$k" =~ ^[A-Z][A-Z0-9_]*$ ]] \
+            || die "$f:$n: bad key '$k' (section 4.1: ^[A-Z][A-Z0-9_]*\$)"
+        [[ "$v" == \"*\" ]] && v="${v:1:${#v}-2}"
+        case "$v" in
+            *'$'*|*'`'*) die "$f:$n: $k contains \$ or \` - interpolation is not supported (section 4.1). Write the value out in full, or let the consumer join the halves." ;;
+        esac
+    done < "$f"
+}
 
-    # Only ever remove units this package installs, by exact name prefix - a
-    # wildcard in a shared unit directory is how you delete someone else's
-    # service.
-    #
-    # BOTH directories, and the two globs differ. `secrets-agent.*` does not
-    # match `secrets-agent@.service`, so the user glob alone left the system
-    # template installed after an uninstall - software this package put there,
-    # under "an uninstall removes the software", still on disk. The header's
-    # list of what --with-agent touches now has a removal for every line in it.
-    shopt -s nullglob
-    for unit in "$USERUNITDIR"/secrets-agent.* "$SYSUNITDIR"/secrets-agent@.*; do
-        rm -f -- "$unit"; changed "removed $unit"
-    done
-    shopt -u nullglob
+# Resolution order (section 4.3), and there is no "look beside me" step:
+#   --env-file, then ENV_FILE= recorded in install.conf, then the layout default.
+# A deployed helper never gets a way to look relative to itself, because the
+# same line that is right on a deployed host reads the TEST-ONLY .env in a dev
+# checkout - which is the failure that indirection exists to prevent.
+if [[ -z "$ENV_FILE" ]]; then
+    ENV_FILE="$(env_get "$INSTALL_CONF" ENV_FILE)"
+fi
+if [[ -z "$ENV_FILE" ]]; then
+    # Section 3.2's one sanctioned difference: it changes where config is READ,
+    # never what is LINKED.
+    if [[ "$KIND" == dev ]]; then ENV_FILE="$SRC/.env"; else ENV_FILE="$ROOT/.env"; fi
+fi
 
-    # rmdir, not rm -rf: it succeeds only if we left nothing behind and cannot
-    # take a directory another package put files in.
-    [[ -d $LIBDIR ]] && rmdir -- "$LIBDIR" 2>/dev/null && changed "removed $LIBDIR"
-
-    echo
-    echo "KEPT, deliberately - an uninstall removes the software, not your data:"
-    echo "  $SAFESD/"
-    echo "      Your registry entries: the access-control policy for every safe."
-    echo "      Removing the software must not silently change who may open what."
-    echo "  $SAFESDIR/"
-    echo "      Safe files. This program never deletes a safe; the backup ring is"
-    echo "      the only undo it has, and neither is ours to throw away."
-    echo "  $LOGDIR/"
-    echo "      The audit log: who opened what, and when. It outlives the tool."
-    echo "  $STATEDIR/"
-    echo "      Lockout counters (I16). Uninstalling must not be a way to clear a"
-    echo "      lockout."
-    echo "  $EXPORTDIR/"
-    echo "      The export destination. If anybody ever ran the export verb, a"
-    echo "      file here is an ENTIRE SAFE IN PLAINTEXT (I21). Removing the"
-    echo "      software must not be the moment those quietly disappear - or"
-    echo "      quietly survive unnoticed. LOOK IN IT, then shred what is there:"
-    echo "        ls -l $EXPORTDIR/"
-    echo "        shred -u $EXPORTDIR/*        # not rm: see docs/OPERATIONS.md"
-    echo
-    echo "To remove those too, after you have read them - and after you have"
-    echo "shredded any export, because rm -rf does not:"
-    echo "  rm -rf $ETCDIR $LOGDIR $DESTDIR/var/lib/cockpit-secrets"
-    echo
-    if ((${#CHANGES[@]})); then
-        echo "Removed ${#CHANGES[@]} item(s). Cockpit was not restarted; the page"
-        echo "disappears from the menu on the next login."
-    else
-        echo "Nothing was installed here. Nothing removed."
+# ===========================================================================
+# the safe removal idiom (section 2.4) - copied verbatim, on purpose
+# ===========================================================================
+# rm -rf on a path that is a symlink to the dev checkout, with one trailing
+# slash, deletes the dev checkout. `rm -rf -- "$PKGDIR"` is correct only while
+# $PKGDIR is a real directory, which is exactly the assumption this design
+# changes. Nothing in this file recurses and nothing follows a link.
+remove_link() {
+    local p=$1
+    if [[ -L "$p" ]]; then
+        rm -f -- "$p"          # removes the LINK. The target is untouched.
+        changed "unlinked $p"
+    elif [[ -e "$p" ]]; then
+        warn "$p is not a symlink - left in place, remove it by hand if you meant to"
     fi
-    echo
-    echo "If anyone enabled the agent, they must turn it off in their OWN session -"
-    echo "root cannot reach another user's systemd instance:"
-    echo "  systemctl --user disable --now secrets-agent.socket"
+}
+
+remove_link_or_file() {   # units are real files, not links
+    local p=$1
+    if [[ -L "$p" || -f "$p" ]]; then rm -f -- "$p"; changed "removed $p"; fi
+}
+
+remove_dir_if_empty() {
+    local p=$1
+    [[ -d "$p" && ! -L "$p" ]] || return 0
+    if rmdir -- "$p" 2>/dev/null; then changed "removed empty $p"
+    else note "kept $p (not empty - something else lives there)"; fi
+}
+
+# Is this destination ours to replace? (section 2.2)
+# "Ours" = it resolves into this install root, or into this project's own dev
+# checkout - deploying over a dev install of the SAME project is a normal
+# upgrade. A link belonging to a DIFFERENT project is the collision this check
+# exists to surface at install time, rather than as an intermittent wrong-verb
+# error six months later. /usr/local/sbin is a shared namespace that eight
+# helpers from six projects already occupy.
+owned_by_us() {
+    local link=$1 cur
+    [[ -e "$link" || -L "$link" ]] || return 0
+    [[ -L "$link" ]] || { warn "$link exists and is NOT a symlink"; return 1; }
+    cur=$(readlink -f -- "$link") || return 1
+    [[ "$cur" == "$ROOT_REAL"/* ]] && return 0
+    # A dev install links into the checkout this script runs from, so $SRC is
+    # necessary and sufficient - and tighter than "anywhere under the dev
+    # root", which adopted links belonging to a DIFFERENT checkout.
+    [[ "$cur" == "$SRC"/* ]] && return 0
+    warn "$link -> $cur, which belongs to neither $ROOT_REAL nor $SRC"
+    return 1
+}
+
+link_one() {
+    local target=$1 link=$2 cur=""
+    [[ -e "$target" ]] || die "refusing to link $link -> $target: the target does not exist"
+    if [[ -L "$link" ]]; then
+        cur="$(readlink -- "$link")"
+        [[ "$cur" == "$target" ]] && { kept "unchanged $link -> $target"; return 0; }
+    fi
+    owned_by_us "$link" || die "refusing to take over $link (above). Nothing else was changed."
+    ln -sfn -- "$target" "$link"
+    if [[ -n "$cur" ]]; then changed "relinked $link -> $target (was $cur)"
+    else changed "linked $link -> $target"; fi
+}
+
+# ensure_dir <path> <mode> <why-it-matters>
+# Creates with an explicit mode, or leaves an existing directory alone and warns
+# if its mode is looser than this program can defend. It never silently
+# re-permissions a directory an operator already has: that could break a
+# deliberate local policy, and a warning naming the exact chmod is more use than
+# a surprise.
+ensure_dir() {
+    local d="$1" mode="$2" why="$3"
+    [[ -L "$d" ]] && die "$d is a symlink. $why  Remove it by hand and re-run."
+    if [[ -d $d ]]; then
+        local have owner mask
+        have="$(stat -c '%a' -- "$d")"; owner="$(stat -c '%U' -- "$d")"
+        kept "kept $d (mode 0$have, owner $owner)"
+        case "$mode" in
+            0700) mask=$((8#077)) ;;   # nothing for group or other at all
+            *)    mask=$((8#022)) ;;   # nobody but the owner may write
+        esac
+        (( 8#$have & mask )) && warn "$d is mode 0$have - $why  Fix: chmod $mode $d"
+        if [[ -z $DESTDIR && $owner != root ]]; then
+            warn "$d is owned by $owner, not root - $why  Fix: chown root:root $d"
+        fi
+    else
+        # Create any missing parents at 0755 FIRST. `install -d -m 0700` applies
+        # its mode to every component it has to create, which would leave a
+        # staging root with a 0700 /var - correct for the leaf, wrong for
+        # everything above it.
+        local parent; parent="$(dirname -- "$d")"
+        [[ -d $parent ]] || install -d -m 0755 -- "$parent"
+        install -d -m "$mode" -- "$d"
+        changed "created $d (mode $mode)"
+    fi
+}
+
+# JC-5's one tolerated asymmetry, in the two functions that hold it. New
+# projects put helpers and libs under bin/ and lib/ from the start; forcing the
+# move across six repos, four of them public with their own clone-and-run
+# instructions, would buy nothing an operator can see.
+src_helper() { [[ -e "$SRC/bin/$1" ]] && printf '%s' "$SRC/bin/$1" || printf '%s' "$SRC/$1"; }
+src_lib()    { [[ -d "$SRC/$1"     ]] && printf '%s' "$SRC/$1"     || printf '%s' "$SRC/${1#lib/}"; }
+
+# ===========================================================================
+# where everything goes - every location from .env, none of it guessed
+# ===========================================================================
+load_locations() {
+    ETCROOT="$(env_get "$ENV_FILE" SECRETS_ETC_DIR)"
+    VARROOT="$(env_get "$ENV_FILE" SECRETS_VAR_DIR)"
+    LOGROOT="$(env_get "$ENV_FILE" SECRETS_LOG_DIR)"
+    LIBROOT="$(env_get "$ENV_FILE" SECRETS_LIB_DIR)"
+    EXROOT="$(env_get "$ENV_FILE" SECRETS_EXAMPLE_DIR)"
+    UNITROOT="$(env_get "$ENV_FILE" SECRETS_UNIT_DIR)"
+    # The runtime paths (what the helper will really use) and the staged paths
+    # (what this script writes) are kept apart. A staging root is a build
+    # artefact; nobody registers a safe in one.
+    LIBDIR_RUNTIME="$LIBROOT"
+    PKGDIR="$DESTDIR/usr/share/cockpit/$NAME"
+    SBINDIR="$DESTDIR/usr/local/sbin"
+    LIBDIR="$DESTDIR$LIBROOT"
+    ETCDIR="$DESTDIR$ETCROOT"
+    SAFESD="$ETCDIR/safes.d"
+    SAFESDIR="$ETCDIR/safes"
+    LOGDIR="$DESTDIR$LOGROOT"
+    STATEDIR="$DESTDIR$VARROOT/state"
+    EXPORTDIR="$DESTDIR$VARROOT/exports"
+    EXAMPLEDIR="$DESTDIR$EXROOT"
+    USERUNITDIR="$DESTDIR$UNITROOT/user"
+    SYSUNITDIR="$DESTDIR$UNITROOT/system"
+}
+
+# ===========================================================================
+# uninstall
+# ===========================================================================
+if [[ $ACTION == uninstall ]]; then
+    echo "Uninstalling $PROJECT ($KIND install)"
+    [[ -f "$ENV_FILE" ]] || die "no $ENV_FILE and no ENV_FILE= in $INSTALL_CONF, so this script cannot know where anything was installed. Point it with --env-file, or remove the links by hand."
+    load_locations
+
+    # The sentence the operator needs in order not to panic (section 2.4).
+    # Ask the LINK TARGET's layout, not this script's: an operator may be
+    # running the deployed installer to tear down links a dev install made.
+    _t="$(readlink -f -- "$PKGDIR/index.html" 2>/dev/null || true)"
+    if [[ -L "$PKGDIR/index.html" && -n "$_t" ]] \
+       && [[ "$(readlink -f -- "${_t%/*}/../payload" 2>/dev/null)" != "${_t%/*}" ]]; then
+        echo
+        echo "  This is a DEV install: the Cockpit page is symlinks into"
+        echo "  ${_t%/*}"
+        echo "  ONLY THE SYMLINKS ARE REMOVED. The checkout is not touched."
+        echo
+    fi
+
+    # Units first: stop and disable before the file goes, or systemd keeps a
+    # removed unit around as failed. Failures are warnings, not aborts - an
+    # uninstall that stops halfway leaves a worse host than one that finishes
+    # noisily. Only units this package installs, by exact name: a wildcard in a
+    # shared unit directory is how you delete someone else's service.
+    for u in "${AGENT_SYS_UNITS[@]}"; do
+        if [[ -z "$DESTDIR" ]]; then
+            # A template needs its INSTANCES stopped too, and the socket before
+            # the service, or systemd starts the service again on the next
+            # connection.
+            systemctl stop "${u%.*}@*.socket"  >/dev/null 2>&1 || true
+            systemctl stop "${u%.*}@*.service" >/dev/null 2>&1 || true
+            systemctl disable "$u"             >/dev/null 2>&1 || true
+        fi
+        remove_link_or_file "$SYSUNITDIR/$u"
+    done
+    for u in "${AGENT_UNITS[@]}"; do remove_link_or_file "$USERUNITDIR/$u"; done
+    if [[ -z "$DESTDIR" ]]; then
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        systemctl reset-failed  >/dev/null 2>&1 || true
+    fi
+
+    for f in "${PAGE[@]}"; do remove_link "$PKGDIR/$f"; done
+    remove_dir_if_empty "$PKGDIR"
+    for h in "${HELPERS[@]}"; do remove_link "$SBINDIR/$h"; done
+
+    shopt -s nullglob
+    for l in "${LIBS[@]}"; do
+        for existing in "$LIBDIR/$(basename -- "$l")"/*; do remove_link "$existing"; done
+        remove_dir_if_empty "$LIBDIR/$(basename -- "$l")"
+    done
+    for existing in "$LIBDIR"/agent/*; do remove_link "$existing"; done
+    shopt -u nullglob
+    remove_dir_if_empty "$LIBDIR/agent"
+    remove_link "$LIBDIR/secrets-agent"
+    remove_dir_if_empty "$LIBDIR"
+
+    remove_link_or_file "$INSTALL_CONF"
+    remove_dir_if_empty "$(dirname -- "$INSTALL_CONF")"
+
+    cat <<EOF
+
+KEPT, deliberately - an uninstall removes the software, not your data:
+  $ENV_FILE
+      Your settings. A reinstall must not make you write them again, and this
+      is not the verb that throws them away.
+  $SAFESD/
+      Your registry entries: the access-control policy for every safe.
+      Removing the software must not silently change who may open what.
+  $SAFESDIR/
+      Safe files. This program never deletes a safe; the backup ring is the
+      only undo it has, and neither is ours to throw away.
+  $LOGDIR/
+      The audit log: who opened what, and when. It outlives the tool.
+  $STATEDIR/
+      Lockout counters (I16). Uninstalling must not be a way to clear a lockout.
+  $EXPORTDIR/
+      The export destination. If anybody ever ran the export verb, a file here
+      is AN ENTIRE SAFE IN PLAINTEXT (I21). Removing the software must not be
+      the moment those quietly disappear - or quietly survive unnoticed.
+      LOOK IN IT, then shred what is there:
+        ls -l $EXPORTDIR/
+        shred -u $EXPORTDIR/*        # not rm: see docs/OPERATIONS.md
+
+To remove those too, after you have read them - and after you have shredded any
+export, because rm -rf does not:
+  rm -rf $ETCDIR $LOGDIR $DESTDIR$VARROOT
+
+If anyone enabled the agent, they must turn it off in their OWN session - root
+cannot reach another user's systemd instance:
+  systemctl --user disable --now secrets-agent.socket
+
+Cockpit was NOT restarted. The page disappears from the menu on the next login.
+EOF
+    printf '\n  %d change(s), %d warning(s)\n' "${#CHANGES[@]}" "${#WARNINGS[@]}"
     exit 0
 fi
 
-# ======================================================================
-# pre-flight - everything that can refuse happens before anything is written
-# ======================================================================
-echo "Installing cockpit-secrets $VERSION"
-note "from: $SRC"
-note "to:   ${DESTDIR:-/} (Cockpit package, helper, registry, logs)"
+# ===========================================================================
+# pre-flight - every check refuses, and NOTHING is written until all pass
+# ===========================================================================
+echo "Installing $PROJECT $VERSION"
+note "kind: $KIND    (payload: $SRC)"
+note "env:  $ENV_FILE"
+note "to:   ${DESTDIR:-/}"
 echo
 echo "Pre-flight"
 
-# --- payload present -------------------------------------------------------
+# --- 1. payload present ----------------------------------------------------
 missing=()
-for f in "${PLUGIN[@]}" secrets-admin; do
-    [[ -f "$SRC/$f" ]] || missing+=("$f")
-done
-[[ -f "$SRC/backends/base.py" ]]                || missing+=("backends/base.py")
-[[ -f "$SRC/schema/safe-registry.schema.json" ]] || missing+=("schema/safe-registry.schema.json")
-((${#missing[@]} == 0)) || die "missing source file(s): ${missing[*]}. Nothing was changed."
-note "payload complete (${#PLUGIN[@]} package files, helper, backends, schema)"
+for f in "${PAGE[@]}" "$ENVDEFAULT"; do [[ -e "$SRC/$f" ]] || missing+=("$f"); done
+for h in "${HELPERS[@]}"; do [[ -f "$(src_helper "$h")" ]] || missing+=("bin/$h"); done
+for l in "${LIBS[@]}";    do [[ -d "$(src_lib "$l")"    ]] || missing+=("$l"); done
+[[ -f "$(src_lib lib/backends)/base.py" ]]                  || missing+=("lib/backends/base.py")
+[[ -f "$(src_lib lib/schema)/safe-registry.schema.json" ]]  || missing+=("lib/schema/safe-registry.schema.json")
+((${#missing[@]} == 0)) || die "the payload is incomplete - missing: ${missing[*]}. Nothing was changed."
+note "1. payload complete (${#PAGE[@]} page files, ${#HELPERS[@]} helper, ${#LIBS[@]} lib dirs)"
 
-# --- the page asks for exactly what we ship --------------------------------
-# The defect this exists to make impossible, by name. `theme.js` was added to
-# index.html and not to PLUGIN; section 1 copies PLUGIN and then sweeps $PKGDIR
-# down to PLUGIN, so the file was deleted from the installed host on every run
-# and the page shipped a reference to a resource that was not there.
+# --- 1b. every backend the helper can be asked for is shipped --------------
+# CHECK 3'S SHAPE, APPLIED TO THE LIBRARY. LIBS declares directories, so a
+# backend module that silently vanished from the payload would install cleanly:
+# the installer would link what it found, the stale-file sweep would tidy the
+# old link away, and the result is a plugin where every KDBX safe is
+# unopenable, reported to the operator as "the kdbx backend is not installed".
+# That is the same defect as a page calling a helper nothing installs, and it
+# gets the same refusal.
 #
-# The cost was NOT the "404s silently" the page's own comment claimed. Cockpit
-# does not answer a missing package file with a bare 404: it serves an HTML
-# error page, and Chromium then logs
+# secrets-admin drives itself from one literal tuple - `FORMATS = ("kdbx",
+# "psafe3")` - and `open_backend` turns that data into an import. Reading that
+# same tuple here is what keeps the two from disagreeing. It is a top-of-file
+# literal for exactly the reason check 3's helper constants are.
+formats=$(sed -n 's/^FORMATS *= *(\(.*\)).*/\1/p' "$(src_helper secrets-admin)" \
+          | head -1 | tr -d '"'"'"' ' | tr ',' '\n' | grep -c . || true)
+if ((formats == 0)); then
+    warn "could not read FORMATS out of secrets-admin; backend completeness NOT checked"
+else
+    missing_be=()
+    for fmt in $(sed -n 's/^FORMATS *= *(\(.*\)).*/\1/p' "$(src_helper secrets-admin)" \
+                 | head -1 | tr -d '"'"'"' ' | tr ',' '\n' | grep .); do
+        [[ -f "$(src_lib lib/backends)/$fmt.py" ]] || missing_be+=("$fmt")
+    done
+    ((${#missing_be[@]} == 0)) \
+        || die "secrets-admin declares FORMATS=(${missing_be[*]} ...) but the payload ships no backends/<fmt>.py for: ${missing_be[*]}.
+    Every safe of that format would be unopenable, reported only as 'the backend
+    is not installed'. Ship the module, or remove the format from FORMATS."
+    note "1b. every format in secrets-admin's FORMATS has a backend module ($formats)"
+fi
+
+# --- 2. the page asks for exactly what is shipped --------------------------
+# The defect this exists to make impossible, by name: `theme.js` was added to
+# index.html and not to PAGE, so the sweep deleted it from the installed host on
+# every run. The cost was not the "404s silently" the page's comment claimed -
+# Cockpit answers a missing package file with an HTML error page, and Chromium
+# then logs a MIME-type refusal on EVERY page load, which is a permanent console
+# error on the one page in this host that handles every passphrase we own.
 #
-#   Refused to execute script from '.../theme.js' because its MIME type
-#   ('text/html') is not executable, and strict MIME type checking is enabled.
-#
-# on EVERY page load, which is a permanent console error on the one page in
-# this host that handles every passphrase we own, and a live browser assertion
-# that a clean console is what a clean CSP looks like.
-#
-# This REFUSES rather than warning. Nothing has been written at this point, the
-# fix is one word in one array, and a warning is exactly what the last round
-# produced - a true statement nobody acted on for a release.
-#
-# Only package-local references are considered. `../base1/cockpit.js` is
-# Cockpit's own file, served from Cockpit's own directory, and is deliberately
-# not ours to install.
-python3 - "$SRC/index.html" "${PLUGIN[@]}" <<'PY' \
+# Parsed, not grepped: a regex over HTML is how you miss the one attribute that
+# is spelled differently.
+python3 - "$SRC/index.html" "${PAGE[@]}" <<'PY' \
     || die "index.html references a file this installer does not ship (above). Nothing was changed."
 import html.parser, sys
-
 path, ship = sys.argv[1], set(sys.argv[2:])
 refs = []
 
 
 class Refs(html.parser.HTMLParser):
-    """Every attribute that makes the browser fetch a second file from this
-    package directory. Parsed, not grepped: a regex over HTML is how you miss
-    the one attribute that is spelled differently."""
-
     def handle_starttag(self, tag, attrs):
         a = dict(attrs)
         if tag in ("script", "img", "iframe", "audio", "video", "source",
@@ -307,45 +604,68 @@ for tag, raw in refs:
     u = raw.split("#")[0].split("?")[0].strip()
     if not u:
         continue
-    # A scheme, an authority, an absolute path or a parent segment all name
-    # something outside this package directory, which this installer neither
-    # ships nor sweeps.
     low = u.lower()
+    # A scheme, an authority, an absolute path or a parent segment all name
+    # something outside this package directory. ../base1/cockpit.js is
+    # Cockpit's own file and is deliberately not ours to install.
     if "://" in low or low.startswith(("//", "/", "data:", "mailto:", "../")):
         continue
     if "/" in u:
-        # The payload is FLAT - PLUGIN holds bare names and section 1 copies
-        # them into one directory - so a subdirectory reference cannot be
-        # shipped by this installer at all, however the array is edited.
-        bad.append("%s (<%s>: the Cockpit payload is flat, so no PLUGIN entry "
-                   "can ever satisfy this)" % (u, tag))
+        bad.append("%s (<%s>: the package's page level is flat, so no PAGE "
+                   "entry can satisfy this)" % (u, tag))
         continue
     local.append(u)
     if u not in ship:
         bad.append("%s (<%s>)" % (u, tag))
-
 if bad:
-    sys.exit("index.html references %s, which install.sh's PLUGIN array does not\n"
-             "  install - so section 1's stale-file sweep DELETES it from the installed\n"
-             "  package on every run and Cockpit answers the browser's request with an\n"
-             "  HTML error page. Add it to PLUGIN in install.sh, or make the page\n"
-             "  stop asking for it."
-             % ", ".join(sorted(set(bad))))
-print("  index.html: %d package-local reference(s), every one of them installed "
-      "(%s)" % (len(local), ", ".join(local)))
+    sys.exit("index.html references %s, which PAGE does not install - so the\n"
+             "  stale-file sweep DELETES it from the installed package on every run\n"
+             "  and Cockpit answers the browser with an HTML error page. Add it to\n"
+             "  PAGE, or make the page stop asking for it." % ", ".join(sorted(set(bad))))
+print("  2. index.html: %d package-local reference(s), every one installed (%s)"
+      % (len(local), ", ".join(local)))
 PY
 
-# --- the manifest ----------------------------------------------------------
-# An invalid manifest makes Cockpit drop the package SILENTLY: no page, no menu
-# entry, no error anywhere the operator will look. Refusing here is worth the
-# three seconds. The same check enforces I9: this package must run under
-# Cockpit's default `default-src 'self'` and must not ship a relaxed policy -
-# adding wasm-unsafe-eval to the one page that handles every password we own is
-# exactly the trade docs/UPSTREAM-REVIEW.md rejected.
-python3 - "$SRC/manifest.json" <<'PY' || die "manifest.json rejected (see above). Nothing was changed."
-import json, sys
+# --- 2b. and what the JavaScript fetches at RUNTIME ------------------------
+runtime=$(grep -ohE '(fetch|fetchJSON)\([[:space:]]*"[^"/]+\.[A-Za-z0-9]+"' \
+              "${PAGE[@]/#/$SRC/}" 2>/dev/null | sed -E 's/.*"([^"]+)".*/\1/' | sort -u || true)
+for r in $runtime; do
+    printf '%s\n' "${PAGE[@]}" | grep -qxF "$r" \
+        || die "a shipped page file fetches \"$r\" at runtime, which PAGE does not install. Add it to PAGE, or stop fetching it."
+done
+note "2b. runtime fetch()es resolve to shipped page files ($(printf '%s' "$runtime" | grep -c . || true) found)"
 
-path = sys.argv[1]
+# --- 3. every helper the page names is shipped and will be linked ----------
+# THE wg-admin CATCH. wg-admin and hs-admin are installed on this host,
+# byte-identical to source, and their own installers mention them ZERO times,
+# while wgclient.js names /usr/local/sbin/wg-admin thirty times. A fresh clone
+# of that public repo installs a UI whose backend is absent. This check is what
+# makes that impossible here.
+#
+# Comments count. A false positive costs one word in an array; a false negative
+# costs a UI with no backend. Bias to declaring.
+#
+# The corollary is a ban, because a grep can only see literals: a shipped page
+# file must name each helper it calls in exactly ONE top-of-file constant, as a
+# literal absolute path. secrets.js already does this.
+named=$(grep -ohE '/usr/local/sbin/[A-Za-z0-9_.-]+' "${PAGE[@]/#/$SRC/}" 2>/dev/null \
+        | sed 's#.*/##' | sort -u || true)
+for h in $named; do
+    printf '%s\n' "${HELPERS[@]}" | grep -qxF "$h" \
+        || die "a shipped page file names /usr/local/sbin/$h, which HELPERS does not install. Add it to HELPERS, or stop the page calling it."
+done
+note "3. the page names $(printf '%s' "$named" | grep -c . || true) helper(s) under /usr/local/sbin; every one is declared"
+
+# --- 4. the manifest -------------------------------------------------------
+# An invalid manifest makes Cockpit drop the package SILENTLY: no page, no menu
+# entry, no error anywhere the operator will look. The same check enforces I9:
+# this package must run under Cockpit's default `default-src 'self'` and must
+# not ship a relaxed policy. And section 8.4's rule: a Cockpit condition may
+# test only paths THIS project's own install.sh creates, because an unmet
+# condition makes the plugin silently absent.
+python3 - "$SRC/manifest.json" "${HELPERS[@]}" <<'PY' || die "manifest.json rejected (see above). Nothing was changed."
+import json, sys
+path, helpers = sys.argv[1], sys.argv[2:]
 try:
     m = json.load(open(path))
 except Exception as e:
@@ -353,84 +673,174 @@ except Exception as e:
 if not isinstance(m, dict):
     sys.exit("manifest.json is not a JSON object")
 
+
 def scan(node, where="manifest.json"):
     """Any content-security-policy key, at any depth, is a refusal (I9)."""
     if isinstance(node, dict):
         for k, v in node.items():
             if str(k).lower().replace("_", "-") == "content-security-policy":
-                sys.exit("%s declares a Content-Security-Policy at %s.%s - "
-                         "refused: this package must run under Cockpit's default "
-                         "policy (I9)" % (path, where, k))
+                sys.exit("%s declares a Content-Security-Policy at %s.%s - refused: "
+                         "this package must run under Cockpit's default policy (I9)"
+                         % (path, where, k))
             scan(v, "%s.%s" % (where, k))
     elif isinstance(node, list):
         for i, v in enumerate(node):
             scan(v, "%s[%d]" % (where, i))
 
+
 scan(m)
-print("  manifest.json: valid JSON, no CSP relaxation (I9)")
+allowed = {"/usr/local/sbin/%s" % h for h in helpers}
+for cond in m.get("conditions", []):
+    p = cond.get("path-exists") if isinstance(cond, dict) else None
+    if p and p not in allowed:
+        sys.exit("manifest.json has a condition on %s, which this project's own\n"
+                 "  install.sh does not create. An unmet Cockpit condition makes the\n"
+                 "  package SILENTLY ABSENT - no page, no menu entry, no error anywhere\n"
+                 "  the operator will look. Test only what install.sh creates (%s), and\n"
+                 "  report a missing sibling at runtime, in the page, naming the file\n"
+                 "  and the .env key. See DEPLOY-CONTRACT section 8.4." % (p, ", ".join(sorted(allowed))))
+print("  4. manifest.json: valid, no CSP relaxation (I9), conditions test only what install.sh creates")
 if "superuser" not in json.dumps(m):
-    print("  manifest.json: note - no 'superuser' declaration found; admin-class "
-          "safes need Cockpit's Administrative access")
+    print("     note - no 'superuser' declaration; admin-class safes need Cockpit's "
+          "Administrative access")
 PY
 
-# --- python payload compiles ----------------------------------------------
+# --- 5. python payload compiles -------------------------------------------
 # compile() rather than py_compile: it proves the file parses without writing a
 # __pycache__ into the source tree (or into DESTDIR, where it would then be
-# installed).
-pyfiles=("$SRC/secrets-admin")
+# installed, and where the library-root assertion would have to sweep it).
+pyfiles=("$(src_helper secrets-admin)")
 shopt -s nullglob
-pyfiles+=("$SRC"/backends/*.py "$SRC"/agent/*.py)
+pyfiles+=("$(src_lib lib/backends)"/*.py "$SRC"/agent/*.py)
 shopt -u nullglob
 for f in "${pyfiles[@]}"; do
-    python3 -c 'import sys; src=open(sys.argv[1],"rb").read(); compile(src, sys.argv[1], "exec")' "$f" \
+    python3 -c 'import sys; compile(open(sys.argv[1],"rb").read(), sys.argv[1], "exec")' "$f" \
         || die "does not compile: $f. Nothing was changed."
 done
-note "python payload compiles (${#pyfiles[@]} file(s))"
+note "5. python payload compiles (${#pyfiles[@]} file(s))"
 
-# --- the JavaScript gate ---------------------------------------------------
+# --- 5b. the JavaScript gate ----------------------------------------------
 # There is no build step; check.sh is the only thing between a stray paren and a
-# blank panel in the browser.
+# blank panel in the browser. The payload deliberately does NOT ship check.sh -
+# a production host has no business holding the dev gate - so its absence is a
+# note in a deployed install and a warning in a checkout, which is the only
+# place it should ever be missing.
 if [[ -x "$SRC/check.sh" ]]; then
     if command -v gjs >/dev/null 2>&1; then
-        # Not redirected: when it fails, the parser's message and the line it
-        # names are the whole point.
         "$SRC/check.sh" || die "check.sh found a JavaScript syntax error (above). Nothing was changed."
     else
         warn "gjs is not installed: the JavaScript syntax gate did not run"
     fi
+elif [[ "$KIND" == dev ]]; then
+    warn "check.sh missing or not executable in a CHECKOUT: JavaScript was not syntax-checked"
 else
-    warn "check.sh missing or not executable: JavaScript was not syntax-checked"
+    note "5b. check.sh is not in the payload by design; deploy.sh ran it before copying"
 fi
 
-# --- the registry schema and the seeded examples ---------------------------
-# The examples ship as documentation, so they must actually be valid against the
-# schema they document. A broken example teaches an operator a broken shape.
-# The `user-safes.d/` glob is SEPARATE and is not a tidy-up: `*.json` does not
-# descend, so the per-user example was the one shipped registry entry that no
-# gate validated. It is validated here and installed as DOCUMENTATION below —
-# never seeded into the system registry, because a per-user entry there is an
-# entry naming a path in somebody's home directory read by a root helper.
+# --- 6. .envdefault parses, and declares every required key ----------------
+env_lint "$SRC/$ENVDEFAULT"
+for k in "${REQUIRED_ENV[@]}"; do
+    grep -qE "^[[:space:]]*$k=" "$SRC/$ENVDEFAULT" \
+        || die "$ENVDEFAULT does not declare REQUIRED_ENV key $k."
+done
+note "6. $ENVDEFAULT parses and declares all ${#REQUIRED_ENV[@]} required key(s)"
+
+# --- 7. .env exists and defines every required key, non-empty --------------
+if [[ ! -f "$ENV_FILE" ]]; then
+    if [[ "$KIND" == dev ]]; then
+        die "no $ENV_FILE. A dev install reads the checkout's TEST-ONLY .env:
+    cp $SRC/$ENVDEFAULT $SRC/.env   # then edit it
+  Nothing was changed."
+    fi
+    die "no $ENV_FILE. Run deploy.sh, which seeds it from $ENVDEFAULT (missing-only). Nothing was changed."
+fi
+env_lint "$ENV_FILE"
+for k in "${REQUIRED_ENV[@]}"; do
+    [[ -n "$(env_get "$ENV_FILE" "$k")" ]] \
+        || die "$ENV_FILE does not set $k (or sets it empty). See $SRC/$ENVDEFAULT for what it means. Nothing was changed."
+done
+load_locations
+for v in "$ETCROOT" "$VARROOT" "$LOGROOT" "$LIBROOT" "$EXROOT" "$UNITROOT"; do
+    [[ "$v" == /* ]] || die "$ENV_FILE holds a relative path: '$v'. Every location must be absolute."
+done
+note "7. $ENV_FILE defines all ${#REQUIRED_ENV[@]} required key(s), all absolute"
+
+# --- 7b. .env agrees with what secrets-admin has compiled in --------------
+# Two places that can hold a location is one place too many. If .env says the
+# registry is somewhere the helper will never look, the page installs cleanly,
+# every verb runs, and every safe is missing - with no error naming the cause.
+# Refuse instead, and name both values.
+HELPER_SRC="$(src_helper secrets-admin)"
+check_const() {  # check_const <python-const> <env-key> <env-value>
+    local const=$1 key=$2 want=$3 have
+    have="$(sed -n "s/^$const *= *\"\\([^\"]*\\)\".*/\\1/p" "$HELPER_SRC" | head -1)"
+    [[ -n "$have" ]] || { warn "could not read $const out of secrets-admin to cross-check $key"; return 0; }
+    [[ "$have" == "$want" ]] || die "$key=$want in $ENV_FILE, but secrets-admin has $const=\"$have\" compiled in.
+    The installer would create one and the helper would read the other, and
+    every safe would be missing with nothing naming the cause. Make them agree."
+}
+check_const DEFAULT_ETC     SECRETS_ETC_DIR "$ETCROOT"
+check_const DEFAULT_VAR     SECRETS_VAR_DIR "$VARROOT"
+check_const DEFAULT_LOG_DIR SECRETS_LOG_DIR "$LOGROOT"
+grep -qF "\"$LIBROOT\"" "$HELPER_SRC" \
+    || die "SECRETS_LIB_DIR=$LIBROOT is not a library candidate in secrets-admin, so the helper would never import backends/ from where this script is about to link it. Make them agree."
+note "7b. every location in .env matches the constant compiled into secrets-admin"
+
+# --- 8. nothing declared collides with another project --------------------
+for f in "${PAGE[@]}"; do
+    owned_by_us "$PKGDIR/$f" || die "$PKGDIR/$f belongs to something else (above). Nothing was changed."
+done
+for h in "${HELPERS[@]}"; do
+    owned_by_us "$SBINDIR/$h" || die "$SBINDIR/$h belongs to something else (above). Nothing was changed."
+done
+note "8. every destination is free, or is already ours"
+
+# --- 9. no dev-tree and no retired path in anything being shipped ---------
+# $SELF is scanned too, with NO carve-out. install.sh used to be excluded
+# because section 3.1's classifier required a DEV_ROOT= literal; that
+# classifier is layout-based now, so the only occurrence left in this file is
+# the split pattern on the grep line below, which cannot match itself.
+# Splitting a scanner's own pattern weakens nothing - the concatenation it
+# searches for is unchanged and every other file is matched in full - it only
+# stops the audit reporting itself, which is what let the carve-out exist.
+# README.md and LICENSE are shipped too, so they are scanned too. A README
+# that documents "how do I tell a dev install from a deployed one" is exactly
+# the file most likely to name the dev root, and it lands on production hosts
+# like any other artifact.
+scan=("${PAGE[@]/#/$SRC/}" "$HELPER_SRC" "$SRC/$ENVDEFAULT" "$SELF")
+for d in README.md LICENSE; do [[ -f "$SRC/$d" ]] && scan+=("$SRC/$d"); done
+for l in "${LIBS[@]}"; do scan+=("$(src_lib "$l")"); done
+[[ -d "$SRC/agent" ]] && scan+=("$SRC/agent")
+if hits=$(grep -RIn -e "/opt/sc""/git" -e "/srv/smb/share/sc/ai-orchestrator""-group" -- "${scan[@]}" 2>/dev/null); then
+    printf '%s\n' "$hits" | sed 's/^/        /' >&2
+    die "a shipped file hardcodes a dev or retired path (above). It belongs in .env. Nothing was changed."
+fi
+note "9. no shipped artifact names a dev-tree or retired path"
+
+# --- 10. the registry schema and the seeded examples ----------------------
+# The examples ship as documentation, so they must be valid against the schema
+# they document: a broken example teaches an operator a broken shape. The
+# user-safes.d glob is SEPARATE and is not a tidy-up - `*.json` does not
+# descend, so the per-user example was the one shipped registry entry no gate
+# validated.
 shopt -s nullglob
 EXAMPLES=("$SRC"/etcdefaults/*.json "$SRC"/etcdefaults/user-safes.d/*.json)
 shopt -u nullglob
-python3 - "$SRC/schema/safe-registry.schema.json" "${EXAMPLES[@]}" <<'PY' \
+python3 - "$(src_lib lib/schema)/safe-registry.schema.json" "${EXAMPLES[@]}" <<'PY' \
     || die "an etcdefaults example is not valid against the registry schema. Nothing was changed."
 import json, sys
-
 schema_path, examples = sys.argv[1], sys.argv[2:]
 try:
     schema = json.load(open(schema_path))
 except Exception as e:
     sys.exit("schema is not valid JSON: %s" % type(e).__name__)
-
 try:
     from jsonschema import Draft7Validator
     validator = Draft7Validator(schema)
 except Exception:
     validator = None
-    print("  registry schema: valid JSON (python3-jsonschema absent, examples "
+    print("  10. registry schema: valid JSON (python3-jsonschema absent, examples "
           "checked for JSON validity only)")
-
 for path in examples:
     try:
         doc = json.load(open(path))
@@ -441,403 +851,337 @@ for path in examples:
         if errs:
             sys.exit("%s is invalid: %s" % (path, errs[0].message))
 if validator is not None:
-    print("  registry schema + %d example(s): valid (jsonschema)" % len(examples))
+    print("  10. registry schema + %d example(s): valid (jsonschema)" % len(examples))
 PY
 
-# --- the deployment contract the helper has to meet ------------------------
-# Advisory, not fatal: the helper is another file's responsibility and the smoke
-# test at the end is the real verdict. But saying it here turns "every verb
-# returns internal" into one obvious line at install time.
-if ! grep -qF "$LIBDIR_RUNTIME" "$SRC/secrets-admin"; then
-    warn "secrets-admin does not mention $LIBDIR_RUNTIME; if it cannot import backends/ from there, the smoke test below will say so"
-fi
-
-# --- the agent, only if it was asked for -----------------------------------
-AGENT_UNITS=()
-AGENT_SYS_UNITS=()
-AGENT_PY=()
-AGENT_BIN=""
+# --- 11. the agent, only if it was asked for ------------------------------
+AGENT_PY=(); AGENT_BIN=""
 if ((WITH_AGENT)); then
     [[ -d "$SRC/agent" ]] || die "--with-agent was given but $SRC/agent does not exist (the optional agent may have been dropped - see docs/KNOWN_ISSUES.md I18). Nothing was changed."
+    for u in "${AGENT_UNITS[@]}"; do
+        [[ -f "$SRC/agent/systemd/$u.in" || -f "$SRC/agent/systemd/$u" ]] \
+            || die "--with-agent: missing user unit agent/systemd/$u(.in). Nothing was changed."
+    done
+    for u in "${AGENT_SYS_UNITS[@]}"; do
+        [[ -f "$SRC/agent/systemd/system/$u.in" || -f "$SRC/agent/systemd/system/$u" ]] \
+            || die "--with-agent: missing system unit agent/systemd/system/$u(.in). Nothing was changed."
+    done
     shopt -s nullglob
-    # TWO GLOBS, TWO DESTINATIONS, and the separation is deliberate. The USER
-    # units live directly under agent/systemd/; the SYSTEM template lives one
-    # level down in agent/systemd/system/. A single recursive glob would drop
-    # `secrets-agent@.service` into the user unit directory, where systemd
-    # would read `User=%i` and `SocketUser=%i` in a per-user manager that
-    # cannot honour either — silently wrong, and wrong about identity, which
-    # is the one thing this agent exists to get right.
-    AGENT_UNITS=("$SRC"/agent/systemd/*.socket "$SRC"/agent/systemd/*.service \
-                 "$SRC"/agent/*.socket "$SRC"/agent/*.service)
-    AGENT_SYS_UNITS=("$SRC"/agent/systemd/system/*.socket \
-                     "$SRC"/agent/systemd/system/*.service)
     AGENT_PY=("$SRC"/agent/*.py)
     shopt -u nullglob
     [[ -f "$SRC/agent/secrets-agent" ]] && AGENT_BIN="$SRC/agent/secrets-agent"
-    ((${#AGENT_UNITS[@]})) || die "--with-agent was given but no .socket/.service unit was found under $SRC/agent. Nothing was changed."
-    note "agent payload: ${#AGENT_UNITS[@]} user unit(s), ${#AGENT_SYS_UNITS[@]} system template(s), ${#AGENT_PY[@]} module(s)${AGENT_BIN:+, 1 executable}"
+    note "11. agent payload: ${#AGENT_UNITS[@]} user unit(s), ${#AGENT_SYS_UNITS[@]} system template(s), ${#AGENT_PY[@]} module(s)${AGENT_BIN:+, 1 executable}"
+fi
+
+# In a dev install the payload is the group-writable share, and from here on the
+# ROOT-RUN HELPER imports its code from there. That is what a dev install is,
+# and secrets-admin says so itself at runtime (_trusted_dir reports an untrusted
+# library root on stderr) - but it must be said at install time too, to the
+# person choosing to do it.
+if [[ "$KIND" == dev ]]; then
+    warn "DEV INSTALL: every link points into $SRC, which may be group-writable and vanishes if that tree is unmounted. The root-run helper will import backends/ from there. This is what a dev install IS; deploy.sh produces the self-sustaining kind."
 fi
 
 echo
 echo "Installing"
 
-# ======================================================================
-# helpers that make "what changed" honest
-# ======================================================================
-
-# put <mode> <src> <dst> - copy only when the bytes differ, and say which of
-# installed / updated / re-permissioned / unchanged happened. cmp is what makes
-# the closing summary a real diff rather than a list of everything that was
-# touched.
-put() {
-    local mode="$1" src="$2" dst="$3" verb="installed"
-    if [[ -e $dst ]] && cmp -s -- "$src" "$dst"; then
-        # Same bytes - but still re-assert mode and owner, because a helper that
-        # drifted to group-writable is a real finding and is cheap to fix. Report
-        # it only if it actually moved.
-        local before after
-        before="$(stat -c '%a %U:%G' -- "$dst")"
-        install -o root -g root -m "$mode" -- "$src" "$dst"
-        after="$(stat -c '%a %U:%G' -- "$dst")"
-        if [[ $before == "$after" ]]; then kept "unchanged $dst"
-        else changed "re-permissioned $dst ($before -> $after)"; fi
-        return
-    fi
-    [[ -e $dst ]] && verb="updated"
-    install -o root -g root -m "$mode" -- "$src" "$dst"
-    changed "$verb $dst (mode $mode)"
-}
-
-# ensure_dir <path> <mode> <why-it-matters>
-# Creates with an explicit mode, or leaves an existing directory alone and warns
-# if its mode is looser than this program can defend. It never silently
-# re-permissions a directory an operator already has: that could break a
-# deliberate local policy, and a warning naming the exact chmod is more use than
-# a surprise.
-ensure_dir() {
-    local d="$1" mode="$2" why="$3"
-    if [[ -d $d ]]; then
-        local have owner mask
-        have="$(stat -c '%a' -- "$d")"
-        owner="$(stat -c '%U' -- "$d")"
-        kept "kept $d (mode 0$have, owner $owner)"
-        case "$mode" in
-            0700) mask=$((8#077)) ;;   # nothing for group or other at all
-            *)    mask=$((8#022)) ;;   # nobody but the owner may write
-        esac
-        if (( 8#$have & mask )); then
-            warn "$d is mode 0$have - $why  Fix: chmod $mode $d"
-        fi
-        if [[ -z $DESTDIR && $owner != root ]]; then
-            warn "$d is owned by $owner, not root - $why  Fix: chown root:root $d"
-        fi
-    else
-        # Create any missing parents at 0755 FIRST. `install -d -m 0700` applies
-        # its mode to every component it has to create, which would leave a
-        # staging root with a 0700 /var - correct for the leaf, wrong for
-        # everything above it.
-        local parent; parent="$(dirname -- "$d")"
-        [[ -d $parent ]] || install -d -o root -g root -m 0755 -- "$parent"
-        install -d -o root -g root -m "$mode" -- "$d"
-        changed "created $d (mode $mode)"
-    fi
-}
-
-# ======================================================================
-# 1. the Cockpit package
-# ======================================================================
+# ===========================================================================
+# 1. the Cockpit page - a REAL directory of per-file symlinks (section 2.1)
+# ===========================================================================
+# NOT one directory symlink at $SRC. This is the same script in a dev install,
+# and there $SRC is the checkout: a directory symlink would point Cockpit's WEB
+# ROOT at .git/, .claude/, tests/, docs/ and function-map/ and serve them over
+# HTTPS to any authenticated Cockpit session. Handing a web root a symlink to a
+# directory whose contents you do not enumerate is how repositories end up on
+# the internet.
 ensure_dir "$PKGDIR" 0755 "Cockpit serves this directory to every logged-in session."
-for f in "${PLUGIN[@]}"; do
-    put 0644 "$SRC/$f" "$PKGDIR/$f"
-done
+for f in "${PAGE[@]}"; do link_one "$SRC/$f" "$PKGDIR/$f"; done
 
 # Drop anything a previous version left behind: an old file that is no longer in
-# the source tree must not keep being served.
-#
-# This sweep is the WHOLE invariant for $PKGDIR, unlike the one in section 2.
-# Nothing in this script writes into $PKGDIR after this loop - there is no
-# import, no smoke test and no verification step that touches it - so there is
-# nothing for section 5b to re-check here, which is why 5b is scoped to the
-# library root and says so. What could put this directory out of step with the
-# header is not a late writer but an edit to PLUGIN, and the pre-flight gate
-# above is what catches that.
+# the payload must not keep being served. Everything here is a symlink, so
+# remove_link cannot recurse into the payload even if one points there.
 shopt -s nullglob
 for existing in "$PKGDIR"/*; do
-    base="$(basename -- "$existing")"
-    keep=0
-    for f in "${PLUGIN[@]}"; do [[ $base == "$f" ]] && keep=1; done
-    if ((!keep)); then rm -rf -- "$existing"; changed "removed stale $existing"; fi
+    base="$(basename -- "$existing")"; keep=0
+    for f in "${PAGE[@]}"; do [[ "$base" == "$f" ]] && keep=1; done
+    ((keep)) || remove_link "$existing"
 done
 shopt -u nullglob
 
-# ======================================================================
+# ===========================================================================
 # 2. the helper, its backends and the registry schema
-# ======================================================================
+# ===========================================================================
 ensure_dir "$SBINDIR" 0755 "it holds a root-run helper."
-put 0755 "$SRC/secrets-admin" "$HELPER_DST"
+for h in "${HELPERS[@]}"; do link_one "$(src_helper "$h")" "$SBINDIR/$h"; done
 
 ensure_dir "$LIBDIR" 0755 "the helper imports code from here as root."
-ensure_dir "$LIBDIR/backends" 0755 "the helper imports code from here as root."
-shopt -s nullglob
-for f in "$SRC"/backends/*.py; do
-    put 0644 "$f" "$LIBDIR/backends/$(basename -- "$f")"
-done
-# Sweep anything that is not one of the .py files we just installed. That covers
-# a module deleted upstream and a __pycache__ from a previous run - which is also
-# why the loop above globs *.py explicitly instead of copying the directory:
-# root-owned bytecode next to root-run source is a second thing to keep honest
-# and buys nothing.
-#
-# THIS SWEEP IS NOT THE WHOLE STORY, and believing it was is what made the
-# invariant false for a whole release. Anything that imports the package after
-# this line puts the bytecode straight back, and section 5 below - this script's
-# own verification - did exactly that. The three parts that make the claim true
-# are: this sweep; `sys.dont_write_bytecode` in secrets-admin, so no root run of
-# the helper ever writes any; and the assertion in section 5b, which re-checks
-# the directory after everything else has run.
-for existing in "$LIBDIR"/backends/*; do
-    base="$(basename -- "$existing")"
-    if [[ $base != *.py || ! -f "$SRC/backends/$base" ]]; then
-        rm -rf -- "$existing"; changed "removed stale $existing"
-    fi
+for l in "${LIBS[@]}"; do
+    leaf="$(basename -- "$l")"
+    ensure_dir "$LIBDIR/$leaf" 0755 "the helper imports from here as root."
+    shopt -s nullglob
+    case "$leaf" in
+        backends) for f in "$(src_lib "$l")"/*.py;   do link_one "$f" "$LIBDIR/$leaf/$(basename -- "$f")"; done ;;
+        schema)   for f in "$(src_lib "$l")"/*.json; do link_one "$f" "$LIBDIR/$leaf/$(basename -- "$f")"; done ;;
+        *)        for f in "$(src_lib "$l")"/*;      do link_one "$f" "$LIBDIR/$leaf/$(basename -- "$f")"; done ;;
+    esac
+    shopt -u nullglob
 done
 
-ensure_dir "$LIBDIR/schema" 0755 "the helper validates every registry entry against it."
-for f in "$SRC"/schema/*.json; do
-    put 0644 "$f" "$LIBDIR/schema/$(basename -- "$f")"
-done
-shopt -u nullglob
+# ===========================================================================
+# 3. configuration, logs and state - OUTSIDE the payload, all of it
+# ===========================================================================
+# Nothing an upgrade replaces may hold state, and an upgrade replaces the
+# payload wholesale. /etc, /var/lib and /var/log are used in preference to
+# anything under the install path because backup policy, logrotate, SELinux
+# labelling and restorecon already know those three trees.
+ensure_dir "$ETCDIR"   0755 "it holds the registry that decides who may open which safe."
+ensure_dir "$SAFESD"   0755 "the helper REFUSES a group- or other-writable registry directory (I1)."
+ensure_dir "$SAFESDIR" 0700 "it holds admin-class safe files."
+ensure_dir "$LOGDIR"   0700 "it holds the audit log."
+ensure_dir "$DESTDIR$VARROOT" 0700 "it holds unlock-failure state."
+ensure_dir "$STATEDIR" 0700 "it holds the per-(uid, safe) lockout counters (I16)."
+# The helper creates this 0700 on first use anyway, so it is not load-bearing -
+# but an operator who can SEE it the moment the package is installed can reason
+# about it before an export lands in it, and a directory that appears the first
+# time somebody dumps a safe in the clear is a directory nobody has looked at.
+ensure_dir "$EXPORTDIR" 0700 "an export is AN ENTIRE SAFE IN PLAINTEXT (I21)."
 
-# ======================================================================
-# 3. configuration, logs and state
-# ======================================================================
-# /etc/cockpit-secrets/safes.d is the whole access-control policy: the helper
-# refuses to trust it at all if it, or an entry in it, is group- or
-# other-writable (I1).
-ensure_dir "$ETCDIR"    0755 "it holds the registry that decides who may open which safe."
-ensure_dir "$SAFESD"    0755 "the helper REFUSES a group- or other-writable registry directory (I1)."
-# 0700: an admin-class safe is 0600 root:root and the directory holding it has no
-# business being listable by anyone else.
-ensure_dir "$SAFESDIR"  0700 "it holds admin-class safe files."
-# The audit log names safes, verbs and uids. It never contains a value (I15), but
-# it is still a map of who holds what.
-ensure_dir "$LOGDIR"    0700 "it holds the audit log."
-ensure_dir "$DESTDIR/var/lib/cockpit-secrets" 0700 "it holds unlock-failure state."
-ensure_dir "$STATEDIR"  0700 "it holds the per-(uid, safe) lockout counters (I16)."
-# The default export destination (I21). The helper creates it 0700 on first use
-# anyway, so this is not load-bearing — but an operator who can SEE the
-# directory the moment the package is installed can reason about it before an
-# export lands in it, and a directory that appears the first time somebody dumps
-# a safe in the clear is a directory nobody has ever looked at. Empty and 0700
-# until `export_allowed` is turned on for some safe, which is off by default.
-ensure_dir "$EXPORTDIR"  0700 "an export is an ENTIRE SAFE IN PLAINTEXT (I21)."
-
-# Seed the examples, and ONLY where nothing is there already.
-#
-# They are seeded with a .example suffix, which the registry's *.json glob does
-# not match, for two reasons that are worth the ugly file name:
-#   - a live example entry would appear in the safe list as a permanently broken
-#     row, which trains operators to ignore broken rows in a security UI;
-#   - worse, it would become a REAL safe with real access rules the moment
-#     anyone created a file at the example path. An access-control policy must
-#     never appear by accident.
-# The operator copies one to <nn>-<id>.json and edits it (see docs/OPERATIONS.md).
+# Seed the examples, and ONLY where nothing is there already. They are seeded
+# with a .example suffix, which the registry's *.json glob does not match, for
+# two reasons worth the ugly file name: a live example entry would appear in the
+# safe list as a permanently broken row, which trains operators to ignore broken
+# rows in a security UI; and worse, it would become a REAL safe with real access
+# rules the moment anyone created a file at the example path. An access-control
+# policy must never appear by accident.
 shopt -s nullglob
 for src in "$SRC"/etcdefaults/*.json; do
     dst="$SAFESD/$(basename -- "$src").example"
-    if [[ -e $dst ]]; then
-        kept "kept existing $dst (not overwritten)"
-    else
-        install -o root -g root -m 0644 -- "$src" "$dst"
-        changed "seeded $dst"
-    fi
+    if [[ -e $dst ]]; then kept "kept existing $dst (not overwritten)"
+    else install -m 0644 -- "$src" "$dst"; changed "seeded $dst"; fi
 done
 shopt -u nullglob
 
-# The PER-USER example goes where documentation goes, not where policy goes.
-# `etcdefaults/user-safes.d/README.md` tells the operator to copy it into a
-# user's own `~/.config/cockpit-secrets/safes.d/`, and it has to exist somewhere
-# on the installed host for that instruction to mean anything. It is NOT seeded
-# into $SAFESD — see the comment above the loop.
+# The PER-USER example goes where documentation goes, not where policy goes: a
+# per-user entry in the system registry would be an entry naming a path in
+# somebody's home directory, read by a root helper.
 ensure_dir "$EXAMPLEDIR" 0755 "it holds shipped documentation, not policy."
 ensure_dir "$EXAMPLEDIR/user-safes.d" 0755 "it holds the per-user registry example."
 shopt -s nullglob
 for src in "$SRC"/etcdefaults/user-safes.d/*; do
     [[ -f $src ]] || continue
-    put 0644 "$src" "$EXAMPLEDIR/user-safes.d/$(basename -- "$src")"
+    link_one "$src" "$EXAMPLEDIR/user-safes.d/$(basename -- "$src")"
 done
-shopt -u nullglob
-
-# Registry entries the operator wrote are never touched. Say so out loud, with a
-# count, so the summary is checkable rather than a promise.
-shopt -s nullglob
 live=("$SAFESD"/*.json)
 shopt -u nullglob
-if ((${#live[@]})); then
-    note "left ${#live[@]} existing registry entry/entries in $SAFESD untouched"
-fi
+((${#live[@]})) && note "left ${#live[@]} existing registry entry/entries in $SAFESD untouched"
 
-# ======================================================================
-# 4. the optional unlock agent (--with-agent only)
-# ======================================================================
+# ===========================================================================
+# 4. the optional unlock agent - RENDERED AND PLACED, never enabled (I18)
+# ===========================================================================
+UNIT_TMP="$(mktemp -d)"
+cleanup_unit_tmp() { [[ -d "$UNIT_TMP" ]] || return 0
+    rm -f -- "$UNIT_TMP"/*; rmdir -- "$UNIT_TMP" 2>/dev/null || true; }
+trap cleanup_unit_tmp EXIT
+
+render_unit() {  # render_unit <template-path> <outfile>
+    local in=$1 out=$2
+    [[ -f "$in" ]] || die "missing unit template $in"
+    sed -e "s|@PAYLOAD@|$SRC|g" \
+        -e "s|@INSTALL_PATH@|$ROOT|g" \
+        -e "s|@ENV_FILE@|$ENV_FILE|g" \
+        -e "s|@LIBDIR@|$LIBDIR_RUNTIME|g" \
+        -e "s|@SBIN@|/usr/local/sbin|g" "$in" > "$out"
+    # A placeholder that appears nowhere else cannot be silently no-op'ed. That
+    # is the whole reason these are tokens and not literal old paths: sed
+    # against a literal succeeds vacuously the moment the unit is edited, and
+    # installs a working-looking unit naming a path nothing lives at.
+    if grep -q '@[A-Z_]\+@' "$out"; then
+        local left; left=$(grep -o '@[A-Z_]*@' "$out" | sort -u | tr '\n' ' ')
+        rm -f -- "$out"; die "unrendered placeholder(s) in $(basename -- "$in"): $left"
+    fi
+}
+place_unit() {  # place_unit <template-dir> <name> <dest-dir>
+    local dir=$1 u=$2 dest=$3 in="$1/$2.in"
+    [[ -f "$in" ]] || in="$dir/$u"
+    render_unit "$in" "$UNIT_TMP/$u"
+    while read -r word; do
+        [[ "$word" == /* ]] || continue
+        [[ -e "$DESTDIR$word" || -e "$word" ]] \
+            || warn "$u runs $word, which is not installed"
+    done < <(sed -n 's/^ExecStart=[-@+!]*//p' -- "$UNIT_TMP/$u" | tr ' ' '\n')
+    if [[ -f "$dest/$u" ]] && cmp -s -- "$UNIT_TMP/$u" "$dest/$u"; then
+        kept "unchanged $dest/$u"
+    else
+        install -m 0644 -- "$UNIT_TMP/$u" "$dest/$u"; changed "rendered $dest/$u"
+    fi
+}
+
 if ((WITH_AGENT)); then
     ensure_dir "$LIBDIR/agent" 0755 "the agent imports code from here."
-    for f in "${AGENT_PY[@]}"; do
-        put 0644 "$f" "$LIBDIR/agent/$(basename -- "$f")"
-    done
-    [[ -n $AGENT_BIN ]] && put 0755 "$AGENT_BIN" "$LIBDIR/secrets-agent"
+    for f in "${AGENT_PY[@]}"; do link_one "$f" "$LIBDIR/agent/$(basename -- "$f")"; done
+    [[ -n $AGENT_BIN ]] && link_one "$AGENT_BIN" "$LIBDIR/secrets-agent"
 
     # A USER unit, not a system one, on purpose: the agent must run AS the user
-    # whose safes it holds, so SO_PEERCRED on its socket is an identity and not a
-    # broker authenticating on everyone's behalf (I18).
+    # whose safes it holds, so SO_PEERCRED on its socket is an identity and not
+    # a broker authenticating on everyone's behalf (I18).
     ensure_dir "$USERUNITDIR" 0755 "systemd reads user units from here."
-    for u in "${AGENT_UNITS[@]}"; do
-        put 0644 "$u" "$USERUNITDIR/$(basename -- "$u")"
-    done
+    for u in "${AGENT_UNITS[@]}"; do place_unit "$SRC/agent/systemd" "$u" "$USERUNITDIR"; done
 
-    # The SYSTEM template, for the admin access class. Installed, never
-    # enabled: `secrets-agent@<uid>.socket` is one agent per operator behind a
-    # 0700 run dir, and deciding that an administrator's safes may stay open is
-    # not an installer's decision to make (I18). agent/README.md has the
-    # enable line and the argument against running it at all.
-    if ((${#AGENT_SYS_UNITS[@]})); then
-        ensure_dir "$SYSUNITDIR" 0755 "systemd reads system units from here."
-        for u in "${AGENT_SYS_UNITS[@]}"; do
-            put 0644 "$u" "$SYSUNITDIR/$(basename -- "$u")"
-        done
-        note "installed ${#AGENT_SYS_UNITS[@]} system template(s), NOT enabled: see agent/README.md"
-    fi
-
-    # Every ExecStart= in the units we just installed must point at something
-    # that exists, or the operator finds out at first use instead of now.
-    shopt -s nullglob
-    for u in "$USERUNITDIR"/secrets-agent.* "$SYSUNITDIR"/secrets-agent@.*; do
-        while read -r bin; do
-            [[ -n $bin ]] || continue
-            [[ -e "$DESTDIR$bin" ]] || warn "$(basename -- "$u") runs $bin, which is not installed"
-        done < <(sed -n 's/^ExecStart=[-@+!]*\([^ ]*\).*/\1/p' -- "$u")
-    done
-    shopt -u nullglob
+    # The SYSTEM template, for the admin access class. Placed, NEVER enabled:
+    # secrets-agent@<uid>.socket is one agent per operator behind a 0700 run
+    # dir, and deciding that an administrator's safes may stay open is not an
+    # installer's decision to make (I18).
+    ensure_dir "$SYSUNITDIR" 0755 "systemd reads system units from here."
+    for u in "${AGENT_SYS_UNITS[@]}"; do place_unit "$SRC/agent/systemd/system" "$u" "$SYSUNITDIR"; done
+    note "agent units placed, NOT enabled and NOT started: see agent/README.md"
 fi
 
-# ======================================================================
-# 5. smoke test - only against a real installation, never a staging root
-# ======================================================================
+# ===========================================================================
+# 5. install.conf - the machine's record. .env is the operator's; this is not.
+# ===========================================================================
+ensure_dir "$(dirname -- "$INSTALL_CONF")" 0755 "it holds this install's record."
+tmp_conf="$(mktemp)"
+cat > "$tmp_conf" <<EOF
+# Written by install.sh. Do not edit; re-run install.sh instead.
+# This is the machine's record. Your settings are in ENV_FILE below.
+INSTALL_KIND=$KIND
+INSTALL_PATH=$ROOT
+PAYLOAD=$SRC
+ENV_FILE=$ENV_FILE
+PKGDIR=${PKGDIR#"$DESTDIR"}
+LIBDIR=$LIBROOT
+UNITDIR=$UNITROOT
+WITH_AGENT=$WITH_AGENT
+VERSION=$VERSION
+INSTALLED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+INSTALLED_BY=install.sh
+EOF
+if [[ -f "$INSTALL_CONF" ]] && diff -q <(grep -v '^INSTALLED_AT=' "$tmp_conf") \
+        <(grep -v '^INSTALLED_AT=' "$INSTALL_CONF") >/dev/null 2>&1; then
+    kept "unchanged $INSTALL_CONF"; rm -f -- "$tmp_conf"
+else
+    install -m 0644 -- "$tmp_conf" "$INSTALL_CONF"; rm -f -- "$tmp_conf"
+    changed "wrote $INSTALL_CONF"
+fi
+
+# ===========================================================================
+# 6. smoke test - only against a real installation, never a staging root
+# ===========================================================================
 # In a DESTDIR the helper is not at the path it will run from and its library
 # root does not exist yet, so running it would prove nothing.
 echo
 echo "Verifying"
 if [[ -z $DESTDIR ]]; then
-    # Does the library root the helper depends on actually import? This isolates
-    # a path problem from a helper problem.
-    #
-    # `-B` IS LOAD-BEARING. Without it this probe is a writer: it imports a
+    # `-B` IS LOAD-BEARING. Without it this probe is a WRITER: it imports a
     # package out of a root-owned directory as root, and CPython caches the
-    # bytecode next to the source - under this script's umask 022, so 0644.
-    # That single line put a __pycache__ back into a directory the sweep above
-    # had just cleaned, four files, and the installer then reported success
-    # against an invariant it had broken itself.
+    # bytecode next to the source. That single line once put a __pycache__ back
+    # into a directory the sweep had just cleaned, and the installer then
+    # reported success against an invariant it had broken itself.
     if python3 -B -c "import sys; sys.path.insert(0, '$LIBDIR_RUNTIME'); import backends" 2>/dev/null; then
         note "backends import from $LIBDIR_RUNTIME"
     else
         warn "python3 cannot import backends from $LIBDIR_RUNTIME"
     fi
     # One JSON object on stdout and nothing else, exit 0 - the whole contract in
-    # one call. Only the verdict is printed: health output names safes and paths,
-    # and this runs in a group-readable job log (I15).
+    # one call. Only the verdict is printed: health output names safes and
+    # paths, and this runs in a group-readable job log (I15).
     #
     # Deliberately NOT run with PYTHONDONTWRITEBYTECODE=1, even though that
     # would also stop the bytecode: the helper has to be smoke-tested in the
-    # environment it will really run in. It sets `sys.dont_write_bytecode`
-    # itself, and section 5b is what proves it - handing it the variable here
-    # would test the variable instead of the helper.
-    if out="$("$HELPER_DST" health 2>/dev/null)" \
+    # environment it will really run in. It sets sys.dont_write_bytecode
+    # itself, and the assertion below is what proves it.
+    if out="$("$SBINDIR/secrets-admin" health 2>/dev/null)" \
        && printf '%s' "$out" | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if isinstance(d, dict) else 1)' 2>/dev/null; then
         note "secrets-admin health: one JSON object, exit 0"
     else
-        warn "secrets-admin health did not return a JSON object - run '$HELPER_DST health' by hand"
+        warn "secrets-admin health did not return a JSON object - run '$SBINDIR/secrets-admin health' by hand"
     fi
 else
     note "staged into $DESTDIR; smoke test skipped (the helper is not at its runtime path)"
 fi
 
-# ======================================================================
-# 5b. the library root holds exactly what we installed - ASSERTED, LAST
-# ======================================================================
-# The header of this file claims a precise list of what the installation
-# contains. That claim was false for a release: the sweep in section 2 removed
-# the bytecode and section 5 imported the package again and recreated it, four
-# root-owned .pyc files in two different modes from two different umasks
-# (docs/ROOT-VERIFICATION.md F1). The comment saying why bytecode does not
-# belong there was still sitting eight lines above the code that wrote it.
-#
-# So the invariant is now CHECKED here rather than asserted in prose, and it is
-# checked LAST - after the sweep, after both verification steps, after anything
-# else this script might grow. A future change that imports the package one more
-# time, or a helper that starts writing bytecode again, cannot pass this
-# quietly.
-#
-# It repairs and reports rather than dying: at this point the package is
-# installed and working, and the defect is in the installer, not the
-# installation. `warn` is not a quiet channel - it prints to stderr, it lists
-# the file in the "Action required" block below, and tests/root/20-verify-
-# install.sh fails an install that emits any such line. That is where this
-# becomes a test failure.
+# ===========================================================================
+# 6b. post-install assertion - what was PRODUCED, not what was intended
+# ===========================================================================
+# Separate from the pre-flight on purpose: a script that only checked its own
+# intentions would report the mode it meant to set, in both places. Checked
+# LAST - after the sweeps, after the smoke test, after anything else this
+# script might grow. A future change that imports the package one more time, or
+# a helper that starts writing bytecode again, cannot pass this quietly.
+fail=0
+shopt -s nullglob
+found=("$PKGDIR"/*)
+shopt -u nullglob
+((${#found[@]} == ${#PAGE[@]})) \
+    || { warn "$PKGDIR holds ${#found[@]} entries; PAGE declares ${#PAGE[@]}"; fail=1; }
+for f in "${PAGE[@]}"; do
+    l="$PKGDIR/$f"
+    [[ -L "$l" ]] || { warn "$l is not a symlink"; fail=1; continue; }
+    t="$(readlink -f -- "$l" 2>/dev/null || true)"
+    [[ -n "$t" && -e "$t" ]] || { warn "$l is a DANGLING symlink"; fail=1; continue; }
+    [[ "$t" == "$SRC_REAL"/* ]] || { warn "$l -> $t, outside the payload"; fail=1; }
+done
+for h in "${HELPERS[@]}"; do
+    l="$SBINDIR/$h"
+    [[ -L "$l" && -x "$(readlink -f -- "$l")" ]] \
+        || { warn "$l is not a symlink to an executable"; fail=1; }
+done
+
+# The library root holds EXACTLY what was declared - no bytecode, no strays.
+# The header claims a precise list; that claim was false for a release, and it
+# is now checked rather than asserted in prose. It repairs and reports rather
+# than dying: at this point the package is installed and working, and the defect
+# would be in the installer, not the installation.
 assert_library_root_clean() {
     [[ -d $LIBDIR ]] || return 0
-    local stray=() existing base
-
+    local stray=() existing base leaf
     shopt -s nullglob dotglob
-    # Top level: the two package directories, plus the agent's two names. The
-    # agent names are allowed unconditionally, NOT only under --with-agent: a
-    # plain reinstall on a host where somebody installed the agent must not
-    # delete the code their systemd units point at. Uninstall is where the agent
-    # goes away, and it does so by name.
     for existing in "$LIBDIR"/*; do
         base="$(basename -- "$existing")"
-        case "$base" in
-            backends|schema|agent|secrets-agent) continue ;;
-        esac
+        case "$base" in backends|schema|agent|secrets-agent) continue ;; esac
         stray+=("$existing")
     done
-    # backends/ - exactly the source's *.py and nothing else. This is the
-    # directory F1 was measured in.
-    for existing in "$LIBDIR"/backends/*; do
-        base="$(basename -- "$existing")"
-        [[ $base == *.py && -f "$SRC/backends/$base" ]] && continue
-        stray+=("$existing")
+    for l in "${LIBS[@]}"; do
+        leaf="$(basename -- "$l")"
+        for existing in "$LIBDIR/$leaf"/*; do
+            base="$(basename -- "$existing")"
+            [[ -L "$existing" && -e "$(src_lib "$l")/$base" ]] && continue
+            stray+=("$existing")
+        done
     done
-    # schema/ - exactly the source's *.json.
-    for existing in "$LIBDIR"/schema/*; do
-        base="$(basename -- "$existing")"
-        [[ $base == *.json && -f "$SRC/schema/$base" ]] && continue
-        stray+=("$existing")
-    done
-    # agent/ only when it is installed. Same rule, same reason: it is a Python
-    # package imported from a root-owned directory.
+    # agent/ only when it is installed. The agent names are allowed at the top
+    # level unconditionally, NOT only under --with-agent: a plain reinstall on a
+    # host where somebody installed the agent must not delete the code their
+    # systemd units point at. Uninstall is where the agent goes away, by name.
     if [[ -d "$LIBDIR/agent" ]]; then
         for existing in "$LIBDIR"/agent/*; do
             base="$(basename -- "$existing")"
-            [[ $base == *.py && -f "$SRC/agent/$base" ]] && continue
+            [[ -L "$existing" && -e "$SRC/agent/$base" ]] && continue
             stray+=("$existing")
         done
     fi
     shopt -u nullglob dotglob
-
     if ((${#stray[@]} == 0)); then
-        note "library root holds exactly the installed payload (no bytecode, no strays)"
+        note "library root holds exactly the declared payload (all symlinks, no bytecode, no strays)"
         return 0
     fi
     for existing in "${stray[@]}"; do
-        rm -rf -- "$existing"; changed "removed unexpected $existing"
+        if [[ -L "$existing" ]]; then remove_link "$existing"
+        elif [[ -f "$existing" ]]; then rm -f -- "$existing"; changed "removed unexpected $existing"
+        else warn "unexpected DIRECTORY in the library root, left in place: $existing"; fi
     done
-    warn "the library root contained ${#stray[@]} file(s)/directory(ies) this installer did not put there - removed, but something in THIS script or in secrets-admin wrote them after the stale-file sweep. See docs/ROOT-VERIFICATION.md F1: ${stray[*]}"
+    warn "the library root contained ${#stray[@]} entry/entries this installer did not put there - see docs/ROOT-VERIFICATION.md F1: ${stray[*]}"
 }
 assert_library_root_clean
 
-# ======================================================================
-# 6. what changed, and what the operator does next
-# ======================================================================
+conf_payload="$(env_get "$INSTALL_CONF" PAYLOAD)"
+[[ "$(readlink -f -- "$conf_payload")" == "$SRC_REAL" ]] \
+    || { warn "install.conf PAYLOAD=$conf_payload does not resolve to $SRC"; fail=1; }
+((fail)) || note "the package is exactly ${#PAGE[@]} symlink(s), every one resolving into $SRC"
+
+# ===========================================================================
+# 7. what changed, and what the operator does next
+# ===========================================================================
 echo
 echo "Summary"
 printf '  %d change(s), %d unchanged, %d warning(s)\n' \
@@ -848,34 +1192,33 @@ if ((${#WARNINGS[@]})); then
     for w in "${WARNINGS[@]}"; do printf '    ! %s\n' "$w"; done
 fi
 
-# The instructions below name the paths the operator will actually type, which
-# are the runtime paths - a staging root is a build artefact, not somewhere
-# anyone registers a safe.
-R_SAFESD="${SAFESD#"$DESTDIR"}"
-R_SAFESDIR="${SAFESDIR#"$DESTDIR"}"
-
+# The instructions name the paths the operator will actually type, which are the
+# runtime paths - a staging root is a build artefact, not somewhere anyone
+# registers a safe.
 cat <<EOF
 
 Next steps
   1. Reload Cockpit in the browser (Ctrl-Shift-R). Log out and back in for the
      menu entry. Cockpit was NOT restarted and no service was touched.
-  2. Register a safe. Nothing is visible until you do - the registry is the only
+  2. Which install is this?
+       readlink -f /usr/share/cockpit/$NAME/index.html
+       grep INSTALL_KIND ${INSTALL_CONF#"$DESTDIR"}
+  3. Register a safe. Nothing is visible until you do - the registry is the only
      source of safes and it ships empty:
-       cp $R_SAFESD/10-example-admin.json.example \\
-          $R_SAFESD/10-lab-dc.json
-       \$EDITOR $R_SAFESD/10-lab-dc.json      # id, label, path, access
-       chmod 0644 $R_SAFESD/10-lab-dc.json
-       secrets-admin health                   # registry_errors[] must be empty
+       cp $ETCROOT/safes.d/10-example-admin.json.example \\
+          $ETCROOT/safes.d/10-lab-dc.json
+       \$EDITOR $ETCROOT/safes.d/10-lab-dc.json   # id, label, path, access
+       chmod 0644 $ETCROOT/safes.d/10-lab-dc.json
+       secrets-admin health                    # registry_errors[] must be empty
      An entry that omits "access" is an ADMIN safe. That default is deliberate:
      a hand-edit that loses a line must fail closed (I1).
-  3. Put admin-class safes in $R_SAFESDIR, mode 0600 root:root.
+  4. Put admin-class safes in $ETCROOT/safes, mode 0600 root:root.
      A user-class safe lives in that user's own tree, mode 0600, owned by them.
-  4. Read docs/OPERATIONS.md before the first save: the backup ring, the
+  5. Read docs/OPERATIONS.md before the first save: the backup ring, the
      "changed on disk" conflict, and the lossless-save guard (I22) all behave in
      ways that are obvious afterwards and surprising the first time.
 
 The agent stays off unless a registry entry sets agent.enabled - and it should
 stay off. See docs/OPERATIONS.md, "The agent, and why you probably should not".
 EOF
-
 exit 0

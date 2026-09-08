@@ -436,3 +436,170 @@ ones that found nothing),
 [`docs/OPERATIONS.md`](docs/OPERATIONS.md),
 [`docs/HOST-FACTS.md`](docs/HOST-FACTS.md) (what is true of edt1 specifically)
 and [`docs/ROOT-VERIFICATION.md`](docs/ROOT-VERIFICATION.md).
+
+---
+
+## Installing and deploying
+
+`cockpit-secrets` is the **reference implementation** of
+`docs/DEPLOY-CONTRACT.md`. The other five plugins in this tree copy their
+`install.sh` and `deploy.sh` from here, so the shape below is the shape they all
+take.
+
+There are **two processes** and they are not the same thing.
+
+| | `install.sh` | `deploy.sh` / `deploy.ps1` / `deploy.bat` |
+|---|---|---|
+| What it is | An in-place install **by symlink**, from wherever it is run | The real deployment: a copy, then config, then `install.sh` |
+| Moves bytes? | **No.** It links; it never copies the payload | Yes. It is the only thing that copies |
+| Run from | The payload — dev checkout *or* install path | The dev checkout |
+| Owns units? | Renders and places them. Never enables or starts | Enables, behind an explicit flag |
+| Owns `.env`? | No. Reads it, refuses if a required key is missing | Yes. Seeds it from `.envdefault`, **missing-only** |
+
+**The single idea:** the script is the same; only where it is run from differs.
+Nothing in `install.sh` branches on dev-versus-deployed to decide *what* to
+link — only to *record* which it did.
+
+```bash
+# A DEV install - the page, the helper and backends/ all become symlinks into
+# this checkout, so editing secrets.js or backends/kdbx.py changes what runs.
+cp .envdefault .env          # TEST-ONLY, gitignored; see the header in .envdefault
+sudo ./install.sh
+
+# A DEPLOYED install - self-sustaining, no relationship to the share.
+sudo ./deploy.sh                     # -> /opt/cockpit-secrets
+sudo ./deploy.sh --with-agent        # ... and place the unlock agent's units (I18)
+sudo ./deploy.sh --verify            # the standing checks, then stop
+sudo ./deploy.sh --uninstall         # drop the links; keep every byte of data
+sudo ./deploy.sh --remove            # ... and delete the deployed tree too
+```
+
+**The acceptance test:** after `deploy.sh`, unmount the dev share and this host
+keeps working — page, helper, backends, schema and units. A dev install is
+deliberately the opposite: it *is* the share, and `install.sh` says so out loud,
+because in a dev install the **root-run helper imports its code from a
+group-writable tree**.
+
+### What goes where, and why
+
+The hard rule is that **nothing an upgrade replaces may hold state**, and an
+upgrade replaces `payload-<version>/` wholesale.
+
+| The thing | Where | Survives upgrade | Survives `--uninstall` |
+|---|---|---|---|
+| Page files, `secrets-admin`, `backends/`, `schema/`, unit templates | `/opt/cockpit-secrets/payload-<v>/` | no — that is the point | no |
+| Locations and settings | `/opt/cockpit-secrets/.env` | **yes** | **yes** |
+| The registry (`safes.d/`) and admin-class safe files (`safes/`) | `/etc/cockpit-secrets/` | **yes** | **yes** |
+| Lockout counters (I16), exports (I21) | `/var/lib/cockpit-secrets/` | **yes** | **yes** |
+| The audit log | `/var/log/cockpit-secrets/` | **yes** | **yes** |
+
+`/etc`, `/var/lib` and `/var/log` are used **in preference to** anything under
+the install path, because an operator's backup policy, logrotate configuration,
+SELinux labelling and `restorecon` already know those three trees. They do not
+know `/opt/cockpit-secrets/state`, and a second state directory where `/var/lib`
+would have done is a backup that silently does not cover you.
+
+Two of those rows are the reason this project is the hardest case in the tree.
+A **lockout counter** that lived in the payload would be cleared by every
+upgrade, which turns "deploy the new version" into "clear every lockout". An
+**export** is an entire safe in plaintext; one that lived in the payload would
+be deleted by an upgrade with nobody ever having looked at it. Neither may be
+anywhere an upgrade can reach.
+
+`.env` is a **sibling** of `payload`, never a child — the only way "seed `.env`
+in the install path" and "an upgrade never touches operator config" can both
+hold. **It never contains a secret**; `deploy.sh` refuses to write a value whose
+key names a credential and whose value is not a path to one, and that refusal is
+what makes mode 0644 safe rather than merely convenient (JC-8).
+
+```
+/opt/cockpit-secrets/
+├── payload -> payload-0.5.1        one rename(2): safe against a live Cockpit at :9090
+├── payload-0.5.1/
+│   ├── index.html secrets.js secrets.css theme.js manifest.json
+│   ├── bin/secrets-admin
+│   ├── lib/backends/*.py  lib/schema/*.json
+│   ├── agent/  etcdefaults/  systemd templates
+│   └── install.sh  VERSION  .envdefault
+├── .env                            OPERATOR CONFIG — never replaced
+└── payload-0.5.0/                  the previous version, kept for rollback
+```
+
+Rollback needs no share and no network:
+
+```bash
+cd /opt/cockpit-secrets
+ln -sfn payload-0.5.0 payload.new && mv -T payload.new payload && payload/install.sh
+```
+
+The payload is a **subset**: `.git/`, `.claude/`, `tests/`, `docs/`,
+`function-map/`, `check.sh`, `validate.sh`, `run_tests.sh`, `requires.txt`,
+`CHANGELOG.md` and every fixture stay in the checkout. A production host that
+holds passphrases has no business holding a test corpus or a git history. There
+is no build step to invent — `secrets.js` is the bytes the browser loads, byte
+for byte — so `deploy.sh` ships a subset rather than compiling one.
+
+### Which install is this?
+
+```bash
+readlink -f /usr/share/cockpit/secrets/index.html
+grep INSTALL_KIND /etc/cockpit-secrets/install.conf
+```
+
+### The completeness gate
+
+One declaration at the top of `install.sh`, between `BEGIN-MANIFEST` and
+`END-MANIFEST`, read by `deploy.sh`, `deploy.ps1` and `validate.sh`. Two lists
+that can disagree is the failure being designed out. Every pre-flight check
+refuses, and nothing is written until all of them pass:
+
+1. the payload is complete
+2. `index.html` asks only for files `PAGE` ships — *this is the `theme.js` catch*
+3. every `/usr/local/sbin/<x>` the page names is in `HELPERS` — *the `wg-admin` catch*
+4. `manifest.json` is valid, relaxes no CSP (I9), and its conditions test only paths **this** installer creates (§8.4)
+5. every backend in `secrets-admin`'s `FORMATS` has a module in `lib/backends/`
+6. `.env` defines every required key, and **agrees with the constants compiled into `secrets-admin`**
+7. no shipped artifact names a dev-tree or retired path
+
+Check 6 is the one worth dwelling on. If `.env` said the registry lived somewhere
+`secrets-admin` will never look, the page would install cleanly, every verb would
+run, and every safe would be missing — with nothing anywhere naming the cause.
+The installer refuses instead, and prints both values.
+
+### Conformance to DEPLOY-CONTRACT
+
+Verified 2026-09-07 against a staged install under a temp dir, with `DESTDIR=`
+set so nothing touched the live host. `./check.sh`, `./validate.sh` and
+`./run_tests.sh` all green after every change.
+
+| Area | Status |
+|---|---|
+| §1 `/opt/cockpit-secrets`; `payload-<version>/` + symlink; `.env` a sibling | yes |
+| §1.4 State in `/etc`, `/var/lib`, `/var/log`; nothing runtime-writable in the payload | yes |
+| §1.6 Ships a subset; no invented build step | yes |
+| §2.1 Per-file symlinks into a real `/usr/share/cockpit/secrets` | yes |
+| §2.2 Per-file `/usr/local/sbin` link; refuses a path it does not own | yes |
+| §2.4 No `rm -r` in `install.sh` at all; `deploy.sh` only in `remove_old_payload` | yes |
+| §2.4 `--uninstall` names the dev checkout as untouched | yes |
+| §3.1 `readlink -f` then `dirname`; classification records only | yes |
+| §3.3 Writes `/etc/cockpit-secrets/install.conf` | yes |
+| §4.1 `.envdefault` in the one grammar; no interpolation | yes |
+| §4.2 Seeded missing-only; new keys warned; secret-shaped values refused | yes |
+| §4.3 The helper reads **nothing** from `.env` — the contract's own second branch; §7b makes drift a refusal instead | yes, see note |
+| §5 `etcdefaults/` for managed content, `.envdefault` for settings; both present | yes |
+| §6.1 Renders and places units; never enables, starts or stops; never touches `cockpit.socket` | yes |
+| §6.2 Agent units are now `@PLACEHOLDER@` templates; a survivor is a refusal | yes |
+| §7.1 One declaration, three readers | yes |
+| §7.2 All nine refusals present and proven to fire | yes |
+| §7.3 Post-install assertion, including `assert_library_root_clean` | yes |
+| Unbreakable | `run_tests.sh`, `validate.sh`, `check.sh` green; no ban weakened | yes |
+
+**Note on §4.3.** `secrets-admin` does not read `.env`. It takes the contract's
+explicit "or reads nothing" branch: its data seams are its own compiled
+constants, hardened and covered by the existing suite, and rewiring a 450 KB
+root-run helper that holds every passphrase on the host was not a change worth
+making to satisfy a file that would then say the same thing twice. What closes
+the gap is pre-flight check 7b — `install.sh` reads the locations from `.env`,
+creates exactly those, and **refuses when they disagree with `DEFAULT_ETC`,
+`DEFAULT_VAR` or `DEFAULT_LOG_DIR` in the helper**. The two cannot silently
+diverge, which is the property §4.3 exists to guarantee.
