@@ -43,6 +43,261 @@ Two conventions worth knowing before reading an entry:
   unlock agent above all). **`secrets-admin health` is the authority on what a
   given installation actually has** — not this file.
 
+## 0.5.5 — 2026-09-12
+
+**The keep-open gate was per-SAFE; the suspension it granted was per-SESSION.**
+0.5.4 pointed keep-open at the right timer. This release bounds it. There is
+exactly ONE idle timer in a helper session and it ends the whole process, so
+suspending it suspends the only idle protection every safe that process has
+unlocked has — while the gate the daemon runs is about one safe. Two skeptics
+found the gap independently, and it was a real bypass: with `lab-A` opted in and
+`lab-B` opted out, one session holding both could toggle `lab-A` and leave
+`lab-B` answering 26 s into a 10 s idle window it would otherwise have died in.
+A control run with no toggle died on schedule, which is what makes that a
+finding rather than a coincidence. `allow_keep_open: false` bought that safe
+nothing, and the page drew no toggle on its row, so the operator's only signal
+said the opposite.
+
+**This is the second time a gate has been checked against one thing and applied
+to another** — the first was `op_put`, gating on the request's safe while acting
+on a holding found by handle — so the fix is a standing rule with greps behind
+it rather than a patch: *wherever keep-open is granted, the scope the gate was
+asked about must be the scope the grant affects.*
+
+- **The grant is bounded by the weakest safe the session holds.** The suspension
+  is in force only while EVERY safe the session holds has been affirmed by the
+  daemon (`held <= allowed`, in `SessionWindow._rescope`). That comparison is
+  the ONLY line in the program that assigns `keep_open` — the constructor
+  derives it too rather than writing `False` into the slot — and the mutator
+  takes the session's held set keyword-only and without a default, so a call
+  site cannot narrow it by forgetting an argument. `session_held_safes()` is the
+  one definition of the scope. `validate.sh` has a new standing ban with nine
+  greps over all of it, each watched failing with its own half reverted.
+- **Opening a safe the agent will not let the session suspend ends the
+  suspension in that unlock's own reply.** The scope is re-derived after every
+  verb (`unlock` is a verb), and the re-derivation is ordered AHEAD of the emit
+  — the page adopts from replies, so the reply that broke the scope must not be
+  the one still claiming it. `reissue_session_state()` corrects the values of
+  keys the verb already published; it adds nothing to any reply's shape.
+- **The re-ask is on a CLOCK, not on silence** (F2). It lived in the
+  idle-timeout branch of the session loop, so it was reached only by a session
+  that had gone quiet — which is every session except the ones keep-open is
+  actually doing something for. A session that kept talking never re-asked at
+  all: a withdrawn opt-in, a screen lock, a suspend and another tab's Lock all
+  reached exactly the sessions that were about to end anyway. Reproduced by
+  dropping the holding at the daemon and then talking for 46 s past a 30 s
+  interval; the session was still alive and still holding the unlock. It now
+  re-asks for EVERY safe in the grant and re-derives the scope over every safe
+  the session HOLDS, so an opt-in withdrawn from a held safe that was never
+  toggled revokes the suspension too.
+- **OFF works after the opt-in has been withdrawn** (F3). The daemon gates both
+  directions and must — its OFF resets the holding's idle timer, so an ungated
+  OFF is a keepalive — which means it refuses OFF for a safe whose opt-in has
+  just gone. The helper relayed that refusal, so the operator could not turn the
+  toggle off at all and was left with a control reading "Keeping open". The
+  daemon's gate is unchanged; the helper resumes its own idle timer regardless
+  and says in `warnings` that the daemon refused its half. Resuming a timer
+  grants a caller nothing and is strictly more protective.
+- **The registry's lifetime raise is contingent on the suspension** (F4). It
+  survived both OFF and revocation, so a session could click the toggle on, take
+  the hour, and click it off — an extension bought with two clicks, which is
+  exactly the manoeuvre `client_shortened` blocks one door along. `release()`
+  gives it back, `_lower_session_handles()` gives the handles' share back, and
+  the reply re-publishes the lowered `session_expires_in`/`session_max_seconds`
+  so the page is never ahead of the helper.
+- **`unlock`'s own `max_seconds` counts as shortening** (F5). `client_shortened`
+  was set only by a `session` frame. A client could shorten the HANDLE at the
+  unlock, toggle keep-open, and have `_raise_session_handles` hand the lifetime
+  straight back: same manoeuvre, unguarded door. Measured before the fix — a
+  60 s handle came back as 3599 s.
+- **The teardown runs on the path Cockpit actually takes** (B). The page ends a
+  session with `proc.close("terminated")`, and cockpit's spawn channel
+  implements that by SIGNALLING the helper. With no handler that is the kernel's
+  default: the process died where it stood and the release never ran, leaving
+  the daemon holding a ticket still flagged `keep_open` for a session that had
+  gone — which the page draws, so it is a banner still promising a suspension
+  over nothing. SIGTERM and SIGHUP now unwind into the ordinary teardown
+  (`reason: "terminated"`). SIGKILL still cannot, and the daemon's
+  `reconcile_keep_open` and presence drops remain the backstop.
+- **A clean teardown releases EVERY safe it suspended, and the receipt counts.**
+  It named `window.safe` — the last safe toggled — released that one, and
+  printed "its keep-open suspension went with it". A session that had suspended
+  two left one suspended at the daemon and told the operator it had not. A
+  receipt that overstates is the same defect as a banner that overstates; it now
+  names how many and which.
+- **The banner may not promise more than the helper confirmed** (A). The row
+  flag in `health` is the DAEMON's ticket; "they will NOT lock when you stop
+  using them" is about the idle timeout of the helper SESSION holding the
+  unlock, in a process `health` does not describe. The banner drew the full
+  promise from the ticket flag, so it said the most reassuring sentence on the
+  page over a toggle sent from a one-shot, a holding another tab suspended, or a
+  session that had ended. The helper now publishes `session_keep_open_safes` —
+  the whole scope of its one suspension — on `keep-open` and on `unlock`; the
+  page ADOPTS that list the way it already adopts the deadline and draws the
+  promise from nothing else. A ticket suspended with no confirmation behind it
+  gets the narrower sentence, which says what is known and claims nothing about
+  the session. Fixed by making the page unable to claim more, not by rewording.
+- **The countdown after OFF** (D). With the raise given back and re-published,
+  the page adopts the lowered number instead of counting an hour down to a lock
+  two minutes away — and the "resumed" message now names the idle window that
+  came back, in the same breath.
+- **C is a bounded residual, written down with the real number rather than
+  tuned.** `docs/KNOWN_ISSUES.md` now says: a withdrawn opt-in reaches a live
+  suspension within 30 s (the re-ask forces the daemon to re-read the registry,
+  so its own poll adds nothing); a presence signal that lands at the DAEMON
+  costs the daemon's own notice (`--session-poll-seconds` 10 s, `--tick-seconds`
+  5 s) PLUS the 30 s re-ask, so **up to 40 s, not 30**. The constant was not
+  lowered to make the sentence read better.
+- Gates after the change: `check.sh` OK; `validate.sh` 79 PASS / 0 FAIL (two new
+  standing bans); `--selfcheck` 128/0; `ui.spec.js` 506 passed / 0 failed;
+  `agent_cycle.py` 150 checks / 0 failures; `run_tests.sh` 18/18. The promise was
+  re-proven end to end at the STOCK 120 s window with a no-toggle control, and
+  the absolute bound was re-proven to fire with the toggle on.
+
+## 0.5.4 — 2026-09-11
+
+**keep-open was pointed at the wrong timer, and six smaller defects went with
+it.** 0.5.3's `keep-open` suspended the AGENT TICKET's idle timer. The agent
+holds a ticket and no key material — "no key material crosses its socket, so
+even `ok:true` does not reopen the safe" — so suspending it kept nothing open.
+What ends an operator's working session is `SESSION_IDLE_SECONDS` in the
+helper's own `open` session: the channel goes quiet, the process exits, and the
+exit takes the unlock. The toggle never touched it. Measured on the shipped
+build: the agent reported `expires_in: 3599` while the page's lock deadline
+stayed at 299 and nothing re-issued it. **The mechanism did what the brief
+specified; the feature did not do what the operator asked for**, and the banner
+said they would not be locked out while they were.
+
+- **`keep-open` now suspends the SESSION's idle timer**, which is the one the
+  operator feels, and asks the daemon to suspend the ticket's so the two agree
+  about one fact. `run_session`'s two locals became a `SessionWindow` object so
+  the verb can reach them at all; that is why the first attempt went for the
+  agent's timers instead. Outside a session the verb still changes the ticket
+  and now SAYS there was no session idle timeout to suspend, rather than
+  claiming one was.
+- **`SESSION_MAX_SECONDS` remains the bound**, counted from the session's start
+  and not from the toggle. One input may raise it — the safe's own registry
+  entry, because that file is the operator's policy and not a client. It is
+  capped at `SESSION_KEEP_OPEN_CEILING`, announced on stderr above the default,
+  idempotent under re-sending, and refused outright once a `session` frame has
+  shortened the lifetime, so a client cannot shorten the bound and then get it
+  back by clicking a toggle.
+- **The page ADOPTS the deadline; it never computes one.** `unlock` and
+  `keep-open` both publish it and a single function (`adoptSessionDeadline`) is
+  the only writer of `SESSION.expiresAt`. A page with its own arithmetic is a
+  page free to go on showing a deadline the helper has stopped believing —
+  which is the banner-outlives-its-session defect wearing different clothes.
+- **The `op_put` relabel bypass is closed.** The gate was evaluated against the
+  safe id in the REQUEST while the existing holding was found by HANDLE, and
+  "absent `keep_open` means leave it as it is" then carried a suspension back
+  onto a safe the registry refuses: `put{safe:denied}` → `put{handle,
+  safe:allowed, keep_open:true}` → `put{handle, safe:denied}` left a suspended
+  holding on the denied safe, alive twelve seconds into a five-second idle
+  window. The gate now runs on the value `keep_open` will actually have, against
+  the safe the holding will actually carry.
+- **`{"enabled": false}` is gated like `true`.** It was an ungated, handle-free,
+  passphrase-free idle-timer reset that worked on safes the registry had never
+  opted in — `get`'s polling keepalive without `get`'s handle. Both directions
+  now pass `_require_keep_open_allowed`, and the reset happens only for a
+  holding that really was suspended.
+- **Revoking the opt-in reaches a LIVE suspension.** `Agent.reconcile_keep_open`
+  re-reads the registry for every suspended holding before each expiry scan and
+  ends the ones it no longer allows, WITHOUT `touch()` — so a holding that has
+  genuinely been idle is dropped by that same pass and one being used survives
+  with its idle timer running again. It lives outside `sweep` so the standing
+  ban on those four presence functions mentioning `keep_open` stays exactly as
+  strict as it was.
+- **One reader for the registry key.** The helper no longer reads
+  `agent.allow_keep_open` for itself — not in the verb and not for the safe
+  list. The daemon answers both, through a new `policy` op, because it is the
+  process that refuses. Two readers with two loaders gave two answers and the
+  operator was shown one and governed by the other. `list` also publishes
+  `agent_keep_open_known`, so "your registry says no" and "nothing could be
+  asked" stop looking identical.
+- **The audit line carries the direction.** `ctx.note` was set to
+  `keep-open-on`/`keep-open-off` and then dropped, because `audit()` keeps only
+  notes in its declared set and neither was in it. Every keep-open line read
+  `"note": ""`, so the log could not tell the timer being switched off from it
+  being switched back on.
+- **The suspension dies with its session, and the banner stops promising.**
+  `run_session`'s teardown lifts it at the daemon on every exit path, including
+  the operator closing the tab. And while the daemon cannot be reached at all,
+  the banner no longer repeats "They will NOT lock when you stop using them"
+  from the last good poll — it says what is actually known, which is nothing.
+- **The two missing presence locks fire.** The page's `pagehide` and hidden-tab
+  handlers ran entirely inside `if (SESSION)`, so a SUSPENDED holding the page
+  did not create went through both while the banner named them. They now reach
+  every suspended holding the page can see. An ordinary holding still outlives
+  the tab, which is what the agent is for. A suspended SESSION also re-asks the
+  daemon every `SESSION_KEEP_OPEN_RECHECK_SECONDS`, so the presence locks that
+  land at the daemon — logind, freeze, SIGTERM — end the helper session too
+  instead of leaving it holding a safe open for a locked screen.
+- **Proved end to end, against a real helper over a real pipe.** With the toggle
+  on, a session whose idle window is 10 s is left silent for 25 s and then
+  answers `list` and `entries` without a new passphrase; its absolute bound then
+  closes it at 60 s with `reason: "max-lifetime"`; and the daemon's ticket is no
+  longer flagged suspended once that session has gone. Every fix above has a
+  regression test that was watched FAILING with that fix reverted, and the
+  grep-able ones have standing bans in `validate.sh`.
+- Nothing was weakened to get green. Two existing assertions changed because the
+  CONTRACT changed and both moved in the strict direction: the `--no-keep-open`
+  self-check now requires OFF to be REFUSED rather than allowed, and the
+  one-shot `keep-open` integration check now requires the reply to say there was
+  no session to keep open rather than accepting the suspension claim it used to
+  print.
+
+## 0.5.3 — 2026-09-11
+
+The unlock agent gains one bounded relaxation and the compensating controls that
+pay for it: an operator may now suspend **one** of its two timers, on **one**
+safe, where the registry says so.
+
+- **`agent.allow_keep_open` (registry, default `false`, and it needs
+  `agent.enabled`).** It permits a per-session control that stops the safe's
+  IDLE timeout. It does not permit anything else. `max_seconds` still counts
+  from the unlock, still cannot be lengthened by any client message, and still
+  ends a suspended holding — so "keep it open" means "until the absolute
+  deadline". The schema's `$comment` says what it costs in the same voice as the
+  keys around it. An entry that sets it without `agent.enabled` is refused at
+  load time rather than obeyed (I18).
+- **The DAEMON is the authority.** `secrets-agent` reads the registry itself —
+  one boolean per safe id, `O_NOFOLLOW` on the directory and the file, refusing
+  anything another uid can write, failing closed on every unknown — and answers
+  `access-denied` for a safe that did not opt in, whatever the caller says. The
+  helper's matching check is decoration (I3). `tests/integration/agent_cycle.py`
+  measures the refusal twice: once through the helper, and once straight at the
+  socket with no helper in the path. `--no-keep-open` is an agent-wide ceiling
+  above both.
+- **The presence locks are untouched, deliberately and in writing.**
+  `pagehide`, the hidden-tab timer, the Lock button, SIGTERM, a logind session
+  lock and the suspend detector all still drop a suspended holding immediately.
+  Those are not timeouts; `validate.sh` now fails if the word `keep_open` ever
+  appears inside `sweep`, `drop_all`, `_check_session` or `_check_freeze`.
+- **New agent op `keep-open`** (by bare safe id, like `drop`, because the page
+  never has the handle) and **new helper verb `keep-open`**, class-gated,
+  audited one metadata-only line per holding, and reflected in `status`/`health`
+  so the state is inspectable without the page. `idle_expires_in` comes back
+  `null` while suspended rather than a large number. It is the one agent call
+  allowed to fail its verb: if the daemon did not hear it the idle timeout is
+  still running, and an `ok` there would be a receipt that lies about a lock.
+- **The banner is the compensating control and got louder.** While anything is
+  suspended it states so in words above the rows, each affected row carries
+  "idle timeout suspended" beside its countdown, and the countdown becomes the
+  ABSOLUTE lifetime and says which number it is. The toggle is `aria-pressed`,
+  keyboard-reachable, takes a visible focus ring, is announced, and appears only
+  where the registry allows it — with a one-line reason where it does not.
+  Nothing in the banner animates under any motion preference, and the toggle's
+  state reaches no browser storage area (I11).
+- **`list` rows gain `agent_keep_open_allowed`**; `schema` gains the `keep-open`
+  verb and the `enabled` field (42 verbs, 44 fields).
+- The user service unit binds `~/.config/cockpit-secrets/safes.d` back in
+  read-only: `ProtectHome=yes` hid the per-user registry from the daemon
+  entirely, which failed closed but refused every user-class opt-in.
+- Gates: check.sh OK, validate.sh OK (38 unit tests), `--selfcheck` 107 checks
+  (was 61), `agent_cycle.py` 92 checks (was 45), `ui.spec.js` 481 (was 450),
+  run_tests.sh OK with no skips. Every new guard was watched failing with its
+  fix reverted.
+
 ## 0.5.1 — 2026-09-06
 
 **The five things 0.5.0's own verification said were still wrong.** 0.5.0 shipped

@@ -25,6 +25,14 @@ So it is built to be more paranoid than the thing it makes convenient:
     deadline. `status` deliberately does NOT count as use — the UI polls it to
     draw the "unlocked, N s left" banner, and a banner that keeps the safe open
     by being looked at would be the whole hazard with a countdown drawn on it.
+  - **One timer can be suspended, and only by the operator's own policy file.**
+    `keep_open` stops the IDLE timer for one holding so a safe does not lock in
+    the middle of a task. It changes nothing else: `max_seconds` still runs,
+    still counts from the unlock, and still cannot be pushed out by any client
+    or by this flag. It is refused unless the safe's registry entry sets
+    `agent.allow_keep_open`, which the DAEMON reads for itself — see
+    `RegistryPolicy`, and `op_keep_open` for why the idle timer was the only
+    one worth suspending.
   - **Nothing reaches disk.** No state file, no cache, no resume-after-restart.
     Restarting the agent loses everything it holds, on purpose. It writes one
     JSON line per operation to **stderr** — `{when, op, safe, uid, outcome}`,
@@ -73,9 +81,20 @@ docstring argues the split at length. The material path is kept, tested and
 unused; it is what a future opt-in reattach would need, and I18 sanctions it as
 a per-safe opt-in, but nothing in this tree produces key material today.
 
+    -> {"op":"keep-open","safe":"lab-dc","enabled":true}   # or {"handle":…}
+    <- {"ok":true,"safe":"lab-dc","keep_open":true,"changed":1,"affected":1,
+        "expires_in":3412,"idle_expires_in":null,"idle_seconds":300,
+        "max_seconds":3600}
+
     -> {"op":"status"}
     <- {"ok":true,"pid":…,"owner_uid":…,"holdings":[…],"idle_seconds":300,
         "max_seconds":3600,"clock":"BOOTTIME","socket":{…},"session":{…}}
+
+    -> {"op":"policy","safes":["lab-dc","other"]}
+    <- {"ok":true,"available":true,
+        "keep_open":{"lab-dc":true,"other":false}}
+       # the ONE reader of agent.allow_keep_open, made addressable so the
+       # helper asks instead of reading the registry a second time
 
 Errors use docs/CONTRACT.md's taxonomy verbatim:
 `{"error":"access-denied"|"not-found"|"invalid"|"unsupported"|"internal",
@@ -90,6 +109,8 @@ Run modes:
                            no cross-namespace chown is needed)
     python3 secrets_agent.py --run-dir DIR      self-bind, 0700 dir / 0600 socket
     python3 secrets_agent.py --selfcheck        run this file's self-check
+    python3 secrets_agent.py --no-keep-open     refuse keep-open for every safe,
+                                                whatever any registry says
 
 stdlib only, plus `backends/base.py` for `harden_process`, `Secret`, `redact`
 and the error taxonomy. No pip. Python 3.9+ (developed on 3.14.4).
@@ -223,6 +244,11 @@ LIFETIME_CEILING_SECONDS = 86400
 #: number: every holding is a safe that is open while nobody watches, and a
 #: client that can ask for unbounded holdings can pin unbounded plaintext.
 MAX_HOLDINGS = 16
+
+#: How many ids one `policy` request may ask about. The helper asks once per
+#: access class with the ids it is already listing, so this is a registry's
+#: worth of safes and not a feed.
+MAX_POLICY_SAFES = 512
 #: Simultaneous connections. The clients are one Cockpit bridge's helpers.
 MAX_CONNECTIONS = 16
 #: A connection that has said nothing for this long is dropped. A client that
@@ -237,6 +263,21 @@ MAX_LINE_BYTES = 2 * 1024 * 1024
 #: The material one `put` may carry. Reuses the helper's key-file ceiling
 #: because that is the largest legitimate thing an unlock needs to remember.
 MAX_MATERIAL_BYTES = Limits.MAX_KEYFILE_BYTES
+
+#: WHERE THE DAEMON LOOKS FOR THE PER-SAFE `agent.allow_keep_open` OPT-IN.
+#: The same two directories `secrets-admin` reads, in the same order, because
+#: the two must not be able to disagree about what the operator wrote. The
+#: SYSTEM one is root-owned policy and wins; the per-user one is the caller's
+#: own and is consulted second. Neither is created here and nothing in either
+#: is used for anything but one boolean — see `RegistryPolicy`.
+DEFAULT_SYSTEM_REGISTRY = "/etc/cockpit-secrets/safes.d"
+USER_REGISTRY_REL = (".config", "cockpit-secrets", "safes.d")
+
+#: Bounds on that read. A registry is an operator's directory, not a feed, but
+#: the daemon that holds every passphrase this user has typed today is not the
+#: process to hand an unbounded `listdir` and an unbounded `read`.
+MAX_REGISTRY_FILES = 512
+MAX_REGISTRY_FILE_BYTES = 256 * 1024
 
 #: Handle tokens are the helper's 128-bit opaque tokens (docs/CONTRACT.md,
 #: "an opaque 128-bit random token"). The contract fixes the ENTROPY, not the
@@ -267,6 +308,13 @@ FREEZE_SLACK_SECONDS = 30.0
 #: How often the logind session state is polled. A poll, not a subscription —
 #: stated as such here and in the report, because the difference is real.
 SESSION_POLL_SECONDS = 10.0
+
+#: How often a LIVE suspension is re-checked against the registry that granted
+#: it. The opt-in is an operator decision that can be withdrawn, and a gate
+#: that only ran at the moment of the request is a gate that cannot be
+#: withdrawn — the suspension would outlive the permission for the rest of the
+#: holding's absolute lifetime. See `Agent.reconcile_keep_open`.
+POLICY_RECHECK_SECONDS = 15.0
 
 #: systemd's socket-activation contract: the first passed fd is always 3.
 SD_LISTEN_FDS_START = 3
@@ -355,6 +403,171 @@ def _note(msg):
 
 
 # ===========================================================================
+# registry policy — the one thing this daemon reads off the disk, and why
+# ===========================================================================
+
+class RegistryPolicy:
+    """Answers ONE question per safe id: may this safe suspend its idle timer?
+
+    **THE DAEMON IS THE AUTHORITY, NOT THE CALLER.** `keep_open` turns off the
+    only automatic defence the agent has against an operator who walks away, so
+    "is that permitted for this safe?" cannot be a field in the request that
+    asks for it. The registry is the operator's policy file — the same file the
+    access class, the timeouts and the read-only flag come from — and this class
+    is the daemon reading it for itself rather than trusting a client that has
+    already read it once.
+
+    **WHAT IT READS, AND WHAT IT REFUSES TO READ.** One boolean per id:
+    `agent.allow_keep_open`. `path`, `keyfile`, `export_dir` and every other
+    key in an entry are ignored by construction — the agent opens no safe, and
+    a daemon that started resolving paths out of the registry would be a daemon
+    with a reason to open one. It never writes, never creates a directory, and
+    never follows a symlink (`O_NOFOLLOW` on both the directory and the file,
+    `fstat` on the fd and never a second `stat` of the path — I5).
+
+    **IT FAILS CLOSED, AND THERE IS NO OTHER BRANCH.** No entry, no registry,
+    an unreadable directory, an unparsable file, a file some other uid can
+    write: every one of those answers "not allowed", with a reason that names
+    no path (I15). The one asymmetry worth stating out loud is that the shipped
+    USER unit sets `ProtectHome=yes`, so on a stock install this class cannot
+    see `~/.config/cockpit-secrets/safes.d` at all and a user-class safe simply
+    cannot turn keep-open on. `agent/systemd/secrets-agent.service.in` binds
+    that one directory back in read-only for exactly this reason; an
+    installation that has not is refused rather than guessed at.
+
+    **A SYSTEM ENTRY WINS.** Directories are consulted in order and the first
+    one holding the id decides, which is the rule `secrets-admin` applies to
+    the same two registries: a file the user can write must not be able to
+    overrule root's answer about the user's own safe.
+    """
+
+    def __init__(self, dirs, euid):
+        self.dirs = tuple(d for d in dirs if d)
+        self.euid = euid
+
+    # -- one entry file ----------------------------------------------------
+
+    def _read_entry(self, dirfd, name):
+        """The parsed JSON object in `name`, or None when it is not usable.
+
+        Opened relative to an already-validated directory fd, so the name is
+        never joined into a path this function then re-opens.
+        """
+        fd = None
+        try:
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+                         | os.O_NONBLOCK, dir_fd=dirfd)
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                return None
+            if st.st_size > MAX_REGISTRY_FILE_BYTES:
+                return None
+            # A registry file another uid may write is a registry file that
+            # names its own policy. Refused rather than read.
+            if st.st_uid not in (0, self.euid):
+                return None
+            if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+                return None
+            data = os.read(fd, MAX_REGISTRY_FILE_BYTES + 1)
+        except OSError:
+            return None
+        finally:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+        if len(data) > MAX_REGISTRY_FILE_BYTES:
+            return None
+        try:
+            doc = json.loads(data.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError, RecursionError):
+            # An entry this daemon cannot parse is an entry that grants
+            # nothing. `secrets-admin` reports the same file as a registry
+            # error, which is where an operator finds out why.
+            return None
+        return doc if isinstance(doc, dict) else None
+
+    # -- one directory -----------------------------------------------------
+
+    def _scan_dir(self, path, safe):
+        """(True/False, reason) when `path` holds `safe`; (None, reason) else."""
+        dfd = None
+        try:
+            dfd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+                          | os.O_CLOEXEC)
+            st = os.fstat(dfd)
+            if not stat.S_ISDIR(st.st_mode):
+                return None, "a registry root is not a directory"
+            if st.st_uid not in (0, self.euid):
+                return None, "a registry root is owned by another user"
+            if st.st_mode & stat.S_IWOTH:
+                return None, "a registry root is world-writable"
+            names = sorted(n for n in os.listdir(dfd)
+                           if n.endswith(".json"))[:MAX_REGISTRY_FILES]
+            found = None
+            for name in names:      # lexically LAST wins, as the helper does
+                doc = self._read_entry(dfd, name)
+                if doc is None or doc.get("id") != safe:
+                    continue
+                cfg = doc.get("agent")
+                cfg = cfg if isinstance(cfg, dict) else {}
+                found = (cfg.get("allow_keep_open") is True
+                         and cfg.get("enabled") is True)
+            if found is None:
+                return None, "no entry for this safe in that registry"
+            if found:
+                return True, ""
+            return False, ("the registry entry does not set both "
+                           "agent.enabled and agent.allow_keep_open")
+        except OSError:
+            return None, "a registry root could not be read"
+        finally:
+            if dfd is not None:
+                try:
+                    os.close(dfd)
+                except OSError:
+                    pass
+
+    # -- the answer --------------------------------------------------------
+
+    def allows_keep_open(self, safe):
+        """(True, "") when the operator opted this safe in; (False, why) else."""
+        if not self.dirs:
+            return False, "this agent has no registry to consult"
+        why = "no registry entry for this safe"
+        for path in self.dirs:
+            verdict, reason = self._scan_dir(path, safe)
+            if verdict is True:
+                return True, ""
+            if verdict is False:
+                return False, reason        # a system entry ends the search
+            if reason:
+                why = reason
+        return False, why
+
+
+def default_registry_dirs():
+    """The two directories `RegistryPolicy` consults when none were named.
+
+    `COCKPIT_SECRETS_ETC` and `COCKPIT_SECRETS_HOME` are honoured because
+    `secrets-admin` honours them and the two must read the same registry —
+    without them the integration suite would be testing this daemon against
+    the operator's REAL registry, which is worse than a seam. They are read
+    from THIS PROCESS's environment, which systemd (or whoever started the
+    agent) set; a client on the socket cannot reach it.
+    """
+    etc = os.environ.get("COCKPIT_SECRETS_ETC")
+    system = (os.path.join(etc, "safes.d") if etc and os.path.isabs(etc)
+              else DEFAULT_SYSTEM_REGISTRY)
+    home = os.environ.get("COCKPIT_SECRETS_HOME") or os.path.expanduser("~")
+    dirs = [system]
+    if home and os.path.isabs(home):
+        dirs.append(os.path.join(home, *USER_REGISTRY_REL))
+    return dirs
+
+
+# ===========================================================================
 # Holding — one unlocked safe's material, with its two deadlines
 # ===========================================================================
 
@@ -375,9 +588,10 @@ class Holding:
     """
 
     __slots__ = ("_token", "safe", "uid", "material", "created", "last_used",
-                 "idle_seconds", "max_seconds")
+                 "idle_seconds", "max_seconds", "keep_open")
 
-    def __init__(self, token, safe, uid, material, idle_seconds, max_seconds):
+    def __init__(self, token, safe, uid, material, idle_seconds, max_seconds,
+                 keep_open=False):
         # bytearray(str) needs an encoding; the token is ASCII hex by
         # construction (_TOKEN_RE), so this cannot be lossy.
         self._token = bytearray(token.encode("ascii"))
@@ -388,6 +602,10 @@ class Holding:
         self.last_used = self.created
         self.idle_seconds = idle_seconds
         self.max_seconds = max_seconds
+        #: The IDLE timer is suspended for this holding. `max_seconds` is not
+        #: affected and cannot be: see `expires_in`. Set only through
+        #: `Agent._require_keep_open_allowed`, which reads the registry.
+        self.keep_open = bool(keep_open)
 
     # -- identity ----------------------------------------------------------
 
@@ -415,12 +633,29 @@ class Holding:
         self.last_used = now()
 
     def expires_in(self, at=None):
-        """Seconds until this holding dies, whichever deadline comes first."""
+        """Seconds until this holding dies, whichever deadline comes first.
+
+        With `keep_open` the idle deadline is not one of the candidates — that
+        is the whole of what the flag does. **The absolute deadline is still
+        here, still counted from `created`, and still the value nothing can
+        move**, so a suspended holding is bounded by `max_seconds` exactly as a
+        normal one is and "keep it open" can never mean "keep it open forever".
+        """
         at = now() if at is None else at
-        return min(self.created + self.max_seconds,
-                   self.last_used + self.idle_seconds) - at
+        absolute = self.created + self.max_seconds
+        if self.keep_open:
+            return absolute - at
+        return min(absolute, self.last_used + self.idle_seconds) - at
 
     def idle_expires_in(self, at=None):
+        """Seconds until the IDLE deadline, or None while it is suspended.
+
+        None rather than a large number: a caller must be able to tell "there
+        is no idle deadline running" from "there is one, and it is far away",
+        and a number is exactly what a UI would draw a countdown from.
+        """
+        if self.keep_open:
+            return None
         at = now() if at is None else at
         return self.last_used + self.idle_seconds - at
 
@@ -467,7 +702,8 @@ class Agent:
     """
 
     def __init__(self, owner_uid, *, idle_seconds=DEFAULT_IDLE_SECONDS,
-                 max_seconds=DEFAULT_MAX_SECONDS, allow_peer_uids=()):
+                 max_seconds=DEFAULT_MAX_SECONDS, allow_peer_uids=(),
+                 keep_open_available=True, policy=None):
         self.owner_uid = owner_uid
         self.idle_seconds = idle_seconds
         self.max_seconds = max_seconds
@@ -476,6 +712,13 @@ class Agent:
         #: reach anyone else's, because `owned_by()` compares the creating uid
         #: and has no exception in it. Empty by default.
         self.allow_peer_uids = frozenset(allow_peer_uids)
+        #: Whether this agent will honour `keep_open` AT ALL. A ceiling, never
+        #: a floor: `--no-keep-open` refuses every request whatever a registry
+        #: says, and nothing turns it back on over the wire.
+        self.keep_open_available = bool(keep_open_available)
+        #: The registry this daemon consults for `agent.allow_keep_open`. Never
+        #: consulted for anything else, and never for a path.
+        self.policy = policy or RegistryPolicy((), owner_uid)
         self.holdings = []           # list, not dict: scanned in fixed order
         #: Filled in by main() once the socket and the watcher exist, so
         #: `status` can tell an operator what the agent thinks its own socket
@@ -483,6 +726,11 @@ class Agent:
         #: safe, so it is not gated on ownership.
         self.socket_facts = {}
         self.watcher = None
+        #: How often `reconcile_keep_open` re-reads the registry for a LIVE
+        #: suspension. An attribute rather than the constant so a test can set
+        #: it to 0 and measure the revocation instead of waiting for it.
+        self.policy_recheck = POLICY_RECHECK_SECONDS
+        self._last_reconcile = 0.0
 
     # -- admission ---------------------------------------------------------
 
@@ -516,6 +764,26 @@ class Agent:
 
     # -- expiry ------------------------------------------------------------
 
+    def refresh(self, at=None, force=False):
+        """Reconcile live suspensions against the registry, THEN sweep.
+
+        In that order, and it is the only order: a suspension the operator has
+        just stopped allowing has to be gone before the deadlines are read, so
+        that the very same pass applies the idle timer it was hiding.
+
+        It is a separate function from `sweep` because `sweep` is one of the
+        four the standing bans hold to a rule — it, `drop_all`,
+        `_check_session` and `_check_freeze` must not so much as MENTION
+        `keep_open`, because the day one of them grows a branch that spares a
+        suspended holding is the day a toggle starts outliving a locked screen.
+        Reconciliation is the opposite operation — it takes suspensions AWAY —
+        and it earns its own name rather than an exemption inside a function
+        that is not allowed to have one.
+        """
+        at = now() if at is None else at
+        self.reconcile_keep_open(at, force=force)
+        return self.sweep(at)
+
     def sweep(self, at=None):
         """Drop and zero everything whose deadline has passed. Returns how many.
 
@@ -534,6 +802,54 @@ class Agent:
                 dropped += 1
         return dropped
 
+    def reconcile_keep_open(self, at=None, force=False):
+        """Re-read the registry for every LIVE suspension and end the ones it
+        no longer allows. Returns how many were ended.
+
+        **THE OPT-IN IS WITHDRAWABLE, AND THIS IS WHAT MAKES IT SO.** Without
+        this, `agent.allow_keep_open: false` only stopped the NEXT request: a
+        holding suspended a minute earlier kept its suspension for the rest of
+        its absolute lifetime, so an operator who revoked the permission —
+        which is the one action they have when they decide a safe should not be
+        held open — changed nothing about the safe that was actually being held
+        open. A gate that runs only at the moment of the request is a gate that
+        cannot be withdrawn.
+
+        **THE IDLE TIMER COMES BACK UNTOUCHED, AND THAT IS DELIBERATE.**
+        `last_used` is not reset here. A holding that has been suspended and
+        idle for an hour therefore has an idle deadline an hour in the past and
+        is dropped by the same sweep, which is the honest outcome: the timer
+        that would have locked it is being re-imposed, and it had already
+        elapsed. A holding that is actually being used has a fresh `last_used`
+        and survives, which is equally honest. Touching it here would hand a
+        revoked suspension one last free idle window.
+
+        Throttled to `policy_recheck` because it reads files; `force` is for
+        the ops that must not answer out of a stale read.
+        """
+        at = now() if at is None else at
+        live = [h for h in self.holdings if h.keep_open]
+        if not live:
+            return 0
+        if not force and (at - self._last_reconcile) < self.policy_recheck:
+            return 0
+        self._last_reconcile = at
+        ended = 0
+        for h in live:
+            if self.keep_open_available:
+                allowed, why = self.policy.allows_keep_open(h.safe)
+                if allowed:
+                    continue
+            else:
+                why = "disabled on this agent"
+            h.keep_open = False          # NO touch(): see the docstring
+            ended += 1
+            audit("keep-open", h.safe, h.uid, "revoked", why)
+        if ended:
+            _note("the registry no longer allows keep-open for %d holding(s); "
+                  "their idle timers are running again" % ended)
+        return ended
+
     def next_deadline(self, at=None):
         """Seconds until the earliest expiry, or None when nothing is held."""
         at = now() if at is None else at
@@ -550,6 +866,34 @@ class Agent:
             h.zero()
         self.holdings = []
         return n
+
+    # -- the keep-open gate ------------------------------------------------
+
+    def _require_keep_open_allowed(self, safe, uid):
+        """Refuse unless the REGISTRY says this safe may suspend its idle timer.
+
+        Two gates, in this order, and the caller is not consulted by either:
+
+          1. `--no-keep-open` — an operator-set ceiling on this whole daemon.
+          2. `agent.allow_keep_open` on the safe's own registry entry, read by
+             `RegistryPolicy` off the disk. Absent, unreadable or false all
+             answer the same way: no.
+
+        `access-denied` rather than `unsupported`, because the request is
+        perfectly well formed and the answer will change the moment the
+        operator edits their registry — and rather than `invalid`, which reads
+        as "you typed that wrong". The audit line names the safe, the uid and
+        the outcome and nothing else: no path, no registry file name, no value
+        (I15).
+        """
+        if not self.keep_open_available:
+            audit("keep-open", safe, uid, "denied", "disabled on this agent")
+            raise AccessDenied("this agent does not offer keep-open")
+        allowed, why = self.policy.allows_keep_open(safe)
+        if not allowed:
+            audit("keep-open", safe, uid, "denied", why)
+            raise AccessDenied("the registry does not allow keep-open for this "
+                               "safe (%s)" % why)
 
     # -- operations --------------------------------------------------------
 
@@ -579,13 +923,20 @@ class Agent:
         buying the half that is about not being asked again. The two halves were
         always separable; only one of them weakens anything.
         """
-        self.sweep()
+        self.refresh(force=True)
         safe = _require_safe_id(req.get("safe"))
         token = _require_token(req.get("handle"), allow_none=True)
         material = _decode_material(req.get("material"), allow_none=True)
         try:
             idle = _clamp_shorter(req.get("idle_seconds"), self.idle_seconds)
             lifetime = _clamp_shorter(req.get("max_seconds"), self.max_seconds)
+            # ABSENT means "leave it as it is", which matters for a re-put:
+            # `secrets-admin` never sends this field, and a re-put that
+            # silently cleared a suspension the operator had asked for would
+            # be a toggle that turns itself off. False still means false.
+            keep = req.get("keep_open")
+            if keep is not None and not isinstance(keep, bool):
+                raise Invalid("keep_open is not a boolean")
             if token is None:
                 # No token offered: mint one. `Secret.random` is
                 # `secrets.token_bytes`, never `random` — this token is what
@@ -600,6 +951,36 @@ class Agent:
             for h in self.holdings:
                 if h.owned_by(uid, token.encode("ascii")):
                     existing = h
+
+            # ================================================================
+            # THE KEEP-OPEN GATE, ON THE SAFE THIS HOLDING WILL *HAVE*.
+            #
+            # It used to sit above, keyed on `req["safe"]` and run only when
+            # the request said `keep_open: true`. Both halves were wrong, and
+            # together they were a three-message bypass of the registry:
+            #
+            #   put {safe: denied}                      -> a handle
+            #   put {handle, safe: allowed, keep_open}  -> gate passes on the
+            #                                              ALLOWED id
+            #   put {handle, safe: denied}              -> `keep` is absent, so
+            #                                              "leave it as it is"
+            #                                              carried the
+            #                                              suspension back onto
+            #                                              the DENIED safe
+            #
+            # `existing` is found by HANDLE, so the third message relabels the
+            # holding and the gate never runs. The fix is to stop asking about
+            # the request and ask about the holding: compute what `keep_open`
+            # will actually BE — the request's value, or the one being carried
+            # forward — and gate that against the safe the holding will carry
+            # after the relabel. Nothing has been mutated yet when this raises.
+            # ================================================================
+            effective_keep = (keep if keep is not None
+                              else (bool(existing.keep_open)
+                                    if existing is not None else False))
+            if effective_keep:
+                self._require_keep_open_allowed(safe, uid)
+
             if existing is not None:
                 # Replace the material, keep the absolute deadline. A
                 # ticket-only re-put over a material-carrying holding zeroes
@@ -613,13 +994,15 @@ class Agent:
                 existing.safe = safe
                 existing.idle_seconds = min(existing.idle_seconds, idle)
                 existing.max_seconds = min(existing.max_seconds, lifetime)
+                existing.keep_open = effective_keep
                 existing.touch()
                 held = existing
             else:
                 if len(self.holdings) >= MAX_HOLDINGS:
                     raise Invalid("this agent already holds the maximum of %d "
                                   "safes" % MAX_HOLDINGS)
-                held = Holding(token, safe, uid, material, idle, lifetime)
+                held = Holding(token, safe, uid, material, idle, lifetime,
+                               effective_keep)
                 material = None                 # the Holding owns it now
                 self.holdings.append(held)
         finally:
@@ -633,13 +1016,15 @@ class Agent:
         # once existed" are very different facts to read off a log six months
         # later. It is a shape, not a value (I15).
         audit("put", safe, uid, "ok",
-              "idle=%d max=%d %s" % (held.idle_seconds, held.max_seconds,
-                                     "material" if held.material is not None
-                                     else "ticket-only"))
+              "idle=%d max=%d %s%s" % (held.idle_seconds, held.max_seconds,
+                                       "material" if held.material is not None
+                                       else "ticket-only",
+                                       " keep-open" if held.keep_open else ""))
         return {"ok": True, "handle": held.token_str(), "safe": held.safe,
                 "expires_in": int(held.expires_in()),
                 "idle_seconds": held.idle_seconds,
                 "max_seconds": held.max_seconds,
+                "keep_open": held.keep_open,
                 "material_held": held.material is not None}
 
     def op_get(self, uid, req):
@@ -656,8 +1041,9 @@ class Agent:
         h.touch()               # `get` is use; the idle timer restarts here
         out = {"ok": True, "safe": h.safe,
                "material_held": h.material is not None,
+               "keep_open": h.keep_open,
                "expires_in": int(h.expires_in()),
-               "idle_expires_in": int(h.idle_expires_in())}
+               "idle_expires_in": _maybe_int(h.idle_expires_in())}
         if h.material is not None:
             # b64encode makes an immutable copy the GC owns and `zero()` cannot
             # reach, and json.dumps makes another as a str. Unavoidable on the
@@ -701,6 +1087,135 @@ class Agent:
             h.zero()
         return {"ok": True, "dropped": len(holdings)}
 
+    def op_keep_open(self, uid, req):
+        """Suspend, or resume, the IDLE timer for this caller's holdings.
+
+        Two shapes, exactly as `drop` has two: a HANDLE names one holding, and
+        a bare SAFE names every holding this caller has for that safe. The
+        second is the one the page can send — `health` strips the token before
+        the browser sees it, so a banner has a safe id and nothing else. There
+        is no `{"all": true}` form, and there will not be one.
+
+        THE ABSOLUTE DEADLINE IS NOT TOUCHED BY THIS OPERATION AND CANNOT BE.
+        `max_seconds` still counts from the unlock, `expires_in` still reports
+        it, and a holding whose lifetime runs out while keep-open is on is
+        dropped by the same sweep as any other. "Keep it open" therefore means
+        "until the absolute deadline", never "until I say so" — that bound is
+        what makes this a bounded relaxation instead of a hole.
+
+        **Why the idle timer was the only one worth suspending.** The idle
+        timer is the one that fires in the middle of a task, and it is also the
+        one a client ALREADY controls: `get` is use, and use resets it, so a
+        caller holding the token could keep a holding alive indefinitely by
+        polling. This op is that same power made explicit, registry-gated,
+        audited and visible in `status` — strictly less dangerous than the loop
+        it replaces, because the loop was silent. The absolute deadline has
+        never been client-controllable and is not made so here.
+
+        **What is NOT suspended, and must never be.** Every presence signal
+        stays in force: `drop_all` on SIGTERM, on a logind session that locks
+        or ends (`Server._check_session`), on a tick gap that says the machine
+        was suspended (`Server._check_freeze`), and on the client's own `drop`
+        — which is what the page's Lock button, its `pagehide` handler and its
+        hidden-tab timer all reach. Those are not timeouts. They are "nobody is
+        here", and an agent that ignored them because a toggle was on would be
+        holding a safe open for a room with nobody in it. If you are here to
+        finish the job by making keep-open suppress those too: that is the
+        hazard, not the leftover.
+
+        Turning it OFF resets the idle timer rather than resuming it from a
+        `last_used` that may be an hour old. That is exactly what a `get` would
+        have done, so it grants nothing new — and the alternative would make
+        Off an alias for "lock immediately", which is a control this protocol
+        already has and calls `drop`.
+
+        **OFF IS GATED EXACTLY LIKE ON, AND ONLY RESETS WHAT IT REALLY
+        RESUMED.** It used to be neither. `{"enabled": false}` skipped
+        `_require_keep_open_allowed` entirely and still ran `touch()` on every
+        holding this uid had for the named safe — so an ungated, handle-free,
+        passphrase-free message reset the idle timer of any held safe,
+        including safes the registry had never opted into keep-open at all, and
+        a loop of them held any unlock open for its whole absolute lifetime.
+        That is the `get`-polling power without `get`'s handle.
+
+        Two changes close it, and both are needed. The registry gate now runs
+        for BOTH directions, so the message is refused on a safe that never
+        opted in. And the idle timer is reset only for a holding that was
+        ACTUALLY suspended — resuming nothing resets nothing, so even inside an
+        opted-in safe the off direction cannot be used as a keepalive.
+        """
+        self.refresh(force=True)
+        enabled = req.get("enabled")
+        if not isinstance(enabled, bool):
+            raise Invalid("enabled is missing or not a boolean")
+        if req.get("all") is not None:
+            # There is no "keep everything open". A control that suspends the
+            # idle timer on every safe at once is the property this project
+            # exists to avoid, wearing a convenience's clothes.
+            raise Invalid("keep-open names one safe or one handle, never all")
+
+        # BY SAFE, which is the form the page's banner can actually send: the
+        # helper that minted the handle exited with its verb, and `health`
+        # strips the token before the browser ever sees it. Same scoping rule
+        # as `drop`'s by-safe form — this caller's own holdings and no others.
+        if req.get("handle") is None:
+            safe = _require_safe_id(req.get("safe"))
+            self._require_keep_open_allowed(safe, uid)
+            mine = [h for h in self.holdings
+                    if h.uid == uid and h.safe == safe]
+        else:
+            token = _require_token(req.get("handle"))
+            one = self._find(uid, token)
+            # Re-derived here and NOT inherited from the `put` that created
+            # the holding: the operator may have revoked the opt-in since,
+            # and a gate that only runs once is a gate that runs at the
+            # wrong time (I3's rule, one layer down). Both directions, for the
+            # reason in the docstring.
+            self._require_keep_open_allowed(one.safe, uid)
+            safe, mine = one.safe, [one]
+
+        changed = 0
+        for h in mine:
+            was = h.keep_open
+            if was != enabled:
+                changed += 1
+            h.keep_open = enabled
+            # ONLY for a holding that really was suspended. `touch()` on a
+            # holding that was never suspended is a free idle window handed out
+            # by a message that carries no handle and no passphrase.
+            if not enabled and was:
+                h.touch()
+        # One line per holding, so a by-safe toggle over two holdings is two
+        # lines and not one summary somebody has to reconstruct.
+        for h in mine:
+            audit("keep-open", h.safe, uid, "ok",
+                  "enabled" if enabled else "disabled")
+        if not mine:
+            # A satisfied request that changed nothing, answered the way
+            # `drop` answers the same shape: not-found here would say which
+            # safes this agent is holding.
+            audit("keep-open", safe, uid, "ok", "nothing held")
+        soonest = min(mine, key=lambda h: h.expires_in()) if mine else None
+        return {"ok": True, "safe": safe, "keep_open": enabled,
+                "changed": changed, "affected": len(mine),
+                "expires_in": (int(soonest.expires_in())
+                               if soonest is not None else None),
+                "idle_expires_in": (_maybe_int(soonest.idle_expires_in())
+                                    if soonest is not None else None),
+                "idle_seconds": (soonest.idle_seconds
+                                 if soonest is not None else None),
+                "max_seconds": (soonest.max_seconds
+                                if soonest is not None else None)}
+
+    def _holding_row(self, h, at=None):
+        """One holding as `status` and `keep-open` both describe it."""
+        at = now() if at is None else at
+        return {"handle": h.token_str(), "safe": h.safe,
+                "age": int(at - h.created),
+                "keep_open": h.keep_open,
+                "expires_in": int(h.expires_in(at)),
+                "idle_expires_in": _maybe_int(h.idle_expires_in(at))}
+
     def op_status(self, uid, req):
         """What this caller is holding, and the agent's own settings.
 
@@ -714,19 +1229,23 @@ class Agent:
         one answer for "unknown" and "not yours": another uid's holdings are not
         this caller's business to enumerate.
         """
-        self.sweep()
+        self.refresh()
         at = now()
         mine = [h for h in self.holdings if h.uid == uid]
         return {"ok": True, "pid": os.getpid(), "owner_uid": self.owner_uid,
                 "version": VERSION, "clock": CLOCK_NAME,
                 "idle_seconds": self.idle_seconds,
                 "max_seconds": self.max_seconds,
-                "holdings": [{"handle": h.token_str(), "safe": h.safe,
-                              "age": int(at - h.created),
-                              "expires_in": int(h.expires_in(at)),
-                              "idle_expires_in": int(h.idle_expires_in(at))}
-                             for h in mine],
+                "holdings": [self._holding_row(h, at) for h in mine],
                 "holdings_total": len(self.holdings),
+                # So the state is inspectable without the page: whether this
+                # daemon offers keep-open at all, where it looks for the
+                # per-safe opt-in, and how many of the caller's holdings are
+                # currently running with the idle timer suspended.
+                "keep_open": {
+                    "available": self.keep_open_available,
+                    "registry_dirs": list(self.policy.dirs),
+                    "suspended": sum(1 for h in mine if h.keep_open)},
                 "socket": dict(self.socket_facts),
                 "session": {
                     "watched": bool(self.watcher and self.watcher.enabled),
@@ -734,7 +1253,43 @@ class Agent:
                     "poll_seconds": (self.watcher.interval
                                      if self.watcher else None)}}
 
-    OPS = {"put": op_put, "get": op_get, "drop": op_drop, "status": op_status}
+    def op_policy(self, uid, req):
+        """Answer, for the named safes, whether the REGISTRY allows keep-open.
+
+        **THIS OP EXISTS SO THERE IS ONE READER OF THAT REGISTRY KEY.** Before
+        it, `secrets-admin` read `agent.allow_keep_open` out of its own loaded
+        registry to decide whether to draw the toggle and whether to refuse the
+        verb, and this daemon read the same key off the disk for itself. Two
+        readers with two loaders, two sets of ownership rules and two shadowing
+        rules give two answers, and the operator is shown one and governed by
+        the other. The daemon is the authority — it is the process that
+        actually refuses — so the helper now ASKS instead of deciding, and
+        `RegistryPolicy` is the only code in the project that reads the key.
+
+        It discloses one boolean per id the caller already named, to a peer
+        that already passed `SO_PEERCRED`, and it touches no holding: it is the
+        policy read, made addressable, and nothing else. It does not say
+        whether a safe EXISTS — an id this registry has never heard of and one
+        it has heard of and refused both answer `false`, which is the same
+        flattening `_find` applies to handles.
+        """
+        safes = req.get("safes")
+        if not isinstance(safes, list) or not safes:
+            raise Invalid("policy names a list of safe ids")
+        if len(safes) > MAX_POLICY_SAFES:
+            raise Invalid("policy names at most %d safe ids"
+                          % MAX_POLICY_SAFES)
+        out = {}
+        for sid in safes:
+            out[_require_safe_id(sid)] = bool(
+                self.keep_open_available
+                and self.policy.allows_keep_open(sid)[0])
+        return {"ok": True, "available": self.keep_open_available,
+                "keep_open": out}
+
+    OPS = {"put": op_put, "get": op_get, "drop": op_drop,
+           "keep-open": op_keep_open, "status": op_status,
+           "policy": op_policy}
 
     def dispatch(self, uid, req):
         op = req.get("op")
@@ -790,6 +1345,13 @@ def _decode_material(value, *, allow_none=False):
         sec.zero()
         raise Invalid("material exceeds %d bytes" % MAX_MATERIAL_BYTES)
     return sec
+
+
+def _maybe_int(value):
+    """`int(value)`, or None for None. `idle_expires_in` returns None while the
+    idle timer is suspended, and `int(None)` is a TypeError in the one place
+    that must not raise."""
+    return None if value is None else int(value)
 
 
 def _clamp_shorter(requested, configured):
@@ -1227,7 +1789,7 @@ class Server:
         gap = at - self._last_tick
         self._last_tick = at
         self._check_freeze(gap)
-        self.agent.sweep(at)
+        self.agent.refresh(at)
         self._check_session()
         for conn in list(self.conns.values()):
             if not conn.buf and at - conn.opened > CONNECTION_IDLE_SECONDS:
@@ -1489,6 +2051,21 @@ def build_parser():
                         "holding another uid created. Use it for the "
                         "admin-class root helper, and read agent/README.md "
                         "first.")
+    p.add_argument("--registry-dir", metavar="DIR", action="append",
+                   default=[], dest="registry_dir",
+                   help="Where to look for the per-safe agent.allow_keep_open "
+                        "opt-in. Repeatable; the FIRST directory holding an id "
+                        "decides, so name the root-owned one first. Default: "
+                        "%s then ~/%s. Nothing else in a registry entry is "
+                        "read, and no file in one is ever opened for writing."
+                        % (DEFAULT_SYSTEM_REGISTRY,
+                           "/".join(USER_REGISTRY_REL)))
+    p.add_argument("--no-keep-open", action="store_true",
+                   help="Refuse keep-open for every safe, whatever the "
+                        "registry says. A ceiling on this daemon, not a "
+                        "default a client can lift: keep-open suspends the "
+                        "idle timeout, and the idle timeout is what locks a "
+                        "safe when the operator walks away.")
     p.add_argument("--no-session-watch", action="store_true",
                    help="Do not poll logind. Turns OFF locking when the screen "
                         "locks or the session ends; say why if you use it.")
@@ -1556,8 +2133,14 @@ def main(argv=None):
               "can create and read their OWN holdings only."
               % ",".join(str(u) for u in args.allow_peer_uid))
 
+    reg_dirs = args.registry_dir or default_registry_dirs()
+    policy = RegistryPolicy(reg_dirs, euid)
+    if args.no_keep_open:
+        _note("keep-open is disabled on this agent; every request for it will "
+              "be refused whatever a registry entry says.")
     agent = Agent(owner, idle_seconds=idle, max_seconds=lifetime,
-                  allow_peer_uids=args.allow_peer_uid)
+                  allow_peer_uids=args.allow_peer_uid,
+                  keep_open_available=not args.no_keep_open, policy=policy)
 
     bound_path = None
     if not listeners:
@@ -1587,6 +2170,9 @@ def main(argv=None):
           "pid=%d activated=%s idle=%d max=%d clock=%s mlockall=%s"
           % (os.getpid(), bound_path is None, idle, lifetime, CLOCK_NAME,
              report.get("mlockall")))
+    _note("keep-open %s; registry consulted for agent.allow_keep_open: %s"
+          % ("available (per-safe, registry-gated)" if agent.keep_open_available
+             else "DISABLED for every safe", ", ".join(reg_dirs) or "nothing"))
     _note("listening on %s (%s), owner uid %d, idle %ds, max %ds, session %s"
           % (facts["path"],
              "socket %s uid %s, dir %s uid %s"
@@ -1807,6 +2393,349 @@ def _selfcheck():                                           # noqa: C901
        ag.holdings[0].material is None)
     ok("the replaced material was zeroed", len(sec) == 0)
     ag.drop_all("selfcheck")
+
+    # ------------------------------------------------------- keep-open ----
+    #
+    # Every check here is a refusal or a bound. The one permissive case exists
+    # so the refusals are known to be refusals and not a feature that never
+    # works: a gate that has never been seen letting anything through is a
+    # gate nobody has tested either.
+    print("\n== keep-open is REFUSED unless the registry opts the safe in ==")
+    reg = tempfile.mkdtemp(prefix="secrets-agent-registry.")
+    try:
+        def write_entry(name, sid, enabled, allow):
+            cfg = {"enabled": enabled, "idle_seconds": 300,
+                   "max_seconds": 3600}
+            if allow is not None:
+                cfg["allow_keep_open"] = allow
+            body = {"id": sid, "label": sid, "format": "kdbx",
+                    "path": "/nonexistent/%s.kdbx" % sid, "agent": cfg}
+            path = os.path.join(reg, name)
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(body, fh)
+            os.chmod(path, 0o600)
+
+        write_entry("10-opted-in.json", "keeper", True, True)
+        write_entry("20-plain.json", "plain", True, False)
+        write_entry("30-absent.json", "silent", True, None)
+        write_entry("40-agent-off.json", "agentless", False, True)
+        os.chmod(reg, 0o700)
+        policy = RegistryPolicy([reg], me)
+
+        ok("an opted-in safe is allowed",
+           policy.allows_keep_open("keeper")[0] is True)
+        ok("allow_keep_open:false is refused",
+           policy.allows_keep_open("plain")[0] is False)
+        ok("an absent allow_keep_open is refused",
+           policy.allows_keep_open("silent")[0] is False)
+        ok("allow_keep_open without agent.enabled is refused",
+           policy.allows_keep_open("agentless")[0] is False)
+        ok("a safe with no entry at all is refused",
+           policy.allows_keep_open("never-registered")[0] is False)
+        ok("...and the reason names no path",
+           reg not in policy.allows_keep_open("never-registered")[1])
+        ok("an agent with no registry refuses everything",
+           RegistryPolicy([], me).allows_keep_open("keeper")[0] is False)
+
+        ag = Agent(me, idle_seconds=60, max_seconds=600, policy=policy)
+        raises("put with keep_open on a safe that did not opt in",
+               AccessDenied,
+               lambda: ag.op_put(me, {"safe": "plain", "handle": tok_a,
+                                      "keep_open": True}))
+        ok("...and nothing was held as a consolation prize",
+           not ag.holdings)
+        raises("a non-boolean keep_open is invalid, not access-denied", Invalid,
+               lambda: ag.op_put(me, {"safe": "keeper", "handle": tok_a,
+                                      "keep_open": "yes"}))
+
+        put = ag.op_put(me, {"safe": "keeper", "handle": tok_a,
+                             "keep_open": True})
+        ok("put with keep_open on an opted-in safe is accepted",
+           put["keep_open"] is True)
+        ok("...and put still reports the ABSOLUTE lifetime",
+           put["max_seconds"] == 600)
+
+        print("\n== keep-open suspends the IDLE timer and NOTHING else ==")
+        h = ag.holdings[0]
+        h.last_used -= 10000.0              # an hour past any idle deadline
+        ok("the idle deadline is long gone and the holding lives",
+           not h.expired() and ag.sweep() == 0)
+        ok("idle_expires_in is None, not a big number",
+           h.idle_expires_in() is None)
+        ok("get reports it as None over the wire",
+           ag.op_get(me, {"handle": tok_a})["idle_expires_in"] is None)
+        ok("...and says the holding is suspended",
+           ag.op_get(me, {"handle": tok_a})["keep_open"] is True)
+        row = ag.op_status(me, {})["holdings"][0]
+        ok("status reports keep_open per holding", row["keep_open"] is True)
+        ok("...and counts the suspended ones",
+           ag.op_status(me, {})["keep_open"]["suspended"] == 1)
+
+        # THE BOUND. The absolute deadline is the reason this is a relaxation
+        # and not a hole, so it is checked from both sides: it still fires,
+        # and no client can push it out.
+        h.created -= 10000.0
+        ok("the ABSOLUTE deadline still fires under keep-open", h.expired())
+        ok("...and the audit reason is 'absolute'",
+           h.why_expired() == "absolute")
+        ok("...and sweep really drops it", ag.sweep() == 1 and not ag.holdings)
+
+        put = ag.op_put(me, {"safe": "keeper", "handle": tok_a,
+                             "keep_open": True, "max_seconds": 999999})
+        ok("a client asking for a longer lifetime is still clamped",
+           put["max_seconds"] == 600)
+        born = ag.holdings[0].created
+        ag.holdings[0].created -= 300.0
+        ag.op_put(me, {"safe": "keeper", "handle": tok_a, "keep_open": True})
+        ok("re-putting under keep-open keeps the original birth time",
+           ag.holdings[0].created < born)
+        ok("a re-put with no keep_open key leaves the suspension alone",
+           ag.op_put(me, {"safe": "keeper", "handle": tok_a})["keep_open"]
+           is True)
+
+        print("\n== the keep-open op: ownership, the toggle, and the refusals ==")
+        raises("another uid cannot turn it on", AccessDenied,
+               lambda: ag.op_keep_open(me + 1, {"handle": tok_a,
+                                                "enabled": True}))
+        raises("...nor off", AccessDenied,
+               lambda: ag.op_keep_open(me + 1, {"handle": tok_a,
+                                                "enabled": False}))
+        raises("an unknown handle is the SAME access-denied", AccessDenied,
+               lambda: ag.op_keep_open(me, {"handle": tok_b,
+                                            "enabled": True}))
+        raises("a missing 'enabled' is invalid", Invalid,
+               lambda: ag.op_keep_open(me, {"handle": tok_a}))
+        off = ag.op_keep_open(me, {"handle": tok_a, "enabled": False})
+        ok("turning it off resumes the idle timer from now",
+           off["keep_open"] is False and off["idle_expires_in"] > 0)
+        ok("...and says it changed something", off["changed"] == 1)
+        ok("turning it off twice changes nothing",
+           ag.op_keep_open(me, {"handle": tok_a,
+                                "enabled": False})["changed"] == 0)
+        on = ag.op_keep_open(me, {"handle": tok_a, "enabled": True})
+        ok("turning it back on suspends the idle timer again",
+           on["keep_open"] is True and on["idle_expires_in"] is None)
+        ok("...and never reports a longer absolute lifetime than the cap",
+           on["expires_in"] <= 600)
+
+        # THE FORM THE BANNER SENDS: a safe id and no handle, because the
+        # helper that minted the token exited with its verb.
+        raises("a by-safe keep-open on a safe that did not opt in is refused",
+               AccessDenied,
+               lambda: ag.op_keep_open(me, {"safe": "plain",
+                                            "enabled": True}))
+        bysafe = ag.op_keep_open(me, {"safe": "keeper", "enabled": False})
+        ok("a by-safe keep-open reaches the holding with no handle",
+           bysafe["affected"] == 1 and bysafe["keep_open"] is False)
+        ok("...and another uid's by-safe keep-open touches nothing",
+           ag.op_keep_open(me + 1, {"safe": "keeper",
+                                    "enabled": False})["affected"] == 0
+           and len(ag.holdings) == 1)
+        ok("a by-safe keep-open for a safe that is not held is 0, not "
+           "not-found",
+           ag.op_keep_open(me, {"safe": "keeper",
+                                "enabled": False})["affected"] == 1)
+        raises("there is no keep-everything-open form", Invalid,
+               lambda: ag.op_keep_open(me, {"all": True, "enabled": True}))
+        ag.drop_all("selfcheck")
+
+        # A holding created BEFORE the opt-in was withdrawn must not keep the
+        # permission it was born with: the gate is re-derived on every verb
+        # (I3), including this one.
+        ag.op_put(me, {"safe": "plain", "handle": tok_a})
+        raises("keep-open on an existing holding for a safe that never opted "
+               "in is refused", AccessDenied,
+               lambda: ag.op_keep_open(me, {"handle": tok_a,
+                                            "enabled": True}))
+        ag.drop_all("selfcheck")
+
+        # ==================================================================
+        # REGRESSION: THE THREE-MESSAGE RELABEL BYPASS OF THE REGISTRY GATE
+        #
+        # `op_put` used to evaluate the gate against the safe id in the
+        # REQUEST, while `existing` was found by HANDLE — so a re-put could
+        # relabel a holding onto another safe, and the "absent keep_open means
+        # leave it as it is" rule then carried the suspension onto a safe the
+        # registry refuses. Three messages, no passphrase, no new handle:
+        #
+        #   put {safe: plain}                       -> a handle on a DENIED safe
+        #   put {handle, safe: keeper, keep_open}   -> gated on the ALLOWED id
+        #   put {handle, safe: plain}               -> the suspension rides back
+        #
+        # Revert the gate in `op_put` to `if keep is True:` on `safe` and the
+        # last `ok()` below fails: the holding comes back labelled `plain`
+        # with `keep_open` true, and the skeptic's measurement — alive twelve
+        # seconds into a five-second idle window — follows from it.
+        # ==================================================================
+        print("\n== keep-open cannot be relabelled onto a refused safe ==")
+        ag.drop_all("selfcheck")
+        ag.op_put(me, {"safe": "plain", "handle": tok_a})
+        ag.op_put(me, {"safe": "keeper", "handle": tok_a, "keep_open": True})
+        ok("a relabel onto an allowed safe may suspend",
+           ag.holdings[0].keep_open is True
+           and ag.holdings[0].safe == "keeper")
+        raises("...and the relabel BACK onto a refused safe is refused, "
+               "even though the request carries no keep_open at all",
+               AccessDenied,
+               lambda: ag.op_put(me, {"safe": "plain", "handle": tok_a}))
+        ok("...leaving the holding on the safe that was allowed to suspend it",
+           len(ag.holdings) == 1 and ag.holdings[0].safe == "keeper"
+           and ag.holdings[0].keep_open is True)
+        # The same, one message shorter: a first `put` naming the denied safe
+        # with the flag set was already refused, and still is.
+        ag.drop_all("selfcheck")
+        raises("a direct put of keep_open onto a refused safe is still refused",
+               AccessDenied,
+               lambda: ag.op_put(me, {"safe": "plain", "handle": tok_a,
+                                      "keep_open": True}))
+
+        # ==================================================================
+        # REGRESSION: `{"enabled": false}` WAS AN UNGATED IDLE-TIMER RESET
+        #
+        # No registry opt-in, no handle, no passphrase — and it ran `touch()`
+        # on every holding this uid had for the named safe. Two guarantees
+        # replace it, and each has its own check: the gate refuses the message
+        # on a safe that never opted in, and even where it IS allowed the
+        # reset only happens for a holding that was really suspended.
+        #
+        # Revert either half — drop the `self._require_keep_open_allowed` call
+        # from the by-safe branch, or change `if not enabled and was:` back to
+        # `if not enabled:` — and the matching check below fails.
+        # ==================================================================
+        print("\n== the OFF direction is gated, and resets nothing it did "
+              "not resume ==")
+        ag.drop_all("selfcheck")
+        ag.op_put(me, {"safe": "plain", "handle": tok_a})
+        raises("off is refused on a safe that never opted in — by safe id",
+               AccessDenied,
+               lambda: ag.op_keep_open(me, {"safe": "plain",
+                                            "enabled": False}))
+        raises("...and by handle", AccessDenied,
+               lambda: ag.op_keep_open(me, {"handle": tok_a,
+                                            "enabled": False}))
+        stale = ag.holdings[0]
+        stale.last_used -= 30.0
+        was_last_used = stale.last_used
+        ok("...and the refused message moved no idle deadline",
+           ag.holdings[0].last_used == was_last_used)
+
+        ag.drop_all("selfcheck")
+        ag.op_put(me, {"safe": "keeper", "handle": tok_a})   # NOT suspended
+        ag.holdings[0].last_used -= 30.0
+        before = ag.holdings[0].last_used
+        off = ag.op_keep_open(me, {"safe": "keeper", "enabled": False})
+        ok("off on an allowed-but-unsuspended holding changes nothing",
+           off["changed"] == 0 and off["affected"] == 1)
+        ok("...and does NOT reset its idle timer",
+           ag.holdings[0].last_used == before)
+        ag.op_keep_open(me, {"safe": "keeper", "enabled": True})
+        ag.holdings[0].last_used -= 30.0
+        off = ag.op_keep_open(me, {"safe": "keeper", "enabled": False})
+        ok("off on a holding that really was suspended resumes it",
+           off["changed"] == 1 and off["keep_open"] is False)
+        ok("...and DOES reset the idle timer it just re-imposed",
+           ag.holdings[0].last_used > before)
+
+        # ==================================================================
+        # REGRESSION: REVOKING THE OPT-IN MUST REACH A LIVE SUSPENSION
+        #
+        # The gate used to run only when a request asked for something, so a
+        # holding suspended before the operator edited their registry kept the
+        # suspension for the rest of its absolute lifetime. Delete the
+        # `reconcile_keep_open` call from `sweep` and the two checks below
+        # fail: the holding stays suspended and stays alive.
+        # ==================================================================
+        print("\n== revoking allow_keep_open ends a LIVE suspension ==")
+        ag.drop_all("selfcheck")
+        ag.policy_recheck = 0.0
+        ag.op_put(me, {"safe": "keeper", "handle": tok_a, "keep_open": True})
+        ag.holdings[0].last_used -= 10000.0        # far past any idle deadline
+        ok("it is suspended and alive with its idle deadline long gone",
+           ag.holdings[0].keep_open is True and not ag.holdings[0].expired())
+        write_entry("10-opted-in.json", "keeper", True, False)   # revoked
+        ag.refresh(force=True)
+        ok("the withdrawn opt-in ended the suspension and the idle timer that "
+           "came back took the holding with it", not ag.holdings)
+        write_entry("10-opted-in.json", "keeper", True, True)    # restored
+
+        # A holding that is actually being USED survives the same revocation:
+        # the idle timer is re-imposed, not fired.
+        ag.op_put(me, {"safe": "keeper", "handle": tok_a, "keep_open": True})
+        write_entry("10-opted-in.json", "keeper", True, False)
+        ag.refresh(force=True)
+        ok("a freshly used holding survives the revocation, with its idle "
+           "timer running again",
+           len(ag.holdings) == 1 and ag.holdings[0].keep_open is False
+           and isinstance(ag.holdings[0].idle_expires_in(), float))
+        write_entry("10-opted-in.json", "keeper", True, True)
+        ag.drop_all("selfcheck")
+        ag.policy_recheck = POLICY_RECHECK_SECONDS
+
+        # ==================================================================
+        # ONE READER. `policy` is how `secrets-admin` stops reading
+        # `agent.allow_keep_open` for itself and asks the process that
+        # actually refuses.
+        # ==================================================================
+        print("\n== the policy op: one reader for allow_keep_open ==")
+        pol = ag.op_policy(me, {"safes": ["keeper", "plain", "silent",
+                                          "never-registered"]})
+        ok("it answers the same verdicts RegistryPolicy gives",
+           pol["keep_open"] == {"keeper": True, "plain": False,
+                                "silent": False, "never-registered": False})
+        ok("...and says whether this daemon offers the feature at all",
+           pol["available"] is True)
+        ok("a --no-keep-open daemon answers false for an opted-in safe",
+           Agent(me, policy=policy, keep_open_available=False)
+           .op_policy(me, {"safes": ["keeper"]})["keep_open"]["keeper"]
+           is False)
+        raises("policy names a list, not a safe", Invalid,
+               lambda: ag.op_policy(me, {"safe": "keeper"}))
+        raises("...and the list is bounded", Invalid,
+               lambda: ag.op_policy(me, {"safes": ["keeper"]
+                                         * (MAX_POLICY_SAFES + 1)}))
+        ok("policy holds nothing and drops nothing", not ag.holdings)
+
+        print("\n== --no-keep-open is a ceiling no registry can lift ==")
+        deaf = Agent(me, policy=policy, keep_open_available=False)
+        raises("put with keep_open is refused", AccessDenied,
+               lambda: deaf.op_put(me, {"safe": "keeper", "handle": tok_a,
+                                        "keep_open": True}))
+        deaf.op_put(me, {"safe": "keeper", "handle": tok_a})
+        raises("...and so is the op", AccessDenied,
+               lambda: deaf.op_keep_open(me, {"handle": tok_a,
+                                              "enabled": True}))
+        ok("status says the daemon does not offer it",
+           deaf.op_status(me, {})["keep_open"]["available"] is False)
+        # THE CONTRACT CHANGED HERE, DELIBERATELY. Off used to be ungated —
+        # "it only ever reduces privilege, so let it through" — and that made
+        # it an ungated, handle-free idle-timer RESET on any held safe,
+        # including safes no registry ever opted in. It is now refused by the
+        # same gate as On. Nothing is lost: on this daemon nothing can be
+        # suspended in the first place, and `reconcile_keep_open` is what ends
+        # a suspension the policy stops allowing — not the client.
+        raises("turning it OFF is refused by the same ceiling", AccessDenied,
+               lambda: deaf.op_keep_open(me, {"handle": tok_a,
+                                              "enabled": False}))
+        ok("...and nothing was suspended for it to have resumed",
+           deaf.op_status(me, {})["keep_open"]["suspended"] == 0)
+        deaf.drop_all("selfcheck")
+
+        print("\n== a registry file another uid could write is not read ==")
+        loose = os.path.join(reg, "50-loose.json")
+        write_entry("50-loose.json", "loose", True, True)
+        os.chmod(loose, 0o666)
+        ok("a group/world-writable entry grants nothing",
+           policy.allows_keep_open("loose")[0] is False)
+        os.chmod(loose, 0o600)
+        ok("...and the same file at 0600 does",
+           policy.allows_keep_open("loose")[0] is True)
+        with open(os.path.join(reg, "60-broken.json"), "w") as fh:
+            fh.write("{not json")
+        os.chmod(os.path.join(reg, "60-broken.json"), 0o600)
+        ok("an unparsable file does not stop the readable ones",
+           policy.allows_keep_open("keeper")[0] is True)
+    finally:
+        shutil.rmtree(reg, ignore_errors=True)
 
     print("\n== drop by safe, which is what `lock` sends ==")
     ag = Agent(me)

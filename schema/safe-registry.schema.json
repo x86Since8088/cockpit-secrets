@@ -108,7 +108,7 @@
     },
 
     "agent": {
-      "$comment": "The opt-in unlock agent (I18) -- an unlocked safe held behind an AF_UNIX socket so several operations share one passphrase prompt. OFF BY DEFAULT AND IT SHOULD USUALLY STAY OFF: enabling it recreates exactly the property this project exists to avoid, a safe that is open when nobody is looking at it. When on, the handle is bound by SO_PEERCRED to the uid that created it, and both timeouts are enforced by the agent and cannot be extended past 'max_seconds' by any client. Setting idle_seconds high is the mistake that matters: it is the window in which a stolen session reads the safe without knowing the passphrase.",
+      "$comment": "The opt-in unlock agent (I18) -- an unlocked safe held behind an AF_UNIX socket so several operations share one passphrase prompt. OFF BY DEFAULT AND IT SHOULD USUALLY STAY OFF: enabling it recreates exactly the property this project exists to avoid, a safe that is open when nobody is looking at it. When on, the handle is bound by SO_PEERCRED to the uid that created it, and both timeouts are enforced by the agent and cannot be extended past 'max_seconds' by any client. Setting idle_seconds high is the mistake that matters: it is the window in which a stolen session reads the safe without knowing the passphrase, and 'allow_keep_open' is the same mistake with no number on it at all -- read that key's comment before you set it.",
       "type": "object",
       "additionalProperties": false,
       "properties": {
@@ -125,14 +125,19 @@
           "default": 300
         },
         "max_seconds": {
-          "$comment": "Absolute lifetime, counted from the unlock and not extendable by any amount of activity. Must be >= idle_seconds to mean anything; JSON Schema cannot compare two fields, so the helper re-checks that and drops the entry if it is inverted.",
+          "$comment": "Absolute lifetime, counted from the unlock and not extendable by any amount of activity. Must be >= idle_seconds to mean anything; JSON Schema cannot compare two fields, so the helper re-checks that and drops the entry if it is inverted. THIS IS THE ONLY BOUND LEFT when 'allow_keep_open' is true and the operator has switched keep-open on, so on such a safe it is not a backstop -- it is the whole lock.",
           "type": "integer",
           "minimum": 60,
           "maximum": 86400,
           "default": 3600
+        },
+        "allow_keep_open": {
+          "$comment": "WHETHER THE OPERATOR MAY SWITCH OFF THIS SAFE'S IDLE TIMEOUT WHILE THEY WORK. false is the default and is the answer for every safe nobody has deliberately reconsidered. What it costs, plainly: 'idle_seconds' is the timer that locks a safe when the person who unlocked it walks away, and this key permits a control that STOPS it -- so a safe with keep-open switched on stays unlocked for a desk nobody is sitting at, for as long as 'max_seconds' allows. What it does NOT cost, equally plainly: nothing here touches 'max_seconds', which still counts from the unlock and still cannot be extended by any client or by any toggle; the screen-lock, logout, suspend and Lock-button drops are untouched, because those are not timeouts but 'nobody is here'; and turning this key on grants nothing on its own -- it only makes a per-session toggle APPEAR, which the operator must then use, which is audited when they do, and which the banner announces for as long as it is on. It needs 'enabled' as well: without the agent there is no holder to suspend a timer in, and the helper refuses the request rather than pretending. THE DAEMON READS THIS KEY ITSELF, off this file, and refuses a request for a safe that does not set it -- a client that has already read the registry is not the authority on what the registry said. Set it on the safe you keep open while you work; do not set it on the one that matters most. AND THE SUSPENSION IS ONE SWITCH OVER A WHOLE HELPER SESSION, NOT ONE PER SAFE: the helper has a single idle timer per session and it ends the process that holds every unlock in it, so it may be suspended only while EVERY safe that session holds sets this key. For a release it was not, and 'false' here bought a safe nothing whenever any other safe in the same session set it to true. The helper now refuses the suspension outright in that situation and names the safe that blocked it, so the weakest safe in a session governs -- which means an operator who cannot switch keep-open on should look for a safe open beside the one they asked about, not for a mistake in this key.",
+          "type": "boolean",
+          "default": false
         }
       },
-      "default": { "enabled": false, "idle_seconds": 300, "max_seconds": 3600 }
+      "default": { "enabled": false, "idle_seconds": 300, "max_seconds": 3600, "allow_keep_open": false }
     },
 
     "export_allowed": {

@@ -167,6 +167,359 @@ ban '\b(urllib\.request|urllib\.error|http\.client|httplib|requests\.(get|post|p
     secrets-admin backends backends/*.py agent/*.py \
     -- "I21 no network client anywhere in the helper, backends or agent"
 
+# I18's keep-open relaxation — FOUR SPELLINGS, each of which IS the fix.
+#
+# `agent.allow_keep_open` lets an operator suspend one safe's IDLE timeout. The
+# whole argument for shipping that rests on four properties, and every one of
+# them is a line somebody could delete while the feature went on working:
+#
+#   1. THE DAEMON DECIDES. `_require_keep_open_allowed` reads the REGISTRY and
+#      is called from both doors — `op_put`'s `keep_open` field and the
+#      `keep-open` op. One def plus two calls; a caller-trusting version of
+#      this feature is a version with fewer.
+#   2. THE ABSOLUTE DEADLINE SURVIVES. `expires_in` drops the idle candidate
+#      and returns the absolute one; a `keep_open` branch that returned
+#      something larger, or `None`, would be an unlock with no end.
+#   3. THE PRESENCE LOCKS ARE NOT TIMEOUTS. `sweep`, `drop_all`, the session
+#      watcher and the freeze detector must not know this flag exists. A
+#      `keep_open` anywhere in them is the "finish the job" mistake the
+#      docstrings warn about, and it is the one that would actually be
+#      dangerous.
+#   4. AN UNLOCK DOES NOT START SUSPENDED. `agent_put` — the helper's call on
+#      the unlock path — must never send `keep_open`. The operator asks for it
+#      afterwards, explicitly, and it is audited when they do.
+if [[ -f agent/secrets_agent.py ]]; then
+    bad=""
+    # One def, plus three call sites: `op_put`'s keep_open field, and the
+    # keep-open op's two doors (by safe id and by handle), each of which has to
+    # be gated on its own — a version that gated only one of them would refuse
+    # the shape a test sends and admit the shape a client sends.
+    n=$(grep -c '_require_keep_open_allowed(' agent/secrets_agent.py || true)
+    (( n == 4 )) || bad+=" gate-appears-$n-times-(want 1 def + 3 calls)"
+    sed -n '/    def op_put(/,/    def op_get(/p' agent/secrets_agent.py \
+        | grep -q 'self._require_keep_open_allowed(safe, uid)' \
+        || bad+=" put-does-not-gate"
+    sed -n '/    def op_keep_open(/,/    def _holding_row(/p' agent/secrets_agent.py \
+        | grep -q 'self._require_keep_open_allowed(' || bad+=" op-does-not-gate"
+    # The gate must read the registry, not a request field.
+    sed -n '/    def _require_keep_open_allowed(/,/    # -- operations/p' \
+        agent/secrets_agent.py \
+        | grep -q 'self.policy.allows_keep_open(safe)' || bad+=" gate-not-registry"
+    sed -n '/    def expires_in(/,/    def idle_expires_in(/p' agent/secrets_agent.py \
+        | grep -q '^            return absolute - at$' || bad+=" absolute-deadline-lost"
+    # The BODY of each, strictly between its own def line and the next one at
+    # the same indent. A sed range would include the terminating def line, and
+    # the very next method after drop_all() is _require_keep_open_allowed —
+    # whose NAME contains the string, which would make this check fail for the
+    # one reason that is not a finding.
+    for fn in 'def sweep(' 'def drop_all(' 'def _check_session(' 'def _check_freeze('; do
+        if awk -v f="    $fn" 'index($0,f)==1{on=1;next} on && /^    def /{exit} on' \
+               agent/secrets_agent.py | grep -q 'keep_open'; then
+            bad+=" presence-lock-honours-keep_open:${fn}"
+        fi
+    done
+    if [[ -f secrets-admin ]]; then
+        sed -n '/^def agent_put(/,/^def agent_get(/p' secrets-admin \
+            | grep -q 'keep_open' && bad+=" unlock-starts-suspended"
+    fi
+    # 5. THE GATE IS ON THE HOLDING'S OWN SAFE, NOT ON THE REQUEST'S. `op_put`
+    #    finds an existing holding by HANDLE and may RELABEL it, so a gate
+    #    keyed on `req["safe"]` and run only `if keep is True` was bypassable
+    #    in three messages: take a handle on a denied safe, re-put it onto an
+    #    allowed one with keep_open, re-put it back onto the denied one with
+    #    no keep_open at all — "absent means leave it as it is" then carried
+    #    the suspension onto the safe the registry refuses. The fix is the
+    #    effective value, gated against the final label; these two spellings
+    #    are what it looks like.
+    sed -n '/    def op_put(/,/    def op_get(/p' agent/secrets_agent.py \
+        | grep -q 'effective_keep = (keep if keep is not None' \
+        || bad+=" put-gate-not-on-effective-value"
+    sed -n '/    def op_put(/,/    def op_get(/p' agent/secrets_agent.py \
+        | grep -q 'if keep is True:' && bad+=" put-gate-back-on-the-request"
+    # 6. BOTH DIRECTIONS ARE GATED. `{"enabled": false}` was ungated and still
+    #    ran touch(), which made it a handle-free, passphrase-free idle-timer
+    #    reset that worked on safes the registry never opted in. An `if
+    #    enabled:` in front of either gate in `op_keep_open` is that defect
+    #    coming back.
+    if awk 'index($0,"    def op_keep_open(")==1{on=1;next} on && /^    def /{exit} on' \
+           agent/secrets_agent.py \
+        | grep -B2 '_require_keep_open_allowed(' | grep -q 'if enabled:'; then
+        bad+=" off-direction-ungated"
+    fi
+    # ...and the reset only ever happens for a holding that really WAS
+    #    suspended. `if not enabled:` alone hands a free idle window to a
+    #    message that carries no handle.
+    awk 'index($0,"    def op_keep_open(")==1{on=1;next} on && /^    def /{exit} on' \
+        agent/secrets_agent.py | grep -q 'if not enabled and was:' \
+        || bad+=" off-direction-resets-what-it-did-not-resume"
+    # 7. A WITHDRAWN OPT-IN REACHES A LIVE SUSPENSION. Without the reconcile
+    #    the registry gate can only ever refuse the NEXT request, and a
+    #    suspension already running keeps its permission for the rest of the
+    #    holding's absolute lifetime — a permission that cannot be withdrawn.
+    #    It must run before the expiry scan, and it must NOT touch().
+    grep -q 'def reconcile_keep_open(' agent/secrets_agent.py \
+        || bad+=" no-reconcile-so-revocation-cannot-reach-a-live-suspension"
+    awk 'index($0,"    def refresh(")==1{on=1;next} on && /^    def /{exit} on' \
+        agent/secrets_agent.py \
+        | grep -q 'self.reconcile_keep_open(at, force=force)' \
+        || bad+=" refresh-does-not-reconcile"
+    awk 'index($0,"    def reconcile_keep_open(")==1{on=1;next} on && /^    def /{exit} on' \
+        agent/secrets_agent.py | grep -q '\.touch()' \
+        && bad+=" reconcile-hands-back-a-free-idle-window"
+    if [[ -n $bad ]]; then
+        fail "I18 the keep-open bound lost a guard:$bad"
+    else pass "I18 keep-open is gated on the REGISTRY by the daemon at both doors and in both directions, on the holding's own safe after any relabel, keeps the absolute deadline, is unknown to every presence lock, never starts at unlock, and can be withdrawn while it is running"; fi
+else skip "I18 agent/secrets_agent.py not written yet"; fi
+
+# I18, THE HALF THAT IS THE FEATURE — KEEP-OPEN POINTS AT THE SESSION TIMER.
+#
+# The first implementation suspended the AGENT TICKET's idle timer. The agent
+# holds a ticket and no key material, so that suspended nothing the operator
+# could feel: what ends their working session is `SESSION_IDLE_SECONDS` in the
+# helper's `run_session`. The toggle went on, the banner said they would not be
+# locked out, and they were. Each grep below is one line of the fix, and each
+# one could be deleted while the feature went on looking like it worked.
+if [[ -f secrets-admin ]]; then
+    bad=""
+    grep -q '^class SessionWindow:' secrets-admin \
+        || bad+=" no-SessionWindow-so-nothing-can-reach-the-session-timer"
+    # The session waits on the window's own deadline, which drops the idle
+    # candidate while suspended. A `min(now + idle, ...)` back in the loop is
+    # the defect restored.
+    awk 'index($0,"def run_session(")==1{on=1;next} on && /^def /{exit} on' \
+        secrets-admin | grep -q 'wake = window.deadline()' \
+        || bad+=" run_session-does-not-wait-on-the-window"
+    awk 'index($0,"def run_session(")==1{on=1;next} on && /^def /{exit} on' \
+        secrets-admin | grep -q 'if not window.keep_open:' \
+        || bad+=" an-idle-wakeup-still-ends-a-suspended-session"
+    # THE BOUND. The absolute deadline is counted from the session's start and
+    # capped; a raise from anywhere but the registry, or one that is not
+    # capped, is an unlock with no end.
+    awk 'index($0,"    def grant(")==1{on=1;next} on && /^    def /{exit} on' \
+        secrets-admin | grep -q 'min(int(registry_max), SESSION_KEEP_OPEN_CEILING)' \
+        || bad+=" the-registry-raise-is-not-capped"
+    awk 'index($0,"    def hard_deadline(")==1{on=1;next} on && /^    def /{exit} on' \
+        secrets-admin | grep -q 'return self.started + self.lifetime' \
+        || bad+=" the-absolute-deadline-stopped-counting-from-the-start"
+    # A client that SHORTENED the lifetime may not get it back by clicking a
+    # toggle.
+    grep -q 'if self.client_shortened:' secrets-admin \
+        || bad+=" a-client-can-shorten-then-raise-its-own-lifetime"
+    # THE SUSPENSION DIES WITH THE SESSION, at the daemon, on every exit path.
+    awk 'index($0,"def run_session(")==1{on=1;next} on && /^def /{exit} on' \
+        secrets-admin | grep -q 'keep_open_release(window, ctx, reason)' \
+        || bad+=" the-suspension-can-outlive-the-session-that-asked-for-it"
+    # ONE READER OF THE REGISTRY KEY. The helper asks the daemon; a helper-side
+    # `allow_keep_open` read is the second reader and the second answer.
+    grep -q "cfg.get(.allow_keep_open.)" secrets-admin \
+        && bad+=" the-helper-reads-allow_keep_open-for-itself-again"
+    # The verb may DESCRIBE the key in its docstring — it has to, that is where
+    # the reasoning lives — but it must not READ it. Comment and docstring
+    # lines are stripped first so the ban is about code.
+    awk 'index($0,"def v_keep_open(")==1{on=1;next} on && /^def /{exit} on' \
+        secrets-admin \
+        | grep -v '^\s*#' \
+        | grep -E '(get|\[)\(?["'"'"']allow_keep_open' \
+        && bad+=" the-verb-formed-its-own-opinion-again"
+    # THE DIRECTION IS IN THE LOG. `audit()` drops any note outside the set.
+    grep -q '"keep-open-on", "keep-open-off",' secrets-admin \
+        || bad+=" the-audit-note-set-lost-the-direction"
+    if [[ -n $bad ]]; then
+        fail "I18 keep-open lost the timer it is supposed to suspend:$bad"
+    else pass "I18 keep-open suspends the SESSION idle timer, keeps the absolute bound counted from the session's start and capped, dies with its session, reads the registry through the daemon only, and records its direction"; fi
+else skip "I18 secrets-admin not written yet"; fi
+
+# =============================================================================
+# I18 — THE STANDING BAN: THE THING GATED AND THE THING AFFECTED ARE THE SAME
+#       SCOPE.
+# =============================================================================
+#
+# THIS MISTAKE HAS NOW BEEN MADE TWICE, WHICH IS WHY IT IS A BAN AND NOT A
+# COMMENT.
+#
+#   1. `op_put` gated on the REQUEST's safe while acting on a holding found by
+#      HANDLE, so the caller chose which safe the gate ran against.
+#   2. `v_keep_open` gated on ONE safe (`_session_holds(entry["id"])`) while the
+#      thing it switched off — `SESSION_IDLE_SECONDS` in `run_session` — is the
+#      only idle protection EVERY safe that process has unlocked has. One
+#      opted-in safe bought a suspension covering an opted-OUT one held beside
+#      it, and the page drew no toggle for that safe, so the operator's only
+#      signal said the opposite.
+#
+# The rule is one sentence: WHEREVER KEEP-OPEN IS GRANTED, THE SCOPE THE GATE
+# WAS ASKED ABOUT MUST BE THE SCOPE THE GRANT AFFECTS. The grant affects the
+# whole session, so the gate is asked about the whole session, and the greps
+# below are what make a future divergence visible without understanding the
+# program:
+#
+#   * `keep_open` is DERIVED. Exactly one line in the file assigns it, and it
+#     is the one inside `SessionWindow._rescope` that compares the session's
+#     held set against the daemon-affirmed set. Anything else assigning it is
+#     a second opinion about the same fact — which is how (2) happened.
+#   * the mutator takes the SCOPE, keyword-only and with no default, so a call
+#     site cannot narrow it by forgetting an argument.
+#   * every call site passes both halves.
+#   * the scope is re-derived after every verb, because `unlock` is a verb.
+if [[ -f secrets-admin ]]; then
+    bad=""
+    # ONE WRITER. Find the class body and require that every `.keep_open =`
+    # assignment in the whole file lies inside it AND inside `_rescope`.
+    python3 - <<'EOF' || bad+=" keep_open-is-assigned-outside-_rescope"
+import re, sys
+src = open("secrets-admin", encoding="utf-8").read().split("\n")
+try:
+    start = next(i for i, l in enumerate(src) if l == "class SessionWindow:")
+except StopIteration:
+    sys.exit(1)
+end = next((i for i in range(start + 1, len(src))
+            if src[i].startswith("class ") or src[i].startswith("def ")),
+           len(src))
+try:
+    r0 = next(i for i in range(start, end)
+              if src[i].strip().startswith("def _rescope(self"))
+except StopIteration:
+    sys.exit(1)
+r1 = next((i for i in range(r0 + 1, end)
+           if src[i].startswith("    def ")), end)
+bad = [(i + 1, l.strip()) for i, l in enumerate(src)
+       if re.search(r"(?<![\w.])(self|window|ctx\.window)\.keep_open\s*=(?!=)", l)
+       and not (r0 <= i < r1)]
+if bad:
+    print(bad, file=sys.stderr)
+    sys.exit(1)
+EOF
+    # THE SCOPE IS AN ARGUMENT, KEYWORD-ONLY AND WITHOUT A DEFAULT.
+    grep -q 'def grant(self, safe_id, \*, held, allowed, registry_max=None):' \
+        secrets-admin \
+        || bad+=" the-grant-mutator-no-longer-demands-the-session-scope"
+    # AND THE INVARIANT ITSELF: held must be a SUBSET of what the daemon
+    # affirmed. `bool(self.granted) and set(held) <= self.allowed`.
+    grep -q 'self.keep_open = bool(self.granted) and set(held) <= self.allowed' \
+        secrets-admin \
+        || bad+=" the-scope-invariant-was-rewritten-or-removed"
+    # EVERY CALL SITE PASSES BOTH HALVES. A `.grant(` without `held=` is the
+    # narrowing this ban exists to catch; it would also be a TypeError, and
+    # both belts are cheap.
+    # `grep -A3` because the call is wrapped: the scope is on a continuation
+    # line, and a check that looked at one line would pass on a call that had
+    # dropped the argument entirely.
+    while IFS= read -r call; do
+        [[ $call == *"held="* && $call == *"allowed="* ]] \
+            || bad+=" a-grant-call-site-omits-the-scope"
+    done < <(grep -A3 '\.grant(' secrets-admin | tr '\n' ' ' \
+             | sed 's/--/\n/g' | grep 'grant(')
+    # THE SCOPE COMES FROM ONE FUNCTION, and it is the one that looks at every
+    # live handle this session owns.
+    grep -q '^def session_held_safes(ctx):' secrets-admin \
+        || bad+=" no-single-definition-of-the-session-scope"
+    awk 'index($0,"def v_keep_open(")==1{on=1;next} on && /^def /{exit} on' \
+        secrets-admin | grep -q 'held = session_held_safes(ctx)' \
+        || bad+=" the-verb-gates-on-something-other-than-the-session-scope"
+    # ...AND IT IS RE-DERIVED AFTER EVERY VERB, because `unlock` is a verb and
+    # a scope checked only at the toggle can be walked around by unlocking
+    # afterwards.
+    awk 'index($0,"def run_session(")==1{on=1;next} on && /^def /{exit} on' \
+        secrets-admin | grep -q 'keep_open_rescope(window, ctx, verb)' \
+        || bad+=" the-scope-is-not-re-derived-after-a-verb-changes-the-holdings"
+    # THE RELEASE IS THE WHOLE GRANT, AND THE RECEIPT COUNTS. A release that
+    # names one safe while the suspension covered several is the receipt that
+    # overstates.
+    grep -q 'gone = sorted(self.granted)' secrets-admin \
+        || bad+=" the-release-no-longer-covers-the-whole-grant"
+    # The teardown's own receipt, matched inside `keep_open_release` rather
+    # than anywhere in the file: another function carries a similar sentence,
+    # and a ban that matched it would pass with this one deleted.
+    awk 'index($0,"def keep_open_release(")==1{on=1;next} on && /^def /{exit} on' \
+        secrets-admin | tr -d '\n' \
+        | grep -q 'all %d safe(s) it covered: %s' \
+        || bad+=" the-teardown-receipt-stopped-counting-what-it-released"
+    # THE PATH COCKPIT ACTUALLY TAKES. `proc.close("terminated")` signals the
+    # process; with no handler the teardown never runs at all.
+    grep -q 'def _session_signal_handler(' secrets-admin \
+        || bad+=" a-SIGTERMed-session-dies-without-releasing-its-suspension"
+    awk 'index($0,"def run_session(")==1{on=1;next} on && /^def /{exit} on' \
+        secrets-admin | grep -q '_install_session_signals()' \
+        || bad+=" run_session-does-not-install-the-teardown-signal-handler"
+    # THE RE-ASK IS ON A CLOCK. In the `line is None` branch it is reached only
+    # by a session that has gone silent — which is every session except the
+    # ones keep-open is actually doing something for.
+    grep -q 'window.last_recheck' secrets-admin \
+        || bad+=" the-recheck-lost-its-clock-and-is-back-on-silence"
+    awk 'index($0,"def run_session(")==1{on=1;next} on && /^def /{exit} on' \
+        secrets-admin \
+        | grep -q 'if window.keep_open and (time.monotonic() - window.last_recheck' \
+        || bad+=" the-recheck-is-no-longer-at-the-top-of-the-loop"
+    # THE RAISE IS CONTINGENT ON THE GRANT.
+    grep -q 'self.lifetime = self.base_lifetime' secrets-admin \
+        || bad+=" the-registry-raise-outlives-the-suspension-that-bought-it"
+    if [[ -n $bad ]]; then
+        fail "I18 the keep-open scope ban broke:$bad"
+    else pass "I18 the thing gated and the thing affected are the same scope: keep_open is derived in one line from the session's whole held set, the mutator demands that scope keyword-only, every call site passes it, it is re-derived after every verb, the release covers the whole grant and counts what it released, SIGTERM reaches the teardown, the re-ask is on a clock, and the registry raise dies with the grant"; fi
+else skip "I18 secrets-admin not written yet"; fi
+
+# I18 — THE PAGE MAY NOT PROMISE MORE THAN THE HELPER CONFIRMED.
+#
+# `AGENT.rows[].keepOpen` is the DAEMON's ticket flag out of `health`. The
+# banner's "they will NOT lock when you stop using them" is about the idle
+# timeout of the helper SESSION holding the unlock — a different timer, in a
+# process `health` does not describe. The banner made the whole promise from
+# the ticket flag, so it said the most reassuring sentence on the page over
+# holdings nothing had suspended a session timer for.
+if [[ -f secrets.js ]]; then
+    bad=""
+    grep -q 'function keptConfirmed(' secrets.js \
+        || bad+=" no-gate-between-the-ticket-flag-and-the-promise"
+    grep -q 'function keptAdopt(' secrets.js \
+        || bad+=" the-page-does-not-adopt-the-helper-published-scope"
+    grep -q 'session_keep_open_safes' secrets.js \
+        || bad+=" the-page-ignores-the-scope-the-helper-publishes"
+    # The promise paragraph is drawn from `confirmed`, never from `suspended`.
+    grep -q 'var confirmed = AGENT.rows.filter' secrets.js \
+        && bad+=" confirmed-is-computed-from-rows-rather-than-from-suspended"
+    grep -q 'if (confirmed.length) {' secrets.js \
+        || bad+=" the-promise-paragraph-is-not-gated-on-a-confirmation"
+    grep -q 'They will NOT lock when you stop using them' secrets.js \
+        || bad+=" the-promise-sentence-moved-and-this-ban-cannot-see-it"
+    # And the confirmation dies with the session that gave it.
+    grep -q 'keptForget();' secrets.js \
+        || bad+=" the-confirmation-outlives-the-session-that-gave-it"
+    if [[ -n $bad ]]; then
+        fail "I18 the page's promise gate broke:$bad"
+    else pass "I18 the banner makes its promise only for safes the HELPER confirmed a session suspension for, adopts that scope from the helper rather than keeping its own, and forgets it when the session ends"; fi
+else skip "I18 secrets.js not written yet"; fi
+
+# I18 — THE PRESENCE LOCKS REACH A SUSPENDED HOLDING THIS PAGE DID NOT CREATE.
+#
+# `pagehide` and the hidden-tab timer used to run entirely inside `if
+# (SESSION)`, so a holding suspended by another tab sailed through both while
+# the banner promised otherwise. A suspended holding has no idle timer left to
+# catch it; presence is all there is.
+if [[ -f secrets.js ]]; then
+    bad=""
+    grep -q 'function agentPresenceLock(' secrets.js \
+        || bad+=" no-agentPresenceLock"
+    grep -q 'agentPresenceLock("you left the page")' secrets.js \
+        || bad+=" pagehide-does-not-reach-a-suspended-holding"
+    grep -q 'AGENT.rows.some(function (r) { return r.keepOpen; })' secrets.js \
+        || bad+=" the-hidden-tab-timer-is-not-armed-for-a-suspended-holding"
+    # The page ADOPTS the helper's deadline; it never computes one.
+    grep -q 'function adoptSessionDeadline(' secrets.js \
+        || bad+=" no-single-writer-for-the-lock-deadline"
+    n=$(grep -c 'SESSION.expiresAt = ' secrets.js || true)
+    (( n == 1 )) || bad+=" SESSION.expiresAt-written-in-$n-places-(want 1)"
+    grep -q 'adoptSessionDeadline(res.session_expires_in)' secrets.js \
+        || bad+=" the-page-does-not-adopt-the-deadline-keep-open-re-issued"
+    # AND IT GOES DOWN THE SESSION'S CHANNEL. The timer being suspended lives in
+    # the helper process holding the unlock; a `callOnce` spawns a second one,
+    # which has no idle timer of its own and cannot reach the first's. Sent that
+    # way the verb changes the agent's ticket and nothing the operator feels.
+    grep -q 'SESSION.call("keep-open"' secrets.js \
+        || bad+=" the-toggle-is-sent-out-of-session-and-reaches-no-timer"
+    if [[ -n $bad ]]; then
+        fail "I18 the page's half of keep-open lost a guard:$bad"
+    else pass "I18 the page locks a suspended holding on every presence signal it promises, including ones it did not create, and adopts the helper's deadline through a single writer"; fi
+else skip "I18 secrets.js not written yet"; fi
+
 # I4 — NO VERB TAKES A FILESYSTEM PATH. `save-as` and `restore-backup` take a
 # bare NAME; a field named `path`/`dir`/`dest` in a verb's request would be the
 # I4 hazard re-entering through the schema, where it would look like a feature.
@@ -446,6 +799,47 @@ if compgen -G "*.js" >/dev/null; then
         printf '%s\n' "$nul" | sed 's/^/        /'
     else pass "no source file contains a NUL byte"; fi
 else skip "no sources to scan for NUL bytes"; fi
+
+# ---- keep-open: THE GATE AND THE THING IT GATES MUST BE THE SAME SCOPE ----
+#
+# Four defects in this feature were ONE mistake wearing four costumes: something
+# checked at one scope and applied at another. Each was found by reproduction
+# with a control, never by reading, which is why this is a ban and not a note:
+#
+#   1. `op_put` gated on the safe id IN THE REQUEST while acting on a holding
+#      found BY HANDLE, so a re-put could relabel a holding to an allowed safe,
+#      set keep_open, and relabel it back to a denied one.
+#   2. The registry opt-in is PER SAFE; the suspension it granted was PER
+#      SESSION — one timer over every safe the process held — so a denied safe
+#      rode an allowed one's grant.
+#   3. `v_list`'s live test had NO EXPIRY CHECK while the scope gate did, so a
+#      safe whose handle had timed out both drew as unlocked and stopped
+#      blocking the grant: wait the handle out and the gate lets you through.
+#   4. The recheck-revocation path released the helper's window but never told
+#      the DAEMON, so the agent-side half of the suspension outlived the
+#      session that owned it.
+#
+# So the pairings below are what is pinned, not the spellings.
+if [[ -f secrets-admin ]]; then
+    bad=""
+    # (2) the grant is computed over the SCOPE, never one safe.
+    grep -q 'verdicts = keep_open_allowed_for(ctx, sorted(held | {entry\["id"\]}))' secrets-admin \
+        || bad+=" grant-not-over-scope"
+    # (3) `live` in v_list and `session_held_safes` must agree on what "held"
+    #     means. Both test expiry, or neither does; one of each is defect 3.
+    grep -q 'and s.expires_in() > 0' secrets-admin || bad+=" list-live-ignores-expiry"
+    grep -q 'expires_in() > 0' secrets-admin || bad+=" scope-ignores-expiry"
+    # (4) EVERY path that gives the window up tells the daemon. Three release
+    #     sites; three notifications.
+    r=$(grep -c 'window.release(' secrets-admin || true)
+    t=$(grep -c 'keep_open_tell_agent_off(' secrets-admin || true)
+    (( t >= 3 )) || bad+=" release-sites-$r-but-only-$t-notify"
+    # (1)/F3 the OFF direction records a refusal instead of re-raising, so a
+    #     withdrawn opt-in cannot strand a suspended timer.
+    grep -q 'refusal = exc' secrets-admin || bad+=" off-direction-reraises"
+    if [[ -n "$bad" ]]; then fail "keep-open scope pairings:$bad"
+    else pass "keep-open: gate and grant share a scope, expiry agrees, every release notifies"; fi
+fi
 
 # ------------------------------------------- deployment bans (DEPLOY-CONTRACT) ---
 head_ "Deployment bans (docs/DEPLOY-CONTRACT.md)"

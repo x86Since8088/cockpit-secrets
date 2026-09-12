@@ -90,7 +90,10 @@
              role="region" rather than role="alert": the countdown updates once a
              second and an assertive region would interrupt a screen reader on
              every tick. The sentence that matters is announced once, into
-             #sec-live, when the set of held safes changes. -->
+             #sec-live, when the set of held safes changes &#8212; and "kept
+             open" is part of that sentence, because a safe whose idle timeout
+             has been suspended is a different fact from a safe that is merely
+             held, and it is the one this banner exists to keep visible. -->
         <div id="sec-agent-banner" class="sec-agent-host" role="region"
              aria-label="Safes held unlocked by the agent"></div>
 
@@ -234,6 +237,23 @@
             it and counts down to its automatic lock, from every view. If that banner is not
             there, nothing is being held &#8212; the agent is off unless a registry entry opts in,
             and there is nothing for it to hide.</p>
+            <p><strong>Keeping an unlock open suspends one timer, and only one.</strong> Where the
+            registry allows it, the banner offers &#8220;Keep open&#8221;, which stops the safe
+            locking itself while you work. It stops the IDLE timeout and nothing else: the
+            absolute lifetime still runs from the moment of the unlock and nothing &#8212; no
+            client, no toggle, no amount of activity &#8212; can extend it, and the safe still
+            locks the instant you lock it, leave this page, hide this tab for long enough, lock
+            the screen, or suspend the machine. While it is on, the banner says so in words above
+            every row it applies to and counts down that absolute lifetime instead. A safe whose
+            registry entry does not set <code>agent.allow_keep_open</code> has no such control at
+            all, and the helper and the agent both refuse it independently.</p>
+            <p><strong>It is one timer over your whole session, not one per safe.</strong> The
+            helper process holding your unlocks has a single idle timeout, and it ends all of
+            them together &#8212; so &#8220;Keep open&#8221; may only be switched on while EVERY
+            safe that session has unlocked is allowed to suspend it. Open one that is not, and
+            the suspension ends at that moment and the message says which safe stopped it. The
+            weakest safe you have open governs, which is why a safe that matters should not have
+            <code>agent.allow_keep_open</code> set even if the one beside it does.</p>
             <p><strong>What is greyed out here is decoration, and so is what is hidden.</strong>
             The helper re-derives the caller&#8217;s identity from the kernel and re-checks the
             access class on every verb; that is what refuses a safe you may not open, not this

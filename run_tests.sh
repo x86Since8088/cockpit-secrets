@@ -100,7 +100,13 @@ run "integration: load-bearing properties"     600 \
     python3 tests/integration/properties.py
 run "integration: the second-wave verbs"       900 \
     python3 tests/integration/newverbs.py
-run "integration: the unlock agent, end to end" 300 \
+# 300 s was the budget before this file measured the SESSION idle timer, which
+# it can only do by being quiet for longer than one — and then quiet again for
+# the absolute bound, and again for a registry revocation to be noticed. Nearly
+# all of the added time is a deliberate sleep on an open pipe; shortening it
+# would measure a different program, in the same way the lockout ladder below
+# would.
+run "integration: the unlock agent, end to end" 900 \
     python3 tests/integration/agent_cycle.py
 # I16's counter under concurrency (I39) and across principals (I40). It spawns
 # 50 helper processes at once and then waits out the real 2/4/8/16 s backoff

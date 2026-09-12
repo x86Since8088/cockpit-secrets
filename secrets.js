@@ -254,7 +254,60 @@
      * Nothing in here is a handle: the page cannot use an agent's unlock, it
      * can only display it and ask for it to be locked. */
     var AGENT = { rows: [], timer: null, poll: null, said: "", failed: null,
-                  polling: false };
+                  polling: false, busy: {}, kept: {}, keptAt: 0 };
+
+    /* ------------------------------------------------------------------ *
+     * WHAT THIS PAGE IS ALLOWED TO PROMISE, AND WHERE THAT PERMISSION COMES
+     * FROM.
+     *
+     * `AGENT.rows[].keepOpen` is the DAEMON's ticket flag, out of `health`. It
+     * is a true fact about the ticket and it is NOT the operator's promise:
+     * the sentence "they will NOT lock when you stop using them" is about the
+     * idle timeout of the helper SESSION holding the unlock, which lives in a
+     * different process and which `health` does not describe. A ticket can be
+     * flagged with no session suspension behind it at all — toggled from a
+     * one-shot, toggled by another tab, or left over from a session that has
+     * since ended — and the banner made the whole promise for every one of
+     * them.
+     *
+     * `AGENT.kept` is the narrower thing: safe id -> true, written ONLY where
+     * the helper itself answered `session_keep_open: true` for that safe, and
+     * cleared the moment it answers anything else, the moment the session
+     * ends, and whenever this page has no session at all. The strong paragraph
+     * is drawn from THIS, so the page cannot claim more than the helper
+     * confirmed. Everything else gets the narrower sentence, which is still
+     * true.
+     * ------------------------------------------------------------------ */
+    function keptRecord(safeId, on) {
+        if (on) AGENT.kept[safeId] = true;
+        else delete AGENT.kept[safeId];
+        AGENT.keptAt = Date.now();
+    }
+    /* THE AUTHORITATIVE FORM, and the one to prefer wherever the helper sends
+     * it. `session_keep_open_safes` is the whole scope of the session's ONE
+     * suspension as the helper is enforcing it right now, so adopting it
+     * REPLACES whatever this page thought — which is the only way a page can
+     * be sure it is not claiming a safe the helper has already dropped. Same
+     * rule as `adoptSessionDeadline`: the helper issues, the page adopts, and
+     * the page computes nothing. */
+    function keptAdopt(res) {
+        if (!res || res.session !== true) return false;
+        if (!Array.isArray(res.session_keep_open_safes)) return false;
+        AGENT.kept = {};
+        res.session_keep_open_safes.forEach(function (id) {
+            if (typeof id === "string" && id) AGENT.kept[id] = true;
+        });
+        AGENT.keptAt = Date.now();
+        return true;
+    }
+    function keptForget() { AGENT.kept = {}; AGENT.keptAt = 0; }
+    /* Confirmed only while there IS a session to have confirmed it. A page
+     * with no open session holds no session suspension by construction — the
+     * process that had one has exited — so the confirmation expires with it
+     * rather than lingering as the most reassuring sentence on the page. */
+    function keptConfirmed(safeId) {
+        return !!(SESSION && !SESSION.isDead() && AGENT.kept[safeId]);
+    }
 
     /* Breach-corpus availability, asked once per safe and cached for the page's
      * life. Per safe, not once globally, because the helper's breach verb is
@@ -306,7 +359,12 @@
         "entries": 1, "reveal": 1, "totp": 1, "attach-get": 1, "save": 1,
         "lock": 1, "add": 1, "edit": 1, "move": 1, "rm": 1, "group-add": 1,
         "group-rm": 1, "group-mv": 1, "generate": 1, "health": 1,
-        "audit-tail": 1
+        "audit-tail": 1,
+        /* Drawn as the toggle inside the agent banner, next to the countdown
+         * it changes the meaning of — never as a free-standing form, because
+         * "keep this unlocked" is not a question to ask about a safe that is
+         * not currently held. */
+        "keep-open": 1
     };
     /* Verb names docs/CONTRACT.md does NOT pin.
      *
@@ -4798,8 +4856,13 @@
             selected: null,
             dirty: 0
         };
-        var secs = Number(unlockRes && unlockRes.expires_in);
-        SESSION.expiresAt = (isFinite(secs) && secs > 0) ? Date.now() + secs * 1000 : 0;
+        adoptSessionDeadline(unlockRes && unlockRes.expires_in);
+        /* AND THE SCOPE, for the same reason the deadline is re-adopted here:
+         * unlocking a safe the agent will not let this session suspend ends
+         * the suspension at the moment of the unlock, and the helper says so
+         * in this very reply. A page that kept its old list would go on
+         * promising over a suspension the helper had just dropped. */
+        keptAdopt(unlockRes);
         startSessionTicker();
         show(byId("sec-lock"), true);
         enterBrowse();
@@ -4810,6 +4873,31 @@
          * moment the banner learns about it — no poll interval to wait out, and
          * no window in which a safe is held and not shown (I18). */
         agentNoted(safe, unlockRes);
+    }
+
+    /* ------------------------------------------------------------------ *
+     * THE ONE WRITER OF SESSION.expiresAt.
+     *
+     * The page does not COMPUTE a lock deadline; it ADOPTS one, and only from
+     * a helper reply. That is the answer to "who re-issues the deadline when
+     * keep-open changes it": the helper does — `unlock` publishes it and
+     * `keep-open` re-publishes it — and this function is the only place it
+     * lands. The alternative, a page that kept its own arithmetic and patched
+     * it when something changed, is a page free to go on displaying a deadline
+     * the helper has stopped believing, which is the same defect as a banner
+     * that outlives its session wearing different clothes.
+     *
+     * A missing or unusable number clears the deadline rather than inventing
+     * one: "unlocked" with no countdown is honest, and a guessed countdown is
+     * not. The idle death is not drawn at all — every frame this page sends
+     * pushes it out, so it is an EVENT (the channel closing, which lockNow
+     * already handles) and not a deadline anything can count down to.
+     * ------------------------------------------------------------------ */
+    function adoptSessionDeadline(seconds) {
+        if (!SESSION) return;
+        var secs = Number(seconds);
+        SESSION.expiresAt = (isFinite(secs) && secs > 0)
+            ? Date.now() + secs * 1000 : 0;
     }
 
     function startSessionTicker() {
@@ -4849,6 +4937,11 @@
 
     function lockNow(reason) {
         if (SESSION_TIMER) { window.clearInterval(SESSION_TIMER); SESSION_TIMER = null; }
+        /* THE CONFIRMATION DIES WITH THE SESSION THAT GAVE IT. The helper
+         * process is about to go, and with it every suspension it was
+         * enforcing; a page still holding its "confirmed" list would draw the
+         * full promise over a session that no longer exists. */
+        keptForget();
         var hadDirty = BROWSE && BROWSE.dirty;
         var lockedSafeId = BROWSE ? BROWSE.safe.id : null;
         var s = SESSION;
@@ -4893,6 +4986,10 @@
         var msg = "Locked" + (reason ? " — " + reason : "") + ".";
         if (hadDirty) msg += " Unsaved changes were discarded; the safe on disk is unchanged.";
         alertText(msg, "info");
+        renderAgentBanner();
+        /* And then ask the daemon, so the banner goes back to being its state
+         * rather than this page's correction of it. */
+        refreshAgent();
         announce(msg);
         /* This safe's own hold, if it had one, ends with the session. Any OTHER
          * safe the agent is holding is untouched and stays in the banner: the
@@ -7059,8 +7156,19 @@
                  * dangerous direction: it would say a safe stays open longer
                  * than it will, and an operator would stop watching. */
                 var abs = Number(h.expires_in);
-                var idle = Number(h.idle_expires_in);
-                var secs = [abs, idle].filter(function (n) {
+                /* THE IDLE DEADLINE IS ABSENT, NOT ZERO, WHILE IT IS
+                 * SUSPENDED. The daemon answers `idle_expires_in: null` for a
+                 * holding with keep-open on — deliberately, so a caller can
+                 * tell "no idle deadline is running" from "one is, and it is
+                 * far away". `Number(null)` is 0, which would sort first and
+                 * make the banner count down to a lock that is not coming;
+                 * the explicit null check is what stops that. */
+                var idle = (h.idle_expires_in === null ||
+                            h.idle_expires_in === undefined)
+                    ? null : Number(h.idle_expires_in);
+                var cand = [abs];
+                if (idle !== null) cand.push(idle);
+                var secs = cand.filter(function (n) {
                     return isFinite(n) && n >= 0;
                 }).sort(function (a, b) { return a - b; })[0];
                 out.rows.push({
@@ -7069,6 +7177,26 @@
                     cls: cls,
                     idle_expires_in: idle,
                     expires_in: abs,
+                    /* THE DAEMON'S ANSWER, never this page's opinion: whether
+                     * the idle timer is suspended for this holding right now.
+                     * A helper too old to report it leaves this false, and the
+                     * toggle then reads "off" — the safe direction for a
+                     * control whose "on" position means a safe stays open. */
+                    keepOpen: h.keep_open === true,
+                    /* And whether the REGISTRY permits the toggle at all, from
+                     * the safe's own list row. A safe this page cannot see —
+                     * an admin-class one with elevation off — gets no toggle,
+                     * which is the same fail-closed direction. */
+                    allowKeepOpen: !!(known && known.agent_keep_open_allowed),
+                    /* WHETHER THAT `false` IS AN ANSWER OR A SILENCE. The
+                     * helper asks the daemon — the one reader of
+                     * `agent.allow_keep_open` — and reports whether it got a
+                     * reply. "Your registry does not allow this" and "nothing
+                     * could be asked" are different problems with different
+                     * fixes, and a row that says the first when the second is
+                     * true sends the operator to edit a file that was never
+                     * the trouble. */
+                    keepOpenKnown: !(known && known.agent_keep_open_known === false),
                     _deadline: (secs !== undefined && secs > 0) ? now + secs * 1000 : 0
                 });
             });
@@ -7088,6 +7216,11 @@
             cls: isAdminClass(safe) ? "admin" : "user",
             idle_seconds: a.idle_seconds,
             max_seconds: a.max_seconds,
+            /* An unlock never starts suspended. The operator asks for that
+             * afterwards, explicitly, and the daemon audits it when they do. */
+            keepOpen: false,
+            allowKeepOpen: safe.agent_keep_open_allowed === true,
+            keepOpenKnown: safe.agent_keep_open_known !== false,
             _deadline: (isFinite(secs) && secs > 0) ? Date.now() + secs * 1000 : 0
         });
         renderAgentBanner();
@@ -7175,6 +7308,49 @@
         return refreshHealth(agentPollAdmin());
     }
 
+    /* ------------------------------------------------------------------ *
+     * PRESENCE, APPLIED TO EVERY SUSPENDED HOLDING — INCLUDING THE ONES THIS
+     * PAGE DID NOT CREATE.
+     *
+     * Six things are supposed to end a suspended unlock: an explicit Lock, the
+     * page being left, the tab being hidden past the threshold, the logind
+     * session locking, the machine suspending, and logout. The daemon owns the
+     * last three. This page owns the first three — and two of them only ever
+     * ran inside `if (SESSION)`, so a holding suspended by ANOTHER tab, or by
+     * this one before a reload, sailed through both. The banner promised "they
+     * lock when you lock them, leave this page, or the screen locks" over
+     * exactly those holdings, which made the promise false for the case the
+     * operator is least able to see.
+     *
+     * Only SUSPENDED holdings are locked here. An ordinary agent holding is
+     * meant to outlive this tab — that is what the banner's last line says,
+     * and it is why the agent exists — and its idle timer is still running to
+     * bound it. A suspended one has had that timer taken away, so presence is
+     * the only thing left, and presence is what this is.
+     *
+     * Best effort, deliberately: on `pagehide` there may be no time for a
+     * reply, and nothing here waits for one. The helper lifts its own
+     * session's suspension as it tears down and the daemon reconciles against
+     * the registry on its own clock; this is the third strap, not the only one.
+     * ------------------------------------------------------------------ */
+    function agentPresenceLock(why) {
+        var suspended = AGENT.rows.filter(function (r) { return r.keepOpen; });
+        if (!suspended.length) return 0;
+        suspended.forEach(function (r) {
+            var known = safeSpecById(r.safe);
+            try {
+                callOnce("lock", { safe: r.safe },
+                         known ? isAdminClass(known) : true)
+                    .catch(function () { /* leaving anyway */ });
+            } catch (e) { /* leaving anyway */ }
+        });
+        AGENT.rows = AGENT.rows.filter(function (r) { return !r.keepOpen; });
+        renderAgentBanner();
+        announce("Locked " + suspended.length + " safe(s) whose idle timeout " +
+                 "was suspended, because " + why + ".");
+        return suspended.length;
+    }
+
     function agentLock(r) {
         var nm = r.label || r.safe || "the safe";
         /* When the hold belongs to the session this page is browsing, end it
@@ -7203,6 +7379,155 @@
             alertBox(errNode(e));
             refreshAgent();
         });
+    }
+
+    /* ------------------------------------------------------------------ *
+     * KEEP-OPEN — the toggle that suspends a safe's IDLE timeout (I18)
+     *
+     * WHAT IT DOES. Nothing on this page. It calls the helper's `keep-open`
+     * verb, which asks the daemon, which reads the registry and decides. The
+     * page then re-asks `health` and draws whatever the daemon says it is
+     * holding. The toggle's position is the DAEMON's state, never this page's
+     * — the same rule the rest of the banner already keeps, and it matters
+     * more here: a toggle that showed "on" because it was clicked, over a safe
+     * whose idle timer is still running, would be the invisible unlocked safe
+     * with the lights turned up.
+     *
+     * WHAT IT DOES NOT DO, AND MUST NOT. It does not touch the absolute
+     * lifetime, which is the only thing still going to lock a suspended safe,
+     * and it does not touch a single presence lock: `pagehide` below still
+     * ends the session, the hidden-tab timer still fires, Lock now is still
+     * one click away, and the daemon still drops everything when the screen
+     * locks or the machine suspends. Those are not timeouts.
+     *
+     * WHERE THE STATE LIVES. In AGENT.rows, which is refilled from `health`
+     * every poll — so it is session-only in the strictest sense: it reaches no
+     * browser storage area of any kind, no cookie, and no variable this page
+     * would trust across a reload (I11). This file does not so much as NAME a
+     * storage API, and the suite greps for the names, which is the right shape
+     * for that ban: a file that names one is one edit away from using one.
+     * ------------------------------------------------------------------ */
+
+    function keepOpenSupported() { return hasVerb("keep-open"); }
+
+    function agentKeepOpen(r, on) {
+        if (!keepOpenSupported() || AGENT.busy[r.safe]) return;
+        var known = safeSpecById(r.safe);
+        AGENT.busy[r.safe] = true;
+        renderAgentBanner();
+        /* ==============================================================
+         * IT MUST GO DOWN THE SESSION'S OWN CHANNEL, OR IT REACHES NOTHING.
+         *
+         * The timer this toggle exists to suspend lives in the helper process
+         * that is holding the unlock — the `open` session on the other end of
+         * THIS channel. A `callOnce` spawns a second helper, which has no idle
+         * timer to suspend (it exits when its verb returns) and cannot touch
+         * the first one's. Sent that way the verb changes the agent's ticket
+         * and nothing else, which is exactly the shape of the defect this
+         * release fixes: a control that reported success over a timer it never
+         * reached. So when this page has a session for the safe, the frame
+         * goes down it; only a holding this page has no session for falls back
+         * to a one-shot, and the reply then says `session: false` and the
+         * message says so too.
+         * ============================================================== */
+        var inSession = !!(SESSION && BROWSE && BROWSE.safe
+                           && BROWSE.safe.id === r.safe);
+        var ask = inSession
+            ? SESSION.call("keep-open", { safe: r.safe, enabled: !!on })
+            : callOnce("keep-open", { safe: r.safe, enabled: !!on },
+                       known ? isAdminClass(known) : true);
+        ask
+        .then(function (res) {
+            var nm = r.label || r.safe;
+            /* THE DEADLINE THE HELPER NOW BELIEVES, adopted here. The verb may
+             * have moved it — a registry entry is allowed to raise the
+             * session's absolute lifetime, within the helper's ceiling — and a
+             * page still counting down to the old one would be showing a
+             * deadline its helper has stopped keeping. There is no arithmetic
+             * here and there must not be: `adoptSessionDeadline` takes the
+             * helper's number or nothing. */
+            if (res && res.session === true)
+                adoptSessionDeadline(res.session_expires_in);
+            /* THE SCOPE, ADOPTED THE SAME WAY THE DEADLINE IS. Prefer the
+             * helper's list; fall back to the single boolean only for a helper
+             * too old to publish it, and in that case record only the safe
+             * this call named — never more. */
+            if (!keptAdopt(res))
+                keptRecord(r.safe, !!(res && res.session === true
+                                      && res.session_keep_open === true));
+            /* WHAT WAS ACTUALLY SUSPENDED. `session_keep_open` is the session
+             * idle timeout — the one that ends the operator's work — and it is
+             * the only one worth saying "you will not be locked out" about.
+             * The agent's ticket is a separate fact and the banner reports it
+             * separately. Claiming the promise when only the ticket changed is
+             * exactly the sentence this feature was shipped saying and could
+             * not keep. */
+            var kept = !!(res && res.session_keep_open);
+            var msg;
+            if (!on) {
+                /* WHAT COMES BACK, AND HOW SOON. The countdown this page was
+                 * showing may have been an absolute lifetime the registry
+                 * raised for the suspension — `keep-open` off gives that back,
+                 * and the number above has already been adopted — but the
+                 * thing that will actually end the session now is the idle
+                 * timeout, and it is far shorter. Saying "resumed" and leaving
+                 * a long countdown on screen is how the page ends up counting
+                 * down from an hour to a lock two minutes away. */
+                var idleBack = res && Number(res.session_idle_seconds);
+                msg = "Resumed the idle timeout for " + nm + "." +
+                      (isFinite(idleBack) && idleBack > 0
+                        ? " This session now ends after " + fmtSeconds(idleBack) +
+                          " with no activity, whatever the countdown above says."
+                        : "");
+                if (res && (res.warnings || []).some(function (w) {
+                        return /covered \d+ safes/.test(String(w)); }))
+                    msg += " It was ONE timer over every safe this session " +
+                           "holds, so every one of them is counting down again.";
+            } else if (kept) {
+                msg = "Keeping " + nm + " unlocked. This session's idle timeout is " +
+                      "suspended; it now ends only when its absolute lifetime runs " +
+                      "out, or when you lock it, leave this page, or the screen locks.";
+            } else {
+                msg = "The agent's ticket for " + nm + " was changed, but this page " +
+                      "has no open session for it — so no idle timeout was suspended " +
+                      "and you can still be locked out of it.";
+            }
+            if (res && res.affected === 0 && !kept)
+                msg = "The agent is no longer holding " + nm + "; nothing was changed.";
+            alertText(msg, (on && kept) ? "warn" : "ok");
+            announce(msg);
+        }).catch(function (e) {
+            /* A refusal here is a real answer, not a glitch: the registry may
+             * not permit it, or the daemon may be gone. Either way the idle
+             * timeout is STILL RUNNING, and the operator has to be told that
+             * rather than left with a toggle that looks set — and this page
+             * must stop claiming a suspension it did not get. */
+            keptRecord(r.safe, false);
+            alertBox(errNode(e));
+            announce("The unlock was not kept open: " + errText(e) +
+                     " The idle timeout is still running.");
+        }).then(function () {
+            delete AGENT.busy[r.safe];
+            /* Ask the daemon what is actually true. */
+            refreshAgent();
+        });
+    }
+
+    /* The control itself. A real <button> with aria-pressed, not a checkbox
+     * dressed as one: it performs an action on a remote daemon and the answer
+     * arrives asynchronously, which is a button's semantics and not a
+     * checkbox's. */
+    function keepOpenControl(r) {
+        var busy = !!AGENT.busy[r.safe];
+        var b = btn(r.keepOpen ? "Keeping open" : "Keep open",
+                    "sec-keepopen", function () { agentKeepOpen(r, !r.keepOpen); });
+        b.setAttribute("aria-pressed", r.keepOpen ? "true" : "false");
+        b.disabled = busy;
+        b.title = r.keepOpen
+            ? "Resume this safe's idle timeout."
+            : "Suspend this safe's idle timeout so it does not lock while you work. " +
+              "Its absolute lifetime still applies and cannot be extended.";
+        return b;
     }
 
     function renderAgentBanner() {
@@ -7236,7 +7561,33 @@
             return;
         }
 
-        var box = el("div", "sec-agent-banner");
+        var suspended = AGENT.rows.filter(function (r) { return r.keepOpen; });
+        /* ==============================================================
+         * THE PROMISE IS DRAWN FROM WHAT THE HELPER CONFIRMED, NOT FROM THE
+         * TICKET FLAG.
+         *
+         * `r.keepOpen` is the DAEMON's ticket, out of `health`. It is a true
+         * fact about the ticket and it is not the sentence below: "they will
+         * NOT lock when you stop using them" is about the idle timeout of the
+         * helper SESSION holding the unlock, in a different process, which
+         * `health` does not describe. The two came apart in every direction —
+         * a toggle sent from a one-shot, a holding another tab suspended, a
+         * session that has since ended, a session whose suspension the helper
+         * dropped because it opened a safe the agent would not let it suspend
+         * — and the banner made the whole promise for all of them.
+         *
+         * So the rows are split. `confirmed` is the ones the HELPER said
+         * `session_keep_open` for, in a session this page still has; they get
+         * the promise. The rest get the narrower sentence, which is the part
+         * that is actually known.
+         * ============================================================== */
+        var confirmed = suspended.filter(function (r) {
+            return keptConfirmed(r.safe);
+        });
+        var ticketOnly = suspended.filter(function (r) {
+            return !keptConfirmed(r.safe);
+        });
+        var box = el("div", "sec-agent-banner" + (suspended.length ? " held" : ""));
         /* THE WORD "Unlocked" AND A KEY GLYPH, not amber alone. This is the one
          * state in the program where a safe is open while nobody is looking at
          * it, and a banner whose entire message is a background colour is a
@@ -7249,8 +7600,68 @@
             ? "— a safe is held open by the agent"
             : "— " + AGENT.rows.length + " safes are held open by the agent"));
         box.appendChild(h);
+        /* THE COMPENSATING CONTROL FOR THE SUSPENDED IDLE TIMER, and the
+         * reason keep-open is allowed to exist at all. With the idle timeout
+         * gone, the thing that would have locked this safe while the operator
+         * was away is gone with it — so the banner stops being a countdown and
+         * becomes a statement, in words, above the rows it is about. It is the
+         * first line of the banner because it is the fact that changed. */
+        if (confirmed.length) {
+            var warn = el("p", "sec-agent-suspended");
+            warn.appendChild(el("strong", null, confirmed.length === 1
+                ? "The idle timeout is suspended for one safe below."
+                : "The idle timeout is suspended for " + confirmed.length +
+                  " safes below."));
+            /* ==============================================================
+             * THE PROMISE IS ONLY MADE WHILE IT CAN BE CHECKED.
+             *
+             * This paragraph is the compensating control for a safe that is
+             * open with nothing watching it, and the compensation is a
+             * SPECIFIC claim about what will still end it. When the daemon
+             * cannot be reached, this page cannot confirm any of it — not that
+             * the suspension is still in force, not that the holding is still
+             * there, not that anything it names would arrive. Repeating the
+             * promise from the last good poll is the banner outliving the
+             * thing it compensates for: the most reassuring sentence on the
+             * page, said at the one moment it is least entitled to be.
+             *
+             * So while `AGENT.failed` is set, the words say what is actually
+             * known — which is nothing — and the fault box above says to treat
+             * the safe as open until it clears.
+             * ============================================================== */
+            warn.appendChild(el("span", null, AGENT.failed
+                ? (" That was the last thing the agent said before it stopped " +
+                   "answering, and this page cannot confirm any of it now — not " +
+                   "that the suspension is still in force, and not that the safe " +
+                   "is still held. Lock it, or treat it as open.")
+                : (" They will NOT lock when you stop using them. They lock when the " +
+                   "absolute lifetime shown runs out — which nothing can extend — or " +
+                   "when you lock them, leave this page, hide this tab, or the screen " +
+                   "locks. Every one of those now reaches a suspended safe whether or " +
+                   "not this page is the one that unlocked it.")));
+            box.appendChild(warn);
+        }
+        /* THE NARROWER SENTENCE. The agent's ticket really is suspended — that
+         * much came from the daemon — but nothing here has confirmed that the
+         * idle timeout of the session holding the unlock is, so this page must
+         * not say it will not lock. It says what it knows and what to do about
+         * it, and the row's Lock button is the control that always works. */
+        if (ticketOnly.length) {
+            var un = el("p", "sec-agent-unconfirmed");
+            un.appendChild(el("strong", null, ticketOnly.length === 1
+                ? "The unlock agent's own idle timer is suspended for one safe below."
+                : "The unlock agent's own idle timer is suspended for " +
+                  ticketOnly.length + " safes below."));
+            un.appendChild(el("span", null,
+                " This page did not get that suspension from a session of its " +
+                "own, so it cannot tell you the session holding the unlock " +
+                "will not time out — only that the agent will keep its ticket " +
+                "until the absolute lifetime shown runs out. Lock them when " +
+                "you are done."));
+            box.appendChild(un);
+        }
         AGENT.rows.forEach(function (r) {
-            var line = el("div", "sec-agent-row");
+            var line = el("div", "sec-agent-row" + (r.keepOpen ? " keeping" : ""));
             line.appendChild(el("span", "sec-agent-name", String(r.label || r.safe || "safe")));
             /* aria-hidden: the digits change once a second, and the sentence a
              * screen reader needs is announced once, on change, into the polite
@@ -7258,26 +7669,60 @@
             var left = el("span", "sec-agent-left");
             left.setAttribute("aria-hidden", "true");
             line.appendChild(left);
+            if (r.keepOpen)
+                line.appendChild(el("span", "sec-agent-flag",
+                                    "idle timeout suspended"));
             r._node = left;
             line.appendChild(el("span", "sec-spacer"));
+            /* THE TOGGLE APPEARS ONLY WHERE THE REGISTRY ALLOWS IT, and when
+             * it does not, the row says so in one line rather than leaving a
+             * gap the operator has to interpret. Drawing a disabled control
+             * would imply the safe could have it; drawing nothing at all would
+             * leave "why does that safe have a toggle and this one not?"
+             * unanswered. */
+            if (keepOpenSupported()) {
+                if (r.allowKeepOpen) line.appendChild(keepOpenControl(r));
+                else line.appendChild(el("span", "sec-agent-why",
+                    r.keepOpenKnown
+                        ? ("idle timeout not suspendable — its registry entry does " +
+                           "not set agent.allow_keep_open")
+                        : ("idle timeout not suspendable — the unlock agent could " +
+                           "not be asked, and it is the only thing that decides")));
+            }
             line.appendChild(btn("Lock now", "danger", function () { agentLock(r); }));
             box.appendChild(line);
         });
         box.appendChild(el("p", "sec-subtle",
             "Held by secrets-agent rather than by this page, so they outlive closing this " +
-            "tab. They lock on the timeouts shown, which no client can extend (I18)."));
+            "tab. The ABSOLUTE lifetime shown is the one no client and no toggle can " +
+            "extend; only the idle timeout can be suspended, and only where the " +
+            "registry allows it (I18)."));
         host.appendChild(box);
         agentTick();
 
         /* One sentence to the polite region when the SET changes — not on every
-         * tick, and not on a poll that returned the same thing. */
+         * tick, and not on a poll that returned the same thing. The suspension
+         * is part of the key, because "the same safes, one of them no longer
+         * locking itself" is a change a screen-reader user must hear. */
         var key = AGENT.rows.map(function (r) {
-            return String(r.safe || r.label);
+            return String(r.safe || r.label) +
+                   (keptConfirmed(r.safe) ? " (kept open)"
+                                          : (r.keepOpen ? " (agent ticket suspended)" : ""));
         }).sort().join(", ");
         if (key !== AGENT.said) {
             AGENT.said = key;
             announce("Held unlocked by the agent: " + key +
-                     ". Each one has a Lock button in the banner at the top of the page.");
+                     ". Each one has a Lock button in the banner at the top of the page." +
+                     (confirmed.length
+                        ? " The idle timeout is suspended for " + confirmed.length +
+                          " of them: they will not lock on their own until the absolute " +
+                          "lifetime runs out."
+                        : "") +
+                     (ticketOnly.length
+                        ? " The agent's own idle timer is suspended for " +
+                          ticketOnly.length + " of them, which this page cannot " +
+                          "confirm reaches the session holding the unlock."
+                        : ""));
         }
     }
 
@@ -7286,8 +7731,14 @@
             if (!r._node) return;
             if (!r._deadline) { r._node.textContent = "no expiry published"; return; }
             var left = Math.ceil((r._deadline - Date.now()) / 1000);
+            /* WHICH NUMBER THIS IS, SAID OUT LOUD. Normally it is the sooner
+             * of the idle and absolute timers. With keep-open on there is only
+             * one timer left, it is the absolute one, and the row says so —
+             * "locks in 47:12" beside a suspended idle timeout would otherwise
+             * read as the ordinary countdown and hide the change. */
             r._node.textContent = left > 0
-                ? "locks in " + fmtSeconds(left)
+                ? "locks in " + fmtSeconds(left) +
+                  (r.keepOpen ? " (absolute lifetime)" : "")
                 : "locking now…";
             if (left > 0) return;
             /* The deadline the helper gave has passed. Ask what is actually
@@ -9249,6 +9700,12 @@
          * helper anyway; asking first lets it write its audit line. */
         window.addEventListener("pagehide", function () {
             clipboardClear("the page was hidden");
+            /* BEFORE the session teardown, and OUTSIDE its `if`. A suspended
+             * holding has no idle timer left to catch it, and this is one of
+             * the six presence locks the banner promises over every such
+             * holding — not only over the one this page happens to have a
+             * session for. */
+            agentPresenceLock("you left the page");
             if (SESSION) lockNow("the page was closed");
             /* A staged upload nobody is coming back to. The helper sweeps it on
              * its own idle timer anyway, but telling it now is the difference
@@ -9261,10 +9718,20 @@
             if (document.visibilityState === "hidden") {
                 clipboardClear("the tab was hidden");
                 if (HIDE_TIMER) window.clearTimeout(HIDE_TIMER);
-                if (!SESSION) return;
+                /* THE TIMER IS ARMED FOR A SUSPENDED HOLDING TOO, not only for
+                 * this page's own session. It used to return here whenever
+                 * SESSION was null, so a holding whose idle timeout somebody
+                 * had suspended sat through an indefinitely hidden tab with
+                 * nothing left to end it — the presence lock that the banner
+                 * named and the page did not have. */
+                var held = AGENT.rows.some(function (r) { return r.keepOpen; });
+                if (!SESSION && !held) return;
                 var after = uiNum("hide_lock_seconds", 60);
                 HIDE_TIMER = window.setTimeout(function () {
-                    if (document.visibilityState === "hidden" && SESSION)
+                    if (document.visibilityState !== "hidden") return;
+                    agentPresenceLock("this tab was hidden for " +
+                                      fmtSeconds(after));
+                    if (SESSION)
                         lockNow("this tab was hidden for " + fmtSeconds(after));
                 }, after * 1000);
             } else {
