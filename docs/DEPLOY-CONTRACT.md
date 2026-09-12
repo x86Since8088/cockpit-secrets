@@ -1091,11 +1091,17 @@ status note in §8.1 for what has since been fixed.
 >   `/etc/samba-ad-lab/lab.env`. Verified 2026-09-11: it resolves to the live `.secrets`, and all
 >   eight lab credentials matched the edy vault byte-for-byte. A move can no longer produce the
 >   empty-secrets-directory-at-a-dead-path failure described above.
-> - **Still open — the two copies.** `cockpit-adlab` is still not a git repo.
->   `samba-ad-lab/source/cockpit-adlab/` (15 files) remains canonical and the untracked
->   `projects/cockpit-adlab/source/` (9 files) has drifted behind it. `/opt/cockpit-adlab` does
->   now exist as the deployed install, which is the end state this section prescribes — what
->   remains is to stop treating `projects/cockpit-adlab/` as a place anyone edits.
+> - **Resolved 2026-09-11 — the two copies.** Reconciled. The untracked
+>   `projects/cockpit-adlab/source/` was verified to hold nothing the canonical tree lacks —
+>   shared files byte-identical, only a superseded 1.6 KB `install.sh` differed, and no unit,
+>   service or script on the host referenced it — and removed. Its `project_scope.md` was **not**
+>   redundant: it carried a verified analysis of where the shipped helper departs from this
+>   contract, found nowhere else. That is preserved at
+>   `samba-ad-lab/source/cockpit-adlab/docs/CONTRACT-GAP.md` and **§8 should be read against it**
+>   — it is the record of what this worked example has not yet achieved in practice. What remains
+>   at `projects/cockpit-adlab/` is a tombstone redirecting to the canonical tree and to
+>   `/opt/cockpit-adlab`; a backup of the removed tree is at
+>   `_migration-preserve-20260905/cockpit-adlab-RETIRED-20260911.tar.gz`.
 
 ### 8.2 `.envdefault`, shipped in `samba-ad-lab/source/cockpit-adlab/`
 
