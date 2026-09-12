@@ -1041,9 +1041,10 @@ purpose — a script that only checked its intentions would report the mode it m
 ## 8 · Worked example — cockpit-adlab and its sibling project
 
 `cockpit-adlab` is the only plugin that needs another project's location, which makes it the
-example. It is also, today, the most broken thing in the tree.
+example. It was also, when this was written, the most broken thing in the tree; see the
+status note in §8.1 for what has since been fixed.
 
-### 8.1 What is wrong now
+### 8.1 What was wrong (audited 2026-09-08)
 
 - `/usr/share/cockpit/adlab/manifest.json` and `/usr/local/sbin/adlab-admin` both contain
   `/srv/smb/share/sc/ai-orchestrator-group/ai-orchestrator-storage/projects/samba-ad-lab/source/...`.
@@ -1065,6 +1066,36 @@ example. It is also, today, the most broken thing in the tree.
   `samba-ad-lab/source/` is canonical.** The untracked `projects/cockpit-adlab/` becomes a
   deployed install at `/opt/cockpit-adlab`, produced by `deploy.sh`, and stops being a place
   anyone edits. It is not a seventh repository; it is the *output* of the sixth.
+
+> **Status as of 2026-09-11.** Four of the five findings above are resolved; the fifth is
+> structural and still open. Re-verified on edt1 while repairing the 17 `samba-ad-lab` containers
+> that failed to start from the same root cause — bind-mount sources baked into the container
+> config before the consolidation, which only surface on the next start.
+>
+> - **Resolved — hardcoded share path in the installed files.** Neither
+>   `/usr/share/cockpit/adlab/manifest.json` nor `/usr/local/sbin/adlab-admin` hardcodes the share
+>   path any more, so an unmounted share no longer makes the plugin *absent*.
+> - **Resolved — the manifest condition.** The installed manifest and the canonical tracked copy
+>   both gate on `{"path-exists": "/usr/local/sbin/adlab-admin"}` — exactly the rule §8.4
+>   prescribes. The untracked `projects/cockpit-adlab/source/` copy still carried the retired path
+>   until 2026-09-11 and has been aligned with the other two.
+> - **Resolved — `adlab-admin`'s four path constants.** Replaced by `_lab_root()`, which resolves
+>   `$ADLAB_LAB_ROOT` → the path recorded in `/etc/adlab/lab-root` (currently the projects tree) →
+>   a discovery sweep for a tree that actually contains `source/lab.env`. **Caveat when auditing
+>   this file:** its candidate literals are deliberately assembled from parts, so `grep -r` for a
+>   retired root returns nothing even where one survives as a last-resort candidate. A clean grep
+>   is not proof here; read `_lab_root()`.
+> - **Resolved — `lab.env`'s `SECRET_DIR`.** It is no longer a literal. It is derived from
+>   `lab.env`'s own location between explicit `>>> SECRET_DIR` / `<<< SECRET_DIR` markers, so it
+>   follows the tree, and `install.sh` rewrites it to an absolute path only when installing to
+>   `/etc/samba-ad-lab/lab.env`. Verified 2026-09-11: it resolves to the live `.secrets`, and all
+>   eight lab credentials matched the edy vault byte-for-byte. A move can no longer produce the
+>   empty-secrets-directory-at-a-dead-path failure described above.
+> - **Still open — the two copies.** `cockpit-adlab` is still not a git repo.
+>   `samba-ad-lab/source/cockpit-adlab/` (15 files) remains canonical and the untracked
+>   `projects/cockpit-adlab/source/` (9 files) has drifted behind it. `/opt/cockpit-adlab` does
+>   now exist as the deployed install, which is the end state this section prescribes — what
+>   remains is to stop treating `projects/cockpit-adlab/` as a place anyone edits.
 
 ### 8.2 `.envdefault`, shipped in `samba-ad-lab/source/cockpit-adlab/`
 
