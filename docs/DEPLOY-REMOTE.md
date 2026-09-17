@@ -1,6 +1,7 @@
 # Deploying the cockpit-* plugins on a machine that is not edt1
 
-Last measured: 2026-09-07.
+Last measured: 2026-09-07. Sections 1, 2, 3.1, 3.2, 11.3 and 15 re-measured 2026-09-08
+(branches, manifest conditions and installer file lists; see the note at the end of section 2).
 
 ---
 
@@ -49,17 +50,18 @@ large enough that it decides your afternoon.
 If you only want WireGuard or the tuner, you are in tier A and almost nothing in the rest of
 this document applies to you.
 
-`cockpit-adlab` is in no tier: it is not a git repository, it is not published anywhere, and its
-manifest condition points at a path that exists only on edt1. It cannot be deployed. See
-section 11.3.
+`cockpit-adlab` is now in tier A on its dependencies, but it is a special case for a different
+reason: it is useless without the samba-ad-lab containers it drives, and it ships inside that
+project's repository rather than one of its own. It **is** published, and its manifest condition
+is no longer an edt1-only path. See sections 2.2 and 11.3.
 
 ---
 
 ## 2. What you can clone
 
-Five repositories are public. **The repository name does not match the plugin directory name,
-and neither matches the menu label.** Nothing inside a clone tells you this, and no README in
-any of them contains a `git clone` line or a github.com URL — the clone step exists only here.
+Six repositories are public. **The repository name does not match the plugin directory name,
+and neither matches the menu label.** Nothing inside a clone tells you this: no README in any of
+them contains a `git clone` line for itself — the clone step exists only here.
 
 | clone this repo | installs as `/usr/share/cockpit/…` | Cockpit menu label |
 |---|---|---|
@@ -68,55 +70,88 @@ any of them contains a `git clone` line or a github.com URL — the clone step e
 | `x86Since8088/cockpit-os-tuner` | `tuner` | System Tuner |
 | `x86Since8088/cockpit-wireguard` | `wireguard` | WireGuard |
 | `x86Since8088/cockpit-secrets` | `secrets` | Secrets |
+| `x86Since8088/lin-ad-lab-with-cockpit` | `adlab` (in `cockpit-adlab/`) | AD Lab |
 
 ```bash
 git clone https://github.com/x86Since8088/linux-cockpit-remote-desktop-guac.git
 git clone https://github.com/x86Since8088/cockpit-headscale.git
 git clone https://github.com/x86Since8088/cockpit-os-tuner.git
 git clone https://github.com/x86Since8088/cockpit-wireguard.git
+git clone https://github.com/x86Since8088/cockpit-secrets.git
+git clone https://github.com/x86Since8088/lin-ad-lab-with-cockpit.git
 ```
 
-`install.sh` is at the **root of the clone**, not under `source/`:
+`install.sh` is at the **root of the clone**, not under `source/` — except for
+`lin-ad-lab-with-cockpit`, where the plugin is the `cockpit-adlab/` subdirectory and the
+repository root holds the lab's own installer instead:
 
 ```bash
 cd <clone-dir>
 sudo ./install.sh
 ```
 
-### 2.1 cockpit-secrets — clone it, but read this
+### 2.0 `install.sh` is not the deployment — `deploy.sh` is
 
-`cockpit-secrets` was published on 2026-09-07. A direct push to `main` was refused by branch
-protection, so **the repository currently has no `main` branch**; the code is on
-`init/publish-0.5.1` and `HEAD` points at it. Verified by `git ls-remote` today: exactly one ref,
-`refs/heads/init/publish-0.5.1` at `056e21e`.
+Every `sudo ./install.sh` line in this document still works, and it is what you want while you
+are trying a plugin out: `install.sh` is an **in-place install by symlink**. It copies nothing.
+It links the files beside it into `/usr/share/cockpit/<name>`, `/usr/local/sbin` and systemd, so
+the page Cockpit serves *is* your clone, and deleting or moving the clone breaks the install.
 
-A plain clone works today and lands you on that branch. To be safe either way:
+`deploy.sh`, beside it, is the real deployment and the only thing that copies bytes: it copies a
+declared payload subset into `/opt/<project>/payload-<version>/`, seeds `[install path]/.env`
+from `.envdefault` missing-only, swaps a `payload` symlink, and then runs the **same**
+`install.sh` from there. On a host you intend to keep, run `sudo ./deploy.sh`, not
+`sudo ./install.sh`.
+
+Two consequences for everything below:
+
+- Anywhere this document says `sudo ./install.sh`, `sudo ./deploy.sh` is the durable form.
+- `deploy.sh` never enables a unit unless you ask: `--with-policy` (wireguard, headscale),
+  `--with-timer` (tuner), `--with-agent` (secrets), `--with-users` / `--with-deps` /
+  `--with-image` / `--with-units` (guac-rdp). `install.sh` never enables one at all.
+
+The full model is `cockpit-secrets/source/docs/DEPLOY-CONTRACT.md`, which ships in the
+cockpit-secrets clone.
+
+### 2.1 cockpit-secrets — just clone it
+
+PR #2 was merged. `main` exists, it is the default branch, and `HEAD` points at it. Re-measured
+2026-09-08 with `git ls-remote --symref`: `ref: refs/heads/main  HEAD`, `refs/heads/main` at
+`e5507c5`.
 
 ```bash
-# works whether or not main exists yet
 git clone https://github.com/x86Since8088/cockpit-secrets.git
-cd cockpit-secrets && git branch --show-current      # init/publish-0.5.1, or main once merged
 ```
 
-If you want to pin explicitly and the branch still exists:
+**Do not pass `-b init/publish-0.5.1`.** Earlier revisions of this document told you to, and it
+is now the worst option available: that branch still exists, at `ab895ad` — which is
+`refs/pull/2/head`, the **pre-merge** commit. Cloning it gives you stale code and no error at all.
+
+### 2.2 cockpit-adlab — you can get it, inside another repo
+
+It ships inside the samba-ad-lab repository, because it is useless without the containers it
+drives:
 
 ```bash
-git clone -b init/publish-0.5.1 https://github.com/x86Since8088/cockpit-secrets.git
+git clone https://github.com/x86Since8088/lin-ad-lab-with-cockpit.git
+cd lin-ad-lab-with-cockpit/cockpit-adlab && sudo ./deploy.sh
 ```
 
-If that fails with "Remote branch not found", the branch has been merged — use the plain clone
-above.
-
-### 2.2 cockpit-adlab — you cannot get it
-
-It is not a git repository at all, locally or remotely. There is no URL. It also would not run
-on your machine if you had it; see section 11.3.
+Its manifest condition is now `path-exists /usr/local/sbin/adlab-admin` — its own helper, which
+its own installer links — so it no longer disappears on a host that is not edt1. What it needs
+instead is the lab: run the repository's own `install.sh` first, which puts `lab.env`, `rdp.env`
+and the SYSVOL scripts under `/etc/samba-ad-lab` and `/usr/local/libexec/samba-ad-lab`. Read
+section 11.3 before you start — the helper has a path-resolution defect that matters to you.
 
 ### 2.3 One more caveat on the clones
 
-`cockpit-wireguard`'s build-host checkout is **not** `main`. What runs on edt1 is branch
-`test/adopt-wgclient-render-harness`; `main` is a different commit. So even on Ubuntu, "cloned
-from main" is not the same code that has been exercised here.
+One build-host checkout is **not** `main`: `cockpit-guac-rdp` is on
+`fix/exec-bits-on-execstart-targets`. So for that plugin, "cloned from main" is not the same
+code that has been exercised here. The other five checkouts are on `main`.
+
+The branch and clone facts in this section were re-measured on 2026-09-08 against the public
+remotes and the build-host checkouts. Everything about *distributions other than Ubuntu 26.04*
+was not re-measured and remains as described in section 0.
 
 ---
 
@@ -138,9 +173,10 @@ The conditions that actually ship:
 | plugin | condition | so it silently disappears when… |
 |---|---|---|
 | `cockpit-secrets` | `path-exists /usr/local/sbin/secrets-admin` | the helper failed to install |
-| `cockpit-wireguard` | `path-exists /usr/bin/wg` | `wireguard-tools` is absent, **or** your distro puts `wg` somewhere other than `/usr/bin/wg` — the path is hardcoded |
-| `cockpit-adlab` | `path-exists /srv/smb/…/samba-ad-lab/source/lab.env` | always, on any host but edt1 |
-| guac-rdp / headscale / tuner | none | n/a |
+| `cockpit-wireguard` | `path-exists /usr/local/sbin/wg-admin` | the helper failed to install. It no longer keys on `/usr/bin/wg`, so the "your distro puts `wg` elsewhere" trap is gone — but `wireguard-tools` is still a real runtime dependency, just not a manifest condition |
+| `cockpit-adlab` | `path-exists /usr/local/sbin/adlab-admin` | the helper failed to install |
+| `cockpit-headscale` | `path-exists /usr/local/sbin/hs-admin` | the helper failed to install |
+| guac-rdp / tuner | none | n/a |
 
 **The one diagnostic that answers "why isn't the page there":**
 
@@ -154,22 +190,26 @@ cockpit-bridge --packages | grep -E 'wireguard|headscale|tuner|guac-rdp|secrets'
 - absent, no error → a `conditions` path does not exist. Check the table.
 - `cockpit.packages-ERROR: …` → malformed manifest; it names the file and the column.
 
-### 3.2 cockpit-wireguard does not install its own backend — on any distro
+### 3.2 cockpit-wireguard installs its own backend now — this is FIXED
 
-`wgclient.js` calls `/usr/local/sbin/wg-admin`. The installer's file arrays
-(`FILES=(manifest.json index.html wireguard.js wgclient.js wireguard.css)` and
-`POLICY_FILES=(routing-policy.json wg-policy wg-policy-watch wg-policy-watch.service)`) do not
-contain `wg-admin`, and the README never mentions it. The repo ships `wg-admin`; nothing
-installs it. On edt1 it is present only because it was put there by hand.
+Earlier revisions of this document warned that `wgclient.js` called `/usr/local/sbin/wg-admin`
+and that nothing installed it, so the client-provisioning UI shipped with no backend. **That was
+fixed and the fix is what ships.** The `FILES`/`POLICY_FILES` arrays it described no longer
+exist; the manifest block in `install.sh` declares
 
-**This is not a portability problem — it breaks on Ubuntu too.** The status view works; the
-client-provisioning UI has no backend. If you want that feature:
-
-```bash
-sudo install -o root -g root -m 0755 wg-admin /usr/local/sbin/wg-admin
+```
+HELPERS=(wg-admin wg-admin-package wg-policy wg-policy-watch)
 ```
 
-(Inference, not measurement: the failure mode was read from the code path, not observed.)
+and `install.sh` links all four into `/usr/local/sbin/`. Verified on edt1 on 2026-09-08: all four
+are symlinks there. There is no manual `install` step to perform, and running one would leave a
+regular file where the installer expects a link.
+
+The same defect existed in `cockpit-headscale` (`hs-admin` was placed by hand and referenced
+nowhere) and is fixed the same way: `HELPERS=(hs-admin hs-policy)`.
+
+What is genuinely still on you, on every distro: `wireguard-tools` itself. `wg-admin` drives
+`wg`/`wg-quick` and nothing here installs them.
 
 ### 3.3 Nothing restarts Cockpit, and nothing needs to
 
@@ -643,19 +683,44 @@ plugin — with guac-rdp declared out of scope rather than half-ported.
 
 See sections 7 and 9. Ubuntu 22.04 is dead for tiers B and C. Debian 12 is tier A only.
 
-### 11.3 cockpit-adlab — cannot be deployed by anyone
+### 11.3 cockpit-adlab — deployable now, with one defect you must know about
 
-It is not a git repository, so there is nothing to clone. Even if you had the tree, its
-`manifest.json` condition is an absolute path that exists only on edt1
-(`/srv/smb/…/samba-ad-lab/source/lab.env`), so on any other machine the plugin installs
-successfully and is then **silently invisible forever** — see section 3.1.
+The two reasons this section used to give are both gone. It **is** a git repository (it ships
+inside `lin-ad-lab-with-cockpit`, section 2.2), and its committed `manifest.json` condition is
+`{"path-exists": "/usr/local/sbin/adlab-admin"}` — its own helper, not an edt1 path. Nothing
+tracked in that repository names `/opt/sc/git` any more. Verified 2026-09-08 by reading
+`origin/main`.
 
-**Related warning, and it is current rather than hypothetical:** the public repository
-`lin-ad-lab-with-cockpit` tracks a `cockpit-adlab/` directory whose committed `manifest.json`
-declares `{"path-exists": "/opt/sc/git/samba-ad-lab/source/lab.env"}`. That path no longer exists
-— the lab moved and the repo was never updated; nine committed files still reference
-`/opt/sc/git`. If you clone that repo and install it, you get **no error and no menu entry**.
-That is the canonical worked example of the failure in section 3.1.
+**The defect that remains, and it is why this is still section 11 and not section 4.**
+`adlab-admin` does not read the `.env` the deploy contract seeds for it. It resolves the lab
+tree as `$ADLAB_LAB_ROOT` → the path recorded in `/etc/adlab/lab-root` → a built-in discovery
+sweep, and derives `lab.env`, `rdp.env`, the SYSVOL script and the administrator passphrase file
+from whatever that returns. None of its six declared `ADLAB_*` keys is used, and there is no
+`adlab-admin config` verb, though both `deploy.sh` and the lab's `install.sh` tell you to run one.
+
+> **This remediation does not work against a plain clone, and you should know why before you
+> try it.** `adlab-admin`'s `_lab_root()` accepts a recorded path only when
+> `<path>/source/lab.env` is a file. The published `lin-ad-lab-with-cockpit` repository has
+> `lab.env` at its **top level** — there is no `source/` directory in it. So a path pointing at
+> your clone is rejected and the plugin stays inert, with no error naming the cause. It works on
+> the build host only because the orchestrator layout happens to supply that extra level
+> (`projects/samba-ad-lab/` containing `source/`). To use it you must reproduce that shape —
+> the recorded path has to be the **parent of a directory named `source`** that contains
+> `lab.env` — or wait for the code to accept a repository root directly. The same caveat
+> applies to the `ADLAB_LAB_ROOT` key.
+
+
+For you, on a machine that is not edt1, that means:
+
+- Nothing writes `/etc/adlab/lab-root`. Neither installer creates it.
+- The built-in sweep looks for a tree at paths that exist only on the build host.
+- So unless you set `ADLAB_LAB_ROOT` in the environment, or create `/etc/adlab/lab-root`
+  containing the absolute path of your `lin-ad-lab-with-cockpit` clone, every verb that touches
+  lab configuration fails — while the page itself loads normally, because the manifest condition
+  is satisfied by the helper being installed.
+
+Editing `.env` will not fix it; the helper never reads that file. This needs a code change and is
+recorded, not solved.
 
 ---
 
@@ -695,18 +760,27 @@ sudo ausearch -m AVC,USER_AVC -ts recent
 DESTDIR=/tmp/stage ./install.sh && find /tmp/stage -type f
 ```
 
-`cockpit-secrets` and `cockpit-wireguard` **refuse to run as non-root even with `DESTDIR=` set** —
-the EUID check comes first. `cockpit-tuner`, `cockpit-headscale` and `cockpit-guac-rdp` do stage
-as an ordinary user, which is the cheapest way to see what an installer would do to your machine.
+Re-measured 2026-09-08, and the split is **not** the one earlier revisions of this document gave.
+`cockpit-secrets`, `cockpit-tuner` and `cockpit-guac-rdp` stage as an ordinary user when
+`DESTDIR=` is set (their EUID check is guarded by it), which is the cheapest way to see what an
+installer would do to your machine. `cockpit-wireguard` and `cockpit-headscale` refuse non-root
+**unconditionally** — their EUID check is not guarded by `DESTDIR`.
 
-### Two documented options that do not behave as documented
+### One documented option that no longer misbehaves, and one that still bites
 
-- **`cockpit-headscale --with-policy` is rejected.** The README says to use it; the argument
-  loop's `*)` arm prints "unknown option" and exits 1. Use `WITH_POLICY=1 ./install.sh` instead.
-  (`cockpit-wireguard` has no argument loop, so `--with-policy` works there.)
-- **`cockpit-headscale`'s policy mode writes to `/var/snap/headscale/common/acl-policy.hujson`.**
-  That path only means anything where headscale is the Canonical snap. On a distro-packaged or
-  upstream-binary headscale the file lands somewhere inert.
+- **`cockpit-headscale --with-policy` is accepted now.** Earlier revisions said the argument loop
+  rejected it. It does not: the flag survives as an alias for `--with-units`, because helpers are
+  no longer opt-in — the page cannot work without `hs-admin`. `WITH_POLICY=1 ./install.sh`, which
+  those revisions recommended instead, is what does **not** work: no environment variable is read.
+  On `deploy.sh`, `--with-policy` is the flag that actually enables and starts the reconciler.
+- **`cockpit-headscale`'s `HS_ACL_POLICY_FILE` defaults to
+  `/var/snap/headscale/common/acl-policy.hujson`.** That path only means anything where headscale
+  is the Canonical snap, and on this host it must be inside the snap's writable area because
+  confinement stops the daemon reading `/etc`. On a distro-packaged or upstream-binary headscale,
+  repoint it: it is an `.env` key, and the seed follows the key rather than a literal, so changing
+  `HS_ACL_POLICY_FILE` before you deploy puts the seeded policy where you actually want it. The
+  same is true of `HEADSCALE_BIN` and `HEADSCALE_CONFIG`, which are **required** keys precisely
+  because headscale is packaged by no distribution and there is no layout to fall back on.
 
 ### One inference to check yourself on RPM distros
 
@@ -749,32 +823,44 @@ cd <clone-dir> && sudo ./install.sh --uninstall
 **What that does not remove**, stated because you are deploying something unproven and need the
 way back to be honest:
 
-- **cockpit-wireguard** removes *only* `/usr/share/cockpit/wireguard`. If you used
-  `--with-policy`, then `/usr/local/sbin/wg-policy`, `/usr/local/sbin/wg-policy-watch`,
-  `/etc/wireguard/routing-policy.json` and `/etc/systemd/system/wg-policy-watch.service` are all
-  left behind **and possibly still enabled**. Same shape for **cockpit-headscale** (`hs-policy`,
-  its unit, the ACL file) and for **cockpit-tuner** in system mode (its timer is only torn down
-  in `--user` mode).
+- **This is now much less bad than earlier revisions of this document said.** The manual cleanup
+  they printed for `cockpit-wireguard` is obsolete: `--uninstall` stops and disables
+  `wg-policy-watch.service`, removes it, removes all four `/usr/local/sbin` helper links, the page
+  links and `install.conf`. `cockpit-headscale` and `cockpit-tuner` do the same for their units,
+  in the right scope (`systemctl --user` for a `--user` tuner install). Do not run those `rm -f`
+  lines; on a current install they would delete links the installer already removed.
 
-  ```bash
-  sudo systemctl disable --now wg-policy-watch.service 2>/dev/null
-  sudo rm -f /usr/local/sbin/wg-policy /usr/local/sbin/wg-policy-watch \
-             /etc/systemd/system/wg-policy-watch.service /etc/wireguard/routing-policy.json
-  sudo systemctl daemon-reload
-  ```
+  What every one of them keeps, deliberately, is your **data**: the `.env`, and the operator files
+  each names on the way out — `WG_STATE_DIR` (peer keys, client configs) and `WG_POLICY_FILE` for
+  wireguard, the routing and ACL policies for headscale, `TUNER_UNDO_DIR` (the root-owned undo
+  journal, the only record of what was changed on the machine) and every user's history directory
+  for tuner. Removing those is a separate, deliberate action.
+
+- **`deploy.sh --uninstall` vs `--remove`.** On a host you deployed with `deploy.sh`, `--uninstall`
+  runs the installed `install.sh --uninstall` and leaves the deployed tree under `/opt/<project>`
+  in place — so the previous payload is still there and rollback is still two local commands.
+  `--remove` deletes the deployed payloads as well.
 
 - **cockpit-secrets** deliberately keeps `/etc/cockpit-secrets` (registry and safe files),
   `/var/log/cockpit-secrets` (audit log), `/var/lib/cockpit-secrets/state` (lockout counters) and
   `/var/lib/cockpit-secrets/exports`. It prints all of them and tells you to `shred -u` the
   exports directory, **because an export there is an entire safe in plaintext.** It also cannot
   stop another user's agent — root cannot reach another user's systemd instance.
-- **cockpit-guac-rdp** is the most thorough: units, polkit rule, nft drop-ins, tmpfiles, D-Bus
-  policy, libexec, and it restores the stock `gnome-remote-desktop-daemon` if the greeter patch
-  was deployed. It does **not** delete the `edy-rdp` group or the `edy-relay` user.
+- **cockpit-guac-rdp** removes the most: units (instances and sockets stopped first), the polkit
+  rule, the nft drop-ins, tmpfiles, the D-Bus policy, the libexec links, the page links and
+  `install.conf`. It does **not** delete the `edy-rdp` group or the `edy-relay` user — uids
+  outlive packages, and a reused uid is a permission that silently belongs to somebody else.
 
-One thing to know before you install, not after: **all six installers sweep stale files.** After
-copying their payload they delete anything in `/usr/share/cockpit/<name>/` that is not in the
-payload list. Do not put anything of your own there — the next install run removes it.
+  It also does **not** revert the OS packages, the guacd container image, the
+  gnome-remote-desktop greeter patch and its apt hold, or the 3390 door credential. Earlier
+  revisions of this document said the greeter patch was restored; it is not, and the current
+  installer says so explicitly, for the reason that it never applied them — those are `deploy.sh`
+  flags and host state, not things `install.sh` ever touched.
+
+One thing to know before you install, not after: **the installers sweep stale files.** They do
+not copy a payload — they link it — but after linking they delete anything in
+`/usr/share/cockpit/<name>/` that is not on the declared `PAGE` line. Do not put anything of your
+own there; the next install run removes it.
 
 ---
 
@@ -819,7 +905,14 @@ itself most of the time.
   about Ubuntu 26.04 came from a repository index, and most of them from a single lookup that was
   not cross-checked against a second source.
 - **Known not to work:** Ubuntu 22.04 (tiers B and C), Debian 12 (tiers B and C), RHEL/Rocky 9
-  and 10 (guac-rdp), Alpine (everything), cockpit-adlab (everywhere but edt1).
+  and 10 (guac-rdp), Alpine (everything). `cockpit-adlab` is no longer in this list — it is
+  publishable and installable now, but its helper cannot find the lab without
+  `ADLAB_LAB_ROOT` or `/etc/adlab/lab-root`; see section 11.3.
+- **Re-measured 2026-09-08, and only this:** the public branch state of every repository, the
+  `conditions` in every shipped `manifest.json`, the helper arrays in `cockpit-wireguard`'s and
+  `cockpit-headscale`'s `install.sh` (and the corresponding symlinks on edt1), and
+  `adlab-admin`'s path resolution. The distribution matrix in sections 5–11 was **not**
+  re-measured.
 - **Not assessed at all:** `python3-pyotp`, `python3-lxml` and `python3-jsonschema` on Debian;
   `xvfb`, `x11vnc`, `nftables` and `dbus` outside the build host (presence assumed from these
   being universally packaged, not confirmed); RHEL proper as distinct from Rocky (all EL versions

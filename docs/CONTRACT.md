@@ -84,7 +84,8 @@ Verbs take a registry **id**; there is no verb that opens a caller-supplied path
   "password_required": true,            // false ONLY with a keyfile/hardware key
   "keyfile": null,                      // absolute path, helper-side only
   "yubikey_slot": null,
-  "agent": { "enabled": false, "idle_seconds": 300, "max_seconds": 3600 },
+  "agent": { "enabled": false, "idle_seconds": 300, "max_seconds": 3600,
+             "allow_keep_open": false },   // I18 — may the idle timeout be suspended?
   "export_allowed": false,              // I21
   "export_dir": null,                   // I21 — absolute, never under /tmp
   "breach_corpus": null,                // absolute path to an OFFLINE corpus
@@ -200,8 +201,9 @@ exist. Named here as a gap rather than described as a decision.
 
 ## Verbs
 
-Forty-one verbs — the thirty-three below plus the eight registry-writing ones added in
-0.4.0 (`safe-create`, the five `import-*` steps, `safe-forget`, `safe-delete`). `schema` publishes all of them with their request fields, response keys,
+Forty-two verbs — the thirty-three below plus the eight registry-writing ones added in
+0.4.0 (`safe-create`, the five `import-*` steps, `safe-forget`, `safe-delete`) and `keep-open`,
+added with the I18 keep-open relaxation. `schema` publishes all of them with their request fields, response keys,
 `danger`/`mutates`/`needs` flags and a `breaks_when_wrong` sentence each; the tables here are
 the prose, and the schema is the machine-readable form the page builds from.
 
@@ -211,6 +213,8 @@ secrets-admin schema                  -> { version, helper_version, base_version
                                            ui_rules[] }
 secrets-admin list                    -> { safes:[{id,label,format,access,mode,locked,reason,
                                            usable,password_required,needs_keyfile,agent_enabled,
+                                           agent_keep_open_allowed,
+                                           agent_keep_open_known,
                                            export_allowed,registry,origin,manageable,path?}],
                                            registry_errors:int }
 secrets-admin probe    <stdin:{safe}> -> { format, version, kdf, iterations, needs_password,
@@ -242,6 +246,17 @@ secrets-admin save     <stdin:{handle,override_stale}>
                                       -> { ok:true, backup, bytes, conflict:false }
 secrets-admin lock     <stdin:{handle|safe}>
                                       -> { ok:true, locked, agent_dropped? }
+secrets-admin keep-open <stdin:{safe,enabled,handle?}>
+                                      -> { ok:true, keep_open, affected, changed,
+                                           expires_in, idle_expires_in, max_seconds,
+                                           idle_seconds, session, session_keep_open,
+                                           session_expires_in, session_idle_expires_in,
+                                           session_idle_seconds, session_max_seconds,
+                                           warnings? }
+                                         # session_* describe THIS session's idle
+                                         # timer — the one that ends the operator's
+                                         # work. session_expires_in is the deadline
+                                         # the page adopts; it never computes one.
 secrets-admin generate <stdin:{policy}>  -> { value, entropy_bits, calculation,
                                               alphabet_size }
 secrets-admin health                     -> { version, base_version, schema_version,
@@ -810,6 +825,8 @@ The complete shape of one row, which is what the block at the top of "Verbs" now
 | `password_required` | bool | from the entry; false for a key-file-only safe |
 | `needs_keyfile` | bool | the entry names a `keyfile` **or** a `yubikey_slot` |
 | `agent_enabled` | bool | the per-safe agent opt-in (I18) |
+| `agent_keep_open_allowed` | bool | whether the keep-open toggle may be drawn for this safe. **The DAEMON's answer**, fetched by one `policy` call per access class — not a second read of `agent.allow_keep_open` by the helper, which is how the page and the gate came to disagree |
+| `agent_keep_open_known` | bool | whether that answer came from the daemon at all. `false` means nothing could be asked, and `agent_keep_open_allowed` is then `false` because keep-open cannot work without a daemon — a different problem from "your registry says no", with a different fix |
 | `export_allowed` | bool | whether `export` is permitted for this safe at all |
 | `registry` · `origin` · `manageable` | | as the table above |
 | `path` | string, **absent only when unresolvable** | where the file lives |
@@ -1013,6 +1030,15 @@ connection is closed. Four operations, and `secrets-admin` is only ever the clie
 -> {"op":"drop","safe":"lab-dc"}        # or {"handle":…} / {"all":true}
 <- {"ok":true,"dropped":1}
 
+-> {"op":"policy","safes":["lab-dc","other"]}
+<- {"ok":true,"available":true,"keep_open":{"lab-dc":true,"other":false}}
+   # the one reader of agent.allow_keep_open, made addressable so the helper
+   # asks the process that refuses instead of reading the registry itself
+
+-> {"op":"keep-open","safe":"lab-dc","enabled":true}     # or {"handle":…}
+<- {"ok":true,"safe":"lab-dc","keep_open":true,"changed":1,"affected":1,
+    "expires_in":3412,"idle_expires_in":null,"idle_seconds":300,"max_seconds":3600}
+
 -> {"op":"status"}
 <- {"ok":true,"pid":…,"owner_uid":…,"holdings":[…],"idle_seconds":…,"max_seconds":…,
     "clock":"BOOTTIME","socket":{…},"session":{…}}
@@ -1030,6 +1056,143 @@ creating the run directory); **never fail a verb because of the agent** (every c
 on any error, so a hung or hostile daemon costs one extra prompt, never a failed verb); and
 **validate the socket before speaking to it** — owner and mode on the 0700 run directory and on
 the socket node, by `lstat`, never `stat`.
+
+The third rule has **exactly one exception, and it is the `keep-open` verb**. Every other agent
+call is a side effect of a verb that is about something else, so a daemon that cannot answer
+costs one extra prompt. `keep-open` IS the agent operation: if the daemon did not hear it, the
+idle timeout is still running, and a helper that answered `ok` anyway would hand the page a
+toggle reading "on" over a safe about to lock itself. So that verb answers `unsupported` when the
+agent does not reply, and the operator is told that nothing changed.
+
+#### `keep-open` — suspending the idle timeout, and what still bounds it
+
+`agent.allow_keep_open` (default **false**, and it needs `agent.enabled` too) permits an operator
+control that **suspends the IDLE timer that would otherwise end their working session**, and the
+agent ticket's idle timer with it. It exists because the idle timer is the one that fires in the
+middle of a task.
+
+**WHICH TIMER, AND WHY THAT SENTENCE IS THE WHOLE FEATURE.** The first implementation suspended the
+agent TICKET's idle timer only. The agent holds a ticket and no key material — "no key material
+crosses this socket in either direction", above — so suspending it kept nothing open: what ends an
+operator's session is `SESSION_IDLE_SECONDS` in the helper's own `open` session, where the channel
+going quiet exits the process and the exit takes the unlock. The toggle went on, the banner said
+they would not be locked out, and they were locked out on the original schedule. `keep-open` now
+suspends the SESSION's idle timer — inside an `open` session, which is the only place there is one
+— and asks the daemon to suspend the ticket's so the two agree about one fact. Outside a session
+the verb still changes the ticket, and says in `warnings` that there was no session idle timeout to
+suspend rather than claiming one was.
+
+**THE STANDING BAN: THE THING GATED AND THE THING AFFECTED ARE THE SAME SCOPE.** There is exactly
+one idle timer in a helper session and it ends the whole process, so suspending it suspends the
+only idle protection every safe that process has unlocked has. The daemon's gate is about ONE
+safe. Those are different scopes, and the gap between them was a bypass: with `lab-A` opted in and
+`lab-B` opted out, one session holding both could toggle `lab-A` and keep `lab-B` open through
+silence it would otherwise have died in — while the page drew no toggle on `lab-B`'s row at all.
+
+So the rule, and it is a rule rather than a note because **this mistake has now been made twice**
+(the first was `op_put`, gating on the request's safe while acting on a holding found by handle):
+
+> Wherever keep-open is granted, the scope the gate was asked about MUST be the scope the grant
+> affects. The grant affects the whole session, so the gate is asked about the whole session.
+
+In code that is: the suspension is in force only while EVERY safe the session holds has been
+affirmed by the daemon (`held <= allowed`); that comparison, in `SessionWindow._rescope`, is the
+only line in the program that assigns `keep_open`; the mutator takes the session's held set
+keyword-only and without a default so a call site cannot narrow it by forgetting an argument; the
+scope is re-derived after every verb, because `unlock` is a verb and a scope checked only at the
+toggle could be walked around by unlocking afterwards; and the reply to the verb that broke the
+scope carries the state AFTER the re-derivation, because the page adopts from replies.
+`validate.sh` greps for every one of those.
+
+Precisely what it does and does not change:
+
+- **The absolute lifetime is untouched by any client.** The session's `SESSION_MAX_SECONDS` is
+  counted from the session's START, not from the toggle and not from now; the agent's `max_seconds`
+  still counts from the unlock; `expires_in` still reports them; and both still end a suspended
+  holding. "Keep it open" means "until the absolute deadline", never "until I say so".
+  **One input may raise the session's bound: the safe's own registry entry** (`agent.max_seconds`),
+  because the registry is the operator's policy file rather than a client. It is capped at
+  `SESSION_KEEP_OPEN_CEILING` (the same 3600 s ceiling a `session` frame is clamped to), announced
+  on stderr when it goes above the default, idempotent (`started + capped`, so re-sending the
+  toggle cannot ratchet it), and **refused outright once a client has shortened the lifetime** —
+  a client that could shorten the bound and get it back by clicking a toggle would have found an
+  indirect way to extend its own. That guard covers BOTH doors a client can shorten through: a
+  `session` frame and `unlock`'s own `max_seconds`. It used to cover only the first, so shortening
+  at the unlock and then toggling handed the lifetime straight back.
+  **And the raise is contingent on the suspension**: switching keep-open off, or having it revoked,
+  gives it back and re-publishes the lowered `session_expires_in`/`session_max_seconds` in the same
+  reply. Left standing, it was an extension bought with two clicks.
+- **Every presence lock still fires, immediately.** `drop` (which is what the page's Lock button,
+  its `pagehide` handler and its hidden-tab timer all reach), SIGTERM, the daemon's logind poll
+  when the session locks or ends, and its freeze detector when the machine suspends. Those are not
+  timeouts; they are "nobody is here", and suppressing them is the hazard rather than the rest of
+  the job. Two of them used to miss: the page's `pagehide` and hidden-tab handlers ran entirely
+  inside `if (SESSION)`, so a SUSPENDED holding the page did not create sailed through both while
+  the banner promised otherwise. They now reach every suspended holding the page can see, whoever
+  created it. An ordinary, unsuspended holding still outlives the tab — that is what the agent is
+  for, and its idle timer still bounds it.
+- **A suspended session re-asks ON A CLOCK, and cannot outlive its permission or the presence
+  signals.** Every `SESSION_KEEP_OPEN_RECHECK_SECONDS` — counted from the last re-ask, at the TOP
+  of the session loop, so it happens whether the session is silent or busy. It used to live in the
+  idle-timeout branch, which meant it was reached only by a session that had gone quiet: a session
+  that kept talking never re-asked at all, and a withdrawn opt-in or a presence signal landing at
+  the daemon reached exactly the sessions that were about to end anyway. The re-ask covers EVERY
+  safe in the grant and re-derives the scope over every safe the session HOLDS, so an opt-in
+  withdrawn from a held safe that was never toggled revokes the suspension too. A refusal puts the idle timer back **without resetting it** — the session has been idle
+  for however long it has been idle — and the session then ends on the ordinary idle rule. An
+  answer of `affected: 0` means the daemon is no longer holding that safe, which can only be a
+  presence drop or its own absolute deadline, and the session ends with `reason: "agent-released"`.
+- **OFF always reaches the session's own timer, even when the daemon refuses it.** The daemon gates
+  both directions and must (its OFF resets the holding's idle timer, so an ungated OFF is a
+  keepalive) — which means it refuses OFF for a safe whose opt-in has just been withdrawn. The
+  helper used to relay that refusal, so the operator whose registry had changed under them could
+  not turn the toggle off at all. The daemon's gate is unchanged; the helper resumes its own idle
+  timer regardless and says in `warnings` that the daemon refused its half. Resuming a timer is
+  strictly more protective than not resuming it and grants a caller nothing.
+- **The suspension dies with the session — ALL of it, on every exit including SIGTERM.**
+  `run_session`'s teardown lifts it at the daemon for **every** safe the grant covered and says how
+  many and which; it used to name the last safe toggled, release that one, and report that it had
+  released them all. A suspension that outlived its session is what made the page's banner go on
+  promising protection for a session that had ended. And the teardown now runs on the path Cockpit
+  actually takes: the page's `proc.close("terminated")` SIGNALS the helper, and with no handler
+  that was the kernel's default — the process died where it stood and the release never ran at all.
+  SIGTERM and SIGHUP unwind into the teardown (`reason: "terminated"`); SIGKILL still cannot, and
+  the daemon's `reconcile_keep_open` and presence drops are the backstop for that.
+- **A withdrawn opt-in reaches a LIVE suspension.** The daemon reconciles every suspended holding
+  against the registry before each expiry scan (`reconcile_keep_open`, throttled by
+  `POLICY_RECHECK_SECONDS`), clears the ones it no longer allows and does **not** `touch()` them —
+  so a holding that has genuinely been idle is dropped by that same pass, and one that is being
+  used survives with its idle timer running again. Without this, `allow_keep_open: false` only ever
+  stopped the NEXT request and a running suspension kept its permission for the rest of the
+  holding's lifetime: a gate that cannot be withdrawn.
+- **The DAEMON decides, not the caller — and it is the ONLY reader.** `secrets-agent` reads the
+  registry itself — one boolean per id, nothing else, `O_NOFOLLOW` on the directory and the file,
+  refusing anything another uid can write — and answers `access-denied` for a safe that did not opt
+  in, whatever the client says. **Both directions are gated identically**: `{"enabled": false}` used
+  to skip the gate and still reset the idle timer, which made it a handle-free, passphrase-free
+  keepalive that worked on safes the registry had never opted in. It is gated now, and the reset
+  happens only for a holding that really was suspended. `op_put`'s gate is evaluated against the
+  safe the holding will HAVE after any relabel, not against the one in the request — the former was
+  bypassable in three messages by re-putting a handle onto an allowed safe and then back.
+  The helper no longer forms its own opinion at all: `v_keep_open` relays the daemon's answer, and
+  `list` gets `agent_keep_open_allowed` from the daemon's `policy` op. Two readers of one registry
+  key gave two answers, and the operator was shown one and governed by the other.
+  `--no-keep-open` is an agent-wide ceiling above all of it, and no registry entry lifts it.
+- **It is audited and it is visible, and the audit says WHICH DIRECTION.** One metadata-only line
+  per holding per change (`op: "keep-open"`, the safe, the uid, `enabled`/`disabled` — never a
+  value and never a path). The helper's own line carries `note: "keep-open-on"` or
+  `"keep-open-off"`; those two strings were being set and then dropped, because `audit()` keeps
+  only notes in its declared set and neither was in it — so every line read `"note": ""` and the
+  log could not tell the timer being switched off from it being switched back on. Also
+  `status`/`health` report `keep_open` per holding plus a `keep_open: {available, registry_dirs,
+  suspended}` block, so the state is inspectable without the page.
+- **`idle_expires_in` is `null` while it is suspended**, not a large number. A caller must be able
+  to tell "no idle deadline is running" from "one is, and it is far away"; a number is what a UI
+  would draw a countdown from. `Number(null)` is 0, so a page that reads it as a number counts
+  down to a lock that is not coming.
+
+Non-negotiable 9 is unaffected: the agent still holds a ticket rather than key material, so a
+suspended holding still cannot reopen a safe without the passphrase.
 
 ### Error taxonomy
 
@@ -1149,14 +1312,20 @@ requests, this file for responses.**
 **C · Cross-checkable now, and cross-checked.** Everything in "The verbs that WRITE the
 registry" was specified here *ahead of* the helper — at the time it was written
 `secrets-admin schema` listed 33 verbs and none of `safe-create`, `import-*`, `safe-forget`
-or `safe-delete` existed. It now lists **41 verbs and 43 fields**, every one of those blocks
+or `safe-delete` existed. It now lists **42 verbs and 44 fields** (`keep-open`, and the
+`enabled` field it reads, are the most recent pair), every one of those blocks
 is checkable against a running helper, and the section below records what disagreed and which
 side moved.
 
 Two of the three groups above are unchanged by that: the `schema` verb's `response` map is
 still an abbreviation (group B), and `list`'s map has been widened to name the keys it
-actually returns — **sixteen** of them as of R5's `path`, and this document's own inline block
-had lagged at ten until that pass re-checked the whole row against the running helper.
+actually returns — sixteen as of R5's `path`, **seventeen** since `keep-open` added
+`agent_keep_open_allowed`, and **eighteen** since that key started carrying the daemon's answer
+and needed `agent_keep_open_known` beside it to say whether there was one — and this document's
+own inline block had lagged at ten until that
+pass re-checked the whole row against the running helper. The row below is checked against a
+running helper, not maintained by hand: a key added to `v_list` and not added here is the same
+defect the table below records.
 
 ---
 

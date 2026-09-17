@@ -52,6 +52,30 @@ to raise. It is not "how long until it locks". It is **the size of the window in
 which your unlocked, unattended screen is an unlocked, unattended password
 safe.** Above a few minutes you are running one as a service.
 
+And `agent.allow_keep_open` is that same temptation with no number on it at all.
+It permits a per-session control that **switches `idle_seconds` off** for one
+safe, so the window above becomes the whole of `max_seconds`. It is false by
+default, it needs `agent.enabled` as well, **the daemon reads it off the registry
+itself and refuses a request for a safe that did not set it** — a client's word
+is not accepted for this — and `--no-keep-open` turns the feature off for the
+whole agent whatever any registry says. What it does NOT touch, and must never:
+`max_seconds` (still counted from the unlock, still unextendable by any message
+a client can send), and every presence lock — SIGTERM, the logind session lock,
+the suspend detector, and the `drop` the page's Lock button, its `pagehide`
+handler and its hidden-tab timer all reach. Those are not timeouts; they are
+"nobody is here". Set `allow_keep_open` on the safe you keep open while you
+work. Do not set it on the one that matters most.
+
+**And it is one switch over a whole helper session, not one per safe.** For a
+release, `allow_keep_open: false` bought a safe nothing whenever any OTHER safe
+the same session held was opted in: the helper has a single idle timer and
+suspending it suspended the protection on both. `secrets-admin` now refuses the
+suspension unless every safe the session holds has been affirmed here, so the
+weakest safe in a session governs. That is a helper-side rule — this daemon has
+no idea what a caller's session holds — and the practical consequence for an
+operator is the one worth remembering: **a safe with `allow_keep_open` set is
+not made safer by being opened next to one without it.**
+
 ## 3 · What it does to earn its place
 
 - **`SO_PEERCRED` is the identity.** The connecting process's `(pid, uid, gid)`
@@ -195,7 +219,9 @@ answered and then the connection is closed.
 | `put` | `{"op":"put","safe":"lab-dc","handle":"<token>","material":"<b64>","idle_seconds":300,"max_seconds":3600}` | `{"ok":true,"handle":"<token>","safe":…,"expires_in":…,"idle_seconds":…,"max_seconds":…,"material_held":bool}` |
 | `get` | `{"op":"get","handle":"<token>"}` | `{"ok":true,"safe":…,"material":"<b64>","material_held":bool,"expires_in":…,"idle_expires_in":…}` |
 | `drop` | `{"op":"drop","handle":"<token>"}`, `{"op":"drop","safe":"lab-dc"}` or `{"op":"drop","all":true}` | `{"ok":true,"dropped":N}` |
-| `status` | `{"op":"status"}` | `{"ok":true,"pid":…,"owner_uid":…,"holdings":[…],"socket":{…},"session":{…}}` |
+| `keep-open` | `{"op":"keep-open","safe":"lab-dc","enabled":true}` or `{"op":"keep-open","handle":"<token>","enabled":true}` | `{"ok":true,"safe":…,"keep_open":bool,"changed":N,"affected":N,"expires_in":…,"idle_expires_in":null,…}` |
+| `policy` | `{"op":"policy","safes":["lab-dc","other"]}` | `{"ok":true,"available":bool,"keep_open":{"lab-dc":true,"other":false}}` — the ONE reader of `agent.allow_keep_open`, made addressable so `secrets-admin` asks the process that refuses instead of reading the registry a second time |
+| `status` | `{"op":"status"}` | `{"ok":true,"pid":…,"owner_uid":…,"holdings":[…],"keep_open":{…},"socket":{…},"session":{…}}` |
 
 **`material` IS OPTIONAL, AND `secrets-admin` NEVER SENDS IT.** Omit it and the
 holding is a **ticket**: a uid-bound record that safe X was unlocked at time T,
@@ -230,9 +256,59 @@ and docs/CONTRACT.md fixes the *entropy* of a handle, not its alphabet.
 Errors use docs/CONTRACT.md's taxonomy verbatim:
 `{"error":"access-denied"|"not-found"|"invalid"|"unsupported"|"internal","detail":"…"}`.
 
+`keep-open` suspends the **idle** timer for one safe's holdings — and, when the
+caller is `secrets-admin` running an `open` session, that session's own idle
+timer too, which is the one the operator actually feels. (The agent holds a
+ticket and no key material, so suspending the ticket's timer alone keeps nothing
+open; a release shipped doing exactly that and the operator was locked out on
+the original schedule with the toggle on.)
+
+**THE SESSION HALF IS SCOPED BY THE HELPER, AND THIS OP CANNOT DO IT.** This
+daemon answers about ONE safe, because a holding is one safe. The helper's idle
+timer is not: there is one of it per session and it ends the whole process, so
+it is the only idle protection every safe that session has unlocked has.
+`secrets-admin` therefore refuses to suspend it unless EVERY safe the session
+holds has been affirmed here (it asks `policy` for exactly those ids), and ends
+the suspension the moment the session opens one that has not. Nothing about that
+rule can live in this file — the daemon does not know what a caller's session
+holds — which is precisely why the two must not be confused: an `ok` from this
+op is an answer about a ticket, never a grant over a session. It applies only
+where
+the registry entry sets `agent.allow_keep_open` — the daemon reads that for
+itself, and answers `access-denied` otherwise, so a client that had been talked
+into asking gets nowhere. `enabled:false` resumes it, and resumes it *from now*,
+which is exactly what a `get` would have done; the alternative would make "off"
+an alias for "lock immediately", and `drop` already is that. The absolute
+deadline is not touched by any of it. `idle_expires_in` comes back **`null`**
+while a holding is suspended rather than a large number, so a caller can tell
+"no idle deadline is running" from "one is, and it is far away". There is no
+`{"all":true}` form and there will not be one. Turning it on is audited, one
+metadata-only line per holding.
+
 `status` lists only the caller's own holdings (with a count of the total, which
 is not sensitive), for the same reason `get` gives one answer for "unknown" and
-"not yours".
+"not yours". Its `keep_open` block — `{available, registry_dirs, suspended}` —
+says whether this daemon offers the feature at all, where it looks for the
+per-safe opt-in, and how many of the caller's holdings are running with the idle
+timer off, so that state is inspectable without the page.
+
+The daemon reads the registry for **one boolean per safe id and nothing else**.
+It resolves no path out of an entry, opens no safe, follows no symlink
+(`O_NOFOLLOW` on the directory and on the file), and ignores any file another
+uid can write. It fails closed on every unknown. Note that the shipped **user**
+unit sets `ProtectHome=yes`, which would hide `~/.config/cockpit-secrets/safes.d`
+from it entirely — the unit binds that one directory back in read-only for this
+Both DIRECTIONS of `keep-open` are gated the same way, and so is a `put` that
+would carry a suspension onto a different safe: the gate is evaluated against
+the safe the holding will HAVE, after any relabel, not against the id in the
+request. A suspension already running is re-checked against the registry before
+every expiry scan (`reconcile_keep_open`), so withdrawing `allow_keep_open`
+reaches it rather than only the next request; the idle timer comes back
+un-reset, which means a holding that has genuinely been idle is dropped by that
+same pass.
+
+reason, and an agent running under an older copy of it will refuse keep-open for
+every user-class safe.
 
 ## 8 · Files
 

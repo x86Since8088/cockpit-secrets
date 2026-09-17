@@ -527,7 +527,15 @@ async function main() {
                 "import-commit": "Add an existing safe…",
                 "import-abort": "Add an existing safe…",
                 "safe-forget": "Forget…",
-                "safe-delete": "Delete…"
+                "safe-delete": "Delete…",
+                /* The keep-open toggle lives in the agent banner, beside the
+                 * countdown whose meaning it changes, and nowhere else. There
+                 * is no free-standing form for it on purpose: "keep this
+                 * unlocked" is not a question to ask about a safe that is not
+                 * currently held, and a control that is reachable when its
+                 * subject does not exist is a control that will one day be
+                 * clicked then. */
+                "keep-open": "Keep open"
             };
 
             const undeclared = schema.verbs.map((v) => v.id).filter((id) => !(id in ROUTES));
@@ -539,6 +547,17 @@ async function main() {
             for (const v of schema.verbs) if (!(v.id in s.responses))
                 s.responses[v.id] = { ok: true };
             s.responses.list.safes[0].export_allowed = true;
+            /* The agent banner is the keep-open toggle's only home, so the
+             * walkthrough has to have something held for it to appear on. */
+            s.responses.list.safes[0].agent_enabled = true;
+            s.responses.list.safes[0].agent_keep_open_allowed = true;
+            s.responses.health = { backends: {}, registry_errors: [], agent: {
+                user: { socket: "/s", present: false, reachable: false, reason: "",
+                        status: null },
+                admin: { socket: "/a", present: true, reachable: true, reason: "",
+                         status: { holdings: [
+                             { safe: "lab-dc", age: 10, expires_in: 3590,
+                               idle_expires_in: 290, keep_open: false }] } } } };
             s.responses.entries = { total: 1, entries: [
                 Object.assign({}, ENTRY, { has_totp: true })] };
             s.responses.totp = { code: "123456", seconds_remaining: 20 };
@@ -1296,6 +1315,667 @@ async function main() {
             ok(/Treat any safe with the agent enabled as open/.test(t),
                "and the operator is told what to assume meanwhile");
             await page.close();
+        }
+
+        /* ================================== keep-open (I18) =============== */
+        /* THE TOGGLE THAT SUSPENDS A SAFE'S IDLE TIMEOUT.
+         *
+         * Every assertion below is either a refusal, a bound, or the banner
+         * saying out loud what has been given up — which is the shape of the
+         * feature. The one permissive case is here so the refusals are known
+         * to be refusals rather than a control that never works.
+         *
+         * The `keep_open` field and the NULL `idle_expires_in` are the daemon's
+         * own reply shape (agent/secrets_agent.py, `_holding_row`). The null
+         * matters: `Number(null)` is 0, and a page that read it as a number
+         * would draw a countdown to a lock that is not coming. */
+        head("Keeping an unlock open (I18)");
+        {
+            const holdingsBlock = (holdings) => ({
+                user: { socket: "/s", present: false, reachable: false, reason: "",
+                        status: null },
+                admin: { socket: "/a", present: true, reachable: true, reason: "",
+                         status: { holdings: holdings } } });
+            const keepScen = (holdings, allow, over) => {
+                const s2 = scen();
+                s2.responses.list.safes[0].agent_enabled = true;
+                s2.responses.list.safes[0].agent_keep_open_allowed = allow;
+                s2.responses.health = Object.assign(
+                    { backends: {}, registry_errors: [],
+                      agent: holdingsBlock(holdings) }, over || {});
+                return s2;
+            };
+            const OFF = [{ safe: "lab-dc", age: 10, expires_in: 3590,
+                           idle_expires_in: 290, keep_open: false }];
+            const ON = [{ safe: "lab-dc", age: 400, expires_in: 3200,
+                          idle_expires_in: null, keep_open: true }];
+
+            {
+                /* THE REGISTRY SAID NO. No toggle at all — and the row says
+                 * why, because an unexplained absence is a question the
+                 * operator cannot answer from the page. */
+                const page = await bootToSafes(browser, keepScen(OFF, false));
+                await page.waitForSelector(".sec-agent-banner", { timeout: 5000 });
+                ok((await page.$$('.sec-agent-banner button:text-is("Keep open")')).length === 0,
+                   "with allow_keep_open false the toggle is ABSENT, not disabled");
+                const t2 = await page.textContent(".sec-agent-banner");
+                ok(/does not set agent.allow_keep_open/.test(t2),
+                   "and the row says why there is no toggle on it");
+                ok((await page.$$('.sec-agent-banner button:text-is("Lock now")')).length === 1,
+                   "Lock now is still offered — the safe is still held");
+                ok(!/idle timeout is suspended/.test(t2),
+                   "and nothing claims a suspension that is not happening");
+                await page.close();
+            }
+            {
+                /* ALLOWED AND OFF. The toggle exists, says it is off, and the
+                 * banner is the ordinary one. */
+                const page = await bootToSafes(browser, keepScen(OFF, true));
+                await page.waitForSelector(".sec-agent-banner", { timeout: 5000 });
+                const b = await page.$('.sec-agent-banner button.sec-keepopen');
+                ok(!!b, "with allow_keep_open true the toggle is drawn");
+                ok(await b.getAttribute("aria-pressed") === "false",
+                   "and it is a real toggle: aria-pressed reflects the daemon's state");
+                ok((await b.textContent()).trim() === "Keep open",
+                   "its label says what clicking it will do");
+                const t2 = await page.textContent(".sec-agent-banner");
+                ok(!/idle timeout is suspended/.test(t2),
+                   "nothing says the idle timeout is suspended while it is running");
+                ok(/locks in 4:5\d/.test(t2) && !/absolute lifetime/.test(t2),
+                   `the countdown is still the idle timer (${t2.match(/locks in [^\s)]+/)})`);
+
+                /* THE CALL. A bare safe id, the same shape `lock` takes and for
+                 * the same reason: this page never had the handle. */
+                await page.click(".sec-agent-banner button.sec-keepopen");
+                await page.waitForFunction(() =>
+                    window.__CALLS.some((c) => c.verb === "keep-open"),
+                    null, { timeout: 5000 })
+                    .then(() => ok(true, "clicking it calls the keep-open verb"))
+                    .catch(() => ok(false, "clicking it calls the keep-open verb"));
+                const body = await page.evaluate(() =>
+                    window.__BODIES.filter((b2) => b2 && b2.enabled !== undefined).pop());
+                ok(body && body.safe === "lab-dc" && body.enabled === true,
+                   `it asks for this safe, enabled:true (${JSON.stringify(body)})`);
+                ok(body && body.handle === undefined,
+                   "and carries no handle — this page never had one");
+                await page.close();
+            }
+            {
+                /* SUSPENDED. The compensating control is the whole of this
+                 * block: with the idle timer gone the banner has to SAY so, in
+                 * words, and count down the only deadline that is left. */
+                const page = await bootToSafes(browser, keepScen(ON, true));
+                await page.waitForSelector(".sec-agent-banner", { timeout: 5000 });
+                const t2 = await page.textContent(".sec-agent-banner");
+                /* ==========================================================
+                 * THE TICKET IS SUSPENDED; THE PROMISE IS NOT MADE. (defect A)
+                 *
+                 * Nothing is unlocked in this tab. `keep_open: true` here is
+                 * the DAEMON's ticket flag out of `health`, and the sentence
+                 * "they will NOT lock when you stop using them" is about the
+                 * idle timeout of the helper SESSION holding the unlock — a
+                 * different timer, in a process this page has no channel to.
+                 * The banner used to make the whole promise from the ticket
+                 * flag alone, which is the standing-banner defect: the most
+                 * reassuring sentence on the page, said with nothing behind
+                 * it.
+                 *
+                 * Revert the `keptConfirmed` split in `renderAgentBanner` and
+                 * this fails: the full promise comes back over a holding this
+                 * page never suspended.
+                 * ========================================================== */
+                ok(!/They will NOT lock when you stop using them/.test(t2),
+                   "with no session of its own, the page does NOT make the " +
+                   "promise from the agent's ticket flag");
+                ok(!/The idle timeout is suspended for one safe below/.test(t2),
+                   "and does not claim the session idle timeout is suspended");
+                ok(/The unlock agent's own idle timer is suspended for one safe below/
+                    .test(t2),
+                   "it says the narrower thing it actually knows");
+                ok(/cannot tell you the session holding the unlock will not time out/
+                    .test(t2),
+                   "and names exactly what it cannot confirm");
+                ok(/idle timeout suspended/.test(t2),
+                   "the row carries the words too, not a colour alone");
+                const b = await page.$('.sec-agent-banner button.sec-keepopen');
+                ok(await b.getAttribute("aria-pressed") === "true",
+                   "the toggle reads pressed");
+                ok((await b.textContent()).trim() === "Keeping open",
+                   "and its label is the present state, not the action");
+                /* 3200 s is the ABSOLUTE remainder. A page that read the null
+                 * idle deadline as 0 would print "locking now…" here. */
+                ok(/locks in 53:\d\d \(absolute lifetime\)/.test(t2),
+                   `the countdown is the absolute lifetime, and says so (${t2.match(/locks in [^)]*\)/)})`);
+                ok(!/locking now/.test(t2),
+                   "a null idle deadline is not read as zero");
+                ok((await page.$$('.sec-agent-banner button:text-is("Lock now")')).length === 1,
+                   "Lock now is still one click away from a suspended safe");
+
+                /* Keyboard and focus. A control that suspends a lock has to be
+                 * reachable and visibly focused. */
+                const focus = await page.evaluate(() => {
+                    const btn = document.querySelector(".sec-agent-banner button.sec-keepopen");
+                    btn.focus();
+                    const cs = window.getComputedStyle(btn);
+                    return { isFocused: document.activeElement === btn,
+                             tag: btn.tagName, outline: cs.outlineWidth,
+                             disabled: btn.disabled };
+                });
+                ok(focus.isFocused && focus.tag === "BUTTON" && !focus.disabled,
+                   "the toggle is a real, focusable, enabled button");
+                ok(focus.outline !== "0px",
+                   `and it takes a visible focus ring (${focus.outline})`);
+                /* The keyboard path, end to end: Enter on the focused control
+                 * must send the same request a click does. */
+                await page.keyboard.press("Enter");
+                await page.waitForFunction(() =>
+                    window.__CALLS.some((c) => c.verb === "keep-open"),
+                    null, { timeout: 5000 })
+                    .then(() => ok(true, "Enter on the focused toggle works like a click"))
+                    .catch(() => ok(false, "Enter on the focused toggle works like a click"));
+                const off = await page.evaluate(() =>
+                    window.__BODIES.filter((b2) => b2 && b2.enabled !== undefined).pop());
+                ok(off && off.enabled === false,
+                   "and a pressed toggle asks to turn it OFF");
+
+                /* I11 — AFTER the toggle has actually been used, which is the
+                 * only moment a page would be tempted to remember its
+                 * position. The state is the daemon's and is kept nowhere
+                 * else; a page that cached it would be a page whose "on" can
+                 * outlive the holding it describes. Checked at RUNTIME and not
+                 * only by the source grep above, because a grep is dodged by
+                 * building the name out of two strings and the storage area
+                 * is not. */
+                const stored = await page.evaluate(() => {
+                    const out = { local: -1, session: -1, cookie: "?" };
+                    try { out.local = window.localStorage.length; } catch (e) { out.local = -2; }
+                    try { out.session = window.sessionStorage.length; } catch (e) { out.session = -2; }
+                    try { out.cookie = document.cookie; } catch (e) { out.cookie = "?"; }
+                    return out;
+                });
+                ok(stored.local === 0 && stored.session === 0,
+                   `neither storage area gained a key from using the toggle (${JSON.stringify(stored)})`);
+                ok(!stored.cookie, "and no cookie was set");
+                const idb = await page.evaluate(async () => {
+                    if (!window.indexedDB || !window.indexedDB.databases) return 0;
+                    try { return (await window.indexedDB.databases()).length; }
+                    catch (e) { return 0; }
+                });
+                ok(idb === 0, `and no IndexedDB database was created (${idb})`);
+                await page.close();
+            }
+            {
+                /* NO MOTION. The banner is the loudest thing on the page and it
+                 * says so with words and weight, never with something that
+                 * moves — which would be unusable for anyone who asked for less
+                 * motion and ignored by everyone else within a minute. */
+                const page = await openPage(browser, keepScen(ON, true));
+                await page.emulateMedia({ reducedMotion: "reduce" });
+                await page.goto(keepScen(ON, true).__url);
+                await page.waitForSelector(".sec-agent-banner", { timeout: 10000 });
+                const anim = await page.evaluate(() => {
+                    const out = [];
+                    document.querySelectorAll(".sec-agent-banner, .sec-agent-banner *")
+                        .forEach((n) => {
+                            const cs = window.getComputedStyle(n);
+                            if (cs.animationName !== "none") out.push(n.className + ":anim");
+                            if (cs.transitionDuration !== "0s") out.push(n.className + ":trans");
+                        });
+                    return out;
+                });
+                ok(anim.length === 0,
+                   `under prefers-reduced-motion nothing in the banner animates or transitions (${anim.join(", ")})`);
+                await page.close();
+            }
+            {
+                /* THE PRESENCE LOCKS ARE NOT SUSPENDED, AND MUST NEVER BE.
+                 * keep-open turns off a TIMEOUT. Leaving the page is not a
+                 * timeout — it is "nobody is here" — so the unlock still ends
+                 * the moment the page goes away, with the toggle on. */
+                const page = await bootToSafes(browser, keepScen(ON, true));
+                await unlockFirst(page, "lab-dc");
+                await page.waitForSelector(".sec-agent-banner", { timeout: 5000 });
+                const before = await page.evaluate(() =>
+                    window.__BODIES.filter((b2) => b2 && b2.verb === "lock").length);
+                await page.evaluate(() => window.dispatchEvent(new Event("pagehide")));
+                await page.waitForFunction((n) =>
+                    window.__BODIES.filter((b2) => b2 && b2.verb === "lock").length > n,
+                    before, { timeout: 5000 })
+                    .then(() => ok(true,
+                        "pagehide still locks the session with keep-open on"))
+                    .catch(() => ok(false,
+                        "pagehide still locks the session with keep-open on"));
+                await page.close();
+            }
+            {
+                /* ==========================================================
+                 * THE DEADLINE THE PAGE SHOWS IS THE HELPER'S, RE-ISSUED.
+                 *
+                 * keep-open moves the deadline this session dies on — the
+                 * registry may raise the absolute bound when the suspension
+                 * starts — and the page has exactly one function that writes
+                 * its countdown, fed only by helper numbers. This drives the
+                 * whole path: unlock publishes 900, the toggle's reply
+                 * publishes 1800, and the visible countdown has to follow the
+                 * second one. A page that kept its own arithmetic would go on
+                 * counting down to a deadline the helper stopped keeping,
+                 * which is the banner-outlives-its-session defect in another
+                 * costume.
+                 *
+                 * Revert `adoptSessionDeadline(res.session_expires_in)` in
+                 * `agentKeepOpen` and this fails: the countdown stays under
+                 * 15:00.
+                 * ========================================================== */
+                const s2 = keepScen(OFF, true);
+                s2.responses["keep-open"] = {
+                    ok: true, safe: "lab-dc", keep_open: true,
+                    affected: 1, changed: 1,
+                    session: true, session_keep_open: true,
+                    session_expires_in: 1800,
+                    session_idle_expires_in: null };
+                const page = await bootToSafes(browser, s2);
+                await unlockFirst(page, "lab-dc");
+                await page.waitForSelector("#sec-session", { timeout: 5000 });
+                const before = (await page.textContent("#sec-session")) || "";
+                ok(/1[45]:\d\d left/.test(before),
+                   `before the toggle the countdown is the unlock's 900 s (${before})`);
+                await page.waitForSelector(".sec-agent-banner button.sec-keepopen",
+                                           { timeout: 5000 });
+                /* Counted for the KEEP-OPEN verb specifically. A count of all
+                 * spawns picks up the one-second agent poll running in the
+                 * background and flakes. */
+                const spawnsBefore = await page.evaluate(() =>
+                    window.__CALLS.filter((c) => c.verb === "keep-open").length);
+                await page.click(".sec-agent-banner button.sec-keepopen");
+                await page.waitForFunction(() =>
+                    window.__BODIES.some((b2) => b2 && b2.verb === "keep-open"),
+                    null, { timeout: 5000 })
+                    .then(() => ok(true,
+                        "with a session open, the toggle goes DOWN THAT CHANNEL " +
+                        "as a session frame"))
+                    .catch(() => ok(false,
+                        "with a session open, the toggle goes DOWN THAT CHANNEL " +
+                        "as a session frame"));
+                /* AND NOT AS A ONE-SHOT SPAWN. The timer this suspends lives in
+                 * the process holding the unlock; a second helper has no idle
+                 * timer to suspend and cannot reach the first one's, so a
+                 * `callOnce` here changes the agent's ticket and nothing else —
+                 * which is the whole defect this release fixes, reintroduced at
+                 * the call site. Revert `agentKeepOpen` to `callOnce` and this
+                 * fails. */
+                const spawnsAfter = await page.evaluate(() =>
+                    window.__CALLS.filter((c) => c.verb === "keep-open").length);
+                ok(spawnsAfter === spawnsBefore,
+                   `and spawns no second helper to do it (${spawnsBefore} -> ${spawnsAfter})`);
+                await page.waitForFunction(() => {
+                    const n = document.getElementById("sec-session");
+                    return n && /2[89]:\d\d|30:00/.test(n.textContent || "");
+                }, null, { timeout: 5000 })
+                    .then(() => ok(true,
+                        "the page ADOPTS the deadline keep-open re-issued (1800 s)"))
+                    .catch(async () => ok(false,
+                        "the page ADOPTS the deadline keep-open re-issued (1800 s) " +
+                        `— still shows ${await page.textContent("#sec-session")}`));
+                await page.close();
+            }
+            {
+                /* ==========================================================
+                 * THE MESSAGE MUST NOT PROMISE WHAT WAS NOT DONE.
+                 *
+                 * A reply that changed only the agent's TICKET — no session,
+                 * so no session idle timeout suspended — must not produce the
+                 * "you will not be locked out" sentence. That sentence over a
+                 * ticket-only change is precisely what this feature shipped
+                 * saying and could not keep.
+                 * ========================================================== */
+                const s2 = keepScen(OFF, true);
+                s2.responses["keep-open"] = {
+                    ok: true, safe: "lab-dc", keep_open: true,
+                    affected: 1, changed: 1,
+                    session: true, session_keep_open: false,
+                    session_expires_in: 900 };
+                const page = await bootToSafes(browser, s2);
+                await page.waitForSelector(".sec-agent-banner button.sec-keepopen",
+                                           { timeout: 5000 });
+                await page.click(".sec-agent-banner button.sec-keepopen");
+                await page.waitForSelector(".sec-alert, #sec-alert", { timeout: 5000 })
+                    .catch(() => {});
+                const said = await page.evaluate(() =>
+                    (document.body.textContent || ""));
+                ok(/no idle timeout was suspended/.test(said),
+                   "a ticket-only change says so, and says you can still be locked out");
+                ok(!/Keeping .* unlocked\. This session's idle timeout is suspended/
+                   .test(said),
+                   "and does not make the promise it did not keep");
+                await page.close();
+            }
+            {
+                /* ==========================================================
+                 * PRESENCE, FOR A HOLDING THIS PAGE DID NOT CREATE.
+                 *
+                 * The banner promises six things end a suspended unlock. Two
+                 * of them — leaving the page, and the hidden-tab timer — only
+                 * ever ran inside `if (SESSION)`, so a holding suspended by
+                 * another tab (or by this one before a reload) sailed through
+                 * both while the banner went on promising otherwise.
+                 *
+                 * There is NO page session here: nothing is unlocked in this
+                 * tab, and the banner is drawn purely from `health`. Revert
+                 * `agentPresenceLock` out of the pagehide handler and no `lock`
+                 * is ever sent.
+                 * ========================================================== */
+                const page = await bootToSafes(browser, keepScen(ON, true));
+                await page.waitForSelector(".sec-agent-banner", { timeout: 5000 });
+                const noSession = await page.evaluate(() =>
+                    document.getElementById("sec-browse-view").hidden);
+                ok(noSession, "this page has no session of its own for that safe");
+                const before = await page.evaluate(() =>
+                    window.__CALLS.filter((c) => c.verb === "lock").length);
+                await page.evaluate(() => window.dispatchEvent(new Event("pagehide")));
+                await page.waitForFunction((n) =>
+                    window.__CALLS.filter((c) => c.verb === "lock").length > n,
+                    before, { timeout: 5000 })
+                    .then(() => ok(true,
+                        "pagehide locks a SUSPENDED holding this page did not create"))
+                    .catch(() => ok(false,
+                        "pagehide locks a SUSPENDED holding this page did not create"));
+                /* A one-shot spawn carries the verb on argv, not in the body
+                 * (the harness records the two separately), so the pair is
+                 * read together. */
+                const sent = await page.evaluate(() => {
+                    const i = window.__CALLS.map((c) => c.verb)
+                        .lastIndexOf("lock");
+                    return { verb: i < 0 ? null : window.__CALLS[i].verb,
+                             body: window.__BODIES[window.__BODIES.length - 1] };
+                });
+                ok(sent.verb === "lock" && sent.body && sent.body.safe === "lab-dc"
+                   && sent.body.handle === undefined,
+                   `and it names the safe, with no handle (${JSON.stringify(sent)})`);
+                await page.close();
+            }
+            {
+                /* The other missing one: the hidden-tab timer. Same holding,
+                 * same absence of a session, and the threshold is turned down
+                 * to a second so this is a test and not a minute of waiting. */
+                const s2 = keepScen(ON, true);
+                s2.responses.schema.constants.hide_lock_seconds = 1;
+                const page = await bootToSafes(browser, s2);
+                await page.waitForSelector(".sec-agent-banner", { timeout: 5000 });
+                const before = await page.evaluate(() =>
+                    window.__CALLS.filter((c) => c.verb === "lock").length);
+                /* The real event, with the real visibility state behind it. */
+                await page.evaluate(() => {
+                    Object.defineProperty(document, "visibilityState",
+                                          { configurable: true, get: () => "hidden" });
+                    document.dispatchEvent(new Event("visibilitychange"));
+                });
+                await page.waitForFunction((n) =>
+                    window.__CALLS.filter((c) => c.verb === "lock").length > n,
+                    before, { timeout: 8000 })
+                    .then(() => ok(true,
+                        "a tab hidden past the threshold locks a suspended holding " +
+                        "this page did not create"))
+                    .catch(() => ok(false,
+                        "a tab hidden past the threshold locks a suspended holding " +
+                        "this page did not create"));
+                await page.close();
+            }
+            {
+                /* ==========================================================
+                 * THE BANNER MUST NOT OUTLIVE THE LOCK IT COMPENSATES FOR.
+                 *
+                 * The suspended-idle-timeout warning is the compensating
+                 * control for a safe that is open with nothing watching it. The
+                 * moment the session it describes ends, the claim has to go —
+                 * not at the next poll, and not "once the daemon catches up".
+                 * ========================================================== */
+                /* ==========================================================
+                 * Nothing is unlocked in this tab: the holding is one this
+                 * page only knows about through `health`, which is the state
+                 * the old banner kept promising over. Then the daemon stops
+                 * answering — and the promise must go with it, while the
+                 * holding itself stays on screen, because an unlocked safe
+                 * must never be invisible (I18).
+                 *
+                 * Revert the `AGENT.failed` branch in the suspended paragraph
+                 * and this fails: the page goes on saying "They will NOT lock
+                 * when you stop using them" about a daemon it cannot reach,
+                 * which is the most reassuring sentence on the page said at
+                 * the one moment it is least entitled to be.
+                 * ========================================================== */
+                const s2 = keepScen(ON, true);
+                /* THE PROMISE IS ONLY EVER DRAWN FROM A HELPER CONFIRMATION,
+                 * so this scenario has to earn one: unlock, toggle, and have
+                 * the helper answer `session_keep_open` with the scope list.
+                 * Before defect A was fixed the ticket flag alone was enough,
+                 * which is what made this test's premise true by accident. */
+                s2.responses["keep-open"] = {
+                    ok: true, safe: "lab-dc", keep_open: true,
+                    affected: 1, changed: 1,
+                    session: true, session_keep_open: true,
+                    session_keep_open_safes: ["lab-dc"],
+                    session_expires_in: 1800, session_idle_expires_in: null };
+                const page = await bootToSafes(browser, s2);
+                await unlockFirst(page, "lab-dc");
+                await page.waitForSelector(".sec-agent-banner button.sec-keepopen",
+                                           { timeout: 5000 });
+                await page.click(".sec-agent-banner button.sec-keepopen");
+                await page.waitForFunction(() => {
+                    const n = document.getElementById("sec-agent-banner");
+                    return n && /They will NOT lock when you stop using them/
+                        .test(n.textContent || "");
+                }, null, { timeout: 8000 }).catch(() => {});
+                const t2 = await page.textContent(".sec-agent-banner");
+                ok(/The idle timeout is suspended/.test(t2)
+                   && /They will NOT lock when you stop using them/.test(t2),
+                   "while the daemon answers AND the helper has confirmed a " +
+                   "session suspension, the banner makes the promise");
+                await page.evaluate(() => {
+                    window.__SCENARIO.responses.health = {
+                        error: "unsupported", detail: "the agent stopped answering" };
+                });
+                await page.waitForFunction(() => {
+                    const n = document.getElementById("sec-agent-banner");
+                    return n && /could not be asked/.test(n.textContent || "");
+                }, null, { timeout: 8000 });
+                const after = await page.textContent("#sec-agent-banner");
+                ok(!/They will NOT lock when you stop using them/.test(after),
+                   "and the moment it cannot be asked, it stops promising");
+                ok(/cannot confirm any of it now/.test(after),
+                   "saying instead what is actually known, which is nothing");
+                ok(/The idle timeout is suspended/.test(after)
+                   && /Lock now/.test(after),
+                   "the suspension and the Lock button both stay — an unlocked " +
+                   "safe must never be invisible (I18)");
+                await page.close();
+            }
+            {
+                /* A `false` that is a SILENCE, not an answer. The helper asks
+                 * the daemon — the one reader of `agent.allow_keep_open` — and
+                 * reports whether it got a reply at all. Telling the operator
+                 * their registry says no, when in truth nothing could be asked,
+                 * sends them to edit a file that was never the problem. */
+                const s2 = keepScen(OFF, false);
+                s2.responses.list.safes[0].agent_keep_open_known = false;
+                const page = await bootToSafes(browser, s2);
+                await page.waitForSelector(".sec-agent-banner", { timeout: 5000 });
+                const t2 = await page.textContent(".sec-agent-banner");
+                ok(/the unlock agent could not be asked/.test(t2),
+                   "an unanswered policy question says so, and names the decider");
+                ok(!/does not set agent.allow_keep_open/.test(t2),
+                   "and does not blame a registry key it never managed to read");
+                await page.close();
+            }
+            {
+                /* ==========================================================
+                 * D — AFTER OFF, THE PAGE MUST NOT GO ON COUNTING DOWN THE
+                 * LIFETIME THE SUSPENSION BOUGHT.
+                 *
+                 * A registry entry may raise the session's absolute lifetime
+                 * while keep-open is on. That raise is contingent on the
+                 * suspension: the helper gives it back on Off and re-publishes
+                 * the lowered number in the same reply. The page has to ADOPT
+                 * that, and it has to say what will actually end the session
+                 * now — the idle timeout, which is minutes rather than the
+                 * hour still on screen.
+                 *
+                 * Revert the `release()` lifetime restore in the helper, or
+                 * the idle sentence in `agentKeepOpen`'s off branch, and this
+                 * fails.
+                 * ========================================================== */
+                const s2 = keepScen(OFF, true);
+                s2.responses["keep-open"] = { __seq: [
+                    { ok: true, safe: "lab-dc", keep_open: true,
+                      affected: 1, changed: 1,
+                      session: true, session_keep_open: true,
+                      session_keep_open_safes: ["lab-dc"],
+                      session_expires_in: 3600, session_idle_expires_in: null,
+                      session_idle_seconds: 120 },
+                    { ok: true, safe: "lab-dc", keep_open: false,
+                      affected: 1, changed: 1,
+                      session: true, session_keep_open: false,
+                      session_keep_open_safes: [],
+                      session_expires_in: 840, session_idle_expires_in: 120,
+                      session_idle_seconds: 120 }] };
+                const page = await bootToSafes(browser, s2);
+                await unlockFirst(page, "lab-dc");
+                await page.waitForSelector(".sec-agent-banner button.sec-keepopen",
+                                           { timeout: 5000 });
+                await page.click(".sec-agent-banner button.sec-keepopen");
+                await page.waitForFunction(() => {
+                    const n = document.getElementById("sec-session");
+                    return n && /59:\d\d|1:00:00|60:00/.test(n.textContent || "");
+                }, null, { timeout: 8000 })
+                    .then(() => ok(true,
+                        "with the suspension on, the page adopts the raised hour"))
+                    .catch(async () => ok(false,
+                        "with the suspension on, the page adopts the raised hour " +
+                        `— shows ${await page.textContent("#sec-session")}`));
+                /* The daemon now reports the ticket as suspended, which is what
+                 * makes the toggle read pressed — so the next click is a real
+                 * OFF and not a second ON. The toggle's position is the
+                 * daemon's state and never this page's, which is the rule that
+                 * makes this step necessary rather than a convenience. */
+                await page.evaluate(() => {
+                    window.__SCENARIO.responses.health.agent.admin.status.holdings =
+                        [{ safe: "lab-dc", age: 400, expires_in: 3200,
+                           idle_expires_in: null, keep_open: true }];
+                });
+                await page.waitForFunction(() => {
+                    const b = document.querySelector(".sec-agent-banner button.sec-keepopen");
+                    return b && b.getAttribute("aria-pressed") === "true";
+                }, null, { timeout: 8000 });
+                await page.click(".sec-agent-banner button.sec-keepopen");
+                await page.waitForFunction(() => {
+                    const n = document.getElementById("sec-session");
+                    return n && /1[34]:\d\d left/.test(n.textContent || "");
+                }, null, { timeout: 8000 })
+                    .then(() => ok(true,
+                        "and on OFF it adopts the lowered one the helper re-issued, " +
+                        "rather than counting an hour down to a lock two minutes away"))
+                    .catch(async () => ok(false,
+                        "and on OFF it adopts the lowered one the helper re-issued " +
+                        `— still shows ${await page.textContent("#sec-session")}`));
+                const said = await page.evaluate(() => document.body.textContent || "");
+                ok(/ends after 2:00 with no activity/.test(said),
+                   "and the message names the idle window that came back, in the " +
+                   "same breath as 'resumed'");
+                /* AND THE PROMISE IS GONE. The helper said the scope is now
+                 * empty; a page that kept its own record would still be
+                 * drawing the strong paragraph over a resumed timer. */
+                const bt = await page.textContent(".sec-agent-banner");
+                ok(!/They will NOT lock when you stop using them/.test(bt),
+                   "and the banner stops promising the moment the scope empties");
+                await page.close();
+            }
+            {
+                /* ==========================================================
+                 * A — THE SCOPE LIST IS WHAT THE PROMISE IS DRAWN FROM.
+                 *
+                 * The helper publishes `session_keep_open_safes`: every safe
+                 * its ONE session suspension covers. A page that kept its own
+                 * per-safe bookkeeping could promise over a safe the helper
+                 * had already dropped from the scope — which is exactly what
+                 * happens when a session opens a safe the agent will not let
+                 * it suspend. Adopting the list wholesale is the only shape
+                 * that cannot drift.
+                 *
+                 * Revert `keptAdopt` and this fails: the page keeps promising
+                 * for lab-dc after the helper answered with an empty scope.
+                 * ========================================================== */
+                const s2 = keepScen(OFF, true);
+                s2.responses["keep-open"] = {
+                    ok: true, safe: "lab-dc", keep_open: true,
+                    affected: 1, changed: 1,
+                    session: true, session_keep_open: true,
+                    session_keep_open_safes: ["lab-dc"],
+                    session_expires_in: 900, session_idle_expires_in: null,
+                    session_idle_seconds: 120 };
+                const page = await bootToSafes(browser, s2);
+                await unlockFirst(page, "lab-dc");
+                await page.waitForSelector(".sec-agent-banner button.sec-keepopen",
+                                           { timeout: 5000 });
+                await page.click(".sec-agent-banner button.sec-keepopen");
+                await page.evaluate(() => {
+                    window.__SCENARIO.responses.health.agent.admin.status.holdings =
+                        [{ safe: "lab-dc", age: 400, expires_in: 3200,
+                           idle_expires_in: null, keep_open: true }];
+                });
+                await page.waitForFunction(() => {
+                    const n = document.getElementById("sec-agent-banner");
+                    return n && /They will NOT lock when you stop using them/
+                        .test(n.textContent || "");
+                }, null, { timeout: 8000 })
+                    .then(() => ok(true,
+                        "a helper-confirmed scope earns the promise"))
+                    .catch(() => ok(false,
+                        "a helper-confirmed scope earns the promise"));
+                /* Now the helper answers with an EMPTY scope — the shape of a
+                 * grant it has just given up, because the session opened a
+                 * safe the agent will not let it suspend. The daemon's ticket
+                 * is unchanged and still says `keep_open: true`, so a page
+                 * drawing its promise from the ticket would go on making it. */
+                await page.evaluate(() => {
+                    window.__SCENARIO.responses["keep-open"] = {
+                        ok: true, safe: "lab-dc", keep_open: true,
+                        affected: 1, changed: 0,
+                        session: true, session_keep_open: false,
+                        session_keep_open_safes: [],
+                        session_expires_in: 900, session_idle_expires_in: 110,
+                        session_idle_seconds: 120 };
+                });
+                await page.click(".sec-agent-banner button.sec-keepopen");
+                await page.waitForFunction(() => {
+                    const n = document.getElementById("sec-agent-banner");
+                    return n && !/They will NOT lock when you stop using them/
+                        .test(n.textContent || "");
+                }, null, { timeout: 8000 })
+                    .then(() => ok(true,
+                        "and an empty scope from the helper takes it straight back"))
+                    .catch(() => ok(false,
+                        "and an empty scope from the helper takes it straight back"));
+                const bt = await page.textContent(".sec-agent-banner");
+                ok(/The unlock agent's own idle timer is suspended/.test(bt),
+                   "leaving the narrower sentence over a ticket that really is " +
+                   "suspended");
+                await page.close();
+            }
+            {
+                /* A helper with no keep-open verb gets no toggle at all. The
+                 * page renders nothing it invented, and a button that calls a
+                 * verb the helper does not have is exactly that. */
+                const s2 = keepScen(OFF, true);
+                s2.responses.schema.verbs =
+                    s2.responses.schema.verbs.filter((v) => v.id !== "keep-open");
+                const page = await bootToSafes(browser, s2);
+                await page.waitForSelector(".sec-agent-banner", { timeout: 5000 });
+                ok((await page.$$(".sec-agent-banner button.sec-keepopen")).length === 0,
+                   "a helper that does not publish keep-open gets no toggle");
+                ok(!/does not set agent.allow_keep_open/
+                    .test(await page.textContent(".sec-agent-banner")),
+                   "and no explanation for a control that was never on offer");
+                await page.close();
+            }
         }
 
         /* ===================================================== yubikey ==== */
