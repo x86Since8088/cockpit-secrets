@@ -25,7 +25,7 @@
 # behind points at the share.
 #
 # What it deliberately does NOT copy: .git/, .claude/, tests/, docs/,
-# function-map/, __pycache__/, check.sh, validate.sh, run_tests.sh,
+# scripts/, __pycache__/, check.sh, validate.sh, run_tests.sh,
 # requires.txt, CHANGELOG.md, any .env, and any fixture. A production host that
 # holds passphrases has no business holding a test corpus or a git history.
 #

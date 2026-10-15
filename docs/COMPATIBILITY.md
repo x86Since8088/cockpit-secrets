@@ -557,12 +557,13 @@ what changed" is the only form of that claim a reader can check.
   of any kind.
 - **The plugin opens no TCP port.** The browser reaches the helper through
   `cockpit.spawn` — a process and a pipe. The only socket in the package is the
-  agent's `AF_UNIX` one (I18), and `function-map/` records that absence entry
-  by entry so it can be proved from the inventory rather than from this
-  sentence: 902 of its 911 entries carry `ports: []`, the nine that do not are
-  the functions that operate the agent socket, and
+  agent's `AF_UNIX` one (I18), and the project-root `function-map/` records that
+  absence entry by entry so it can be proved from the inventory rather than
+  from this sentence: 928 of its 938 entries carry `ports: []`, the ten that do
+  not are the functions that operate the agent socket (and the test helper that
+  talks to it), and
 
-      grep -rn --include='*.yaml' 'transport: "\(tcp\|udp\)"' function-map/
+      grep -rn --include='*.yaml' 'transport: "\(tcp\|udp\)"' ../function-map/
 
   finds nothing.
 
