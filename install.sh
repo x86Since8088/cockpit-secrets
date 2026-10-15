@@ -890,7 +890,7 @@ echo "Installing"
 # ===========================================================================
 # NOT one directory symlink at $SRC. This is the same script in a dev install,
 # and there $SRC is the checkout: a directory symlink would point Cockpit's WEB
-# ROOT at .git/, .claude/, tests/, docs/ and function-map/ and serve them over
+# ROOT at .git/, .claude/, tests/, docs/ and scripts/ and serve them over
 # HTTPS to any authenticated Cockpit session. Handing a web root a symlink to a
 # directory whose contents you do not enumerate is how repositories end up on
 # the internet.

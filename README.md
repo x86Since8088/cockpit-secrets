@@ -533,7 +533,7 @@ ln -sfn payload-0.5.0 payload.new && mv -T payload.new payload && payload/instal
 ```
 
 The payload is a **subset**: `.git/`, `.claude/`, `tests/`, `docs/`,
-`function-map/`, `check.sh`, `validate.sh`, `run_tests.sh`, `requires.txt`,
+`scripts/`, `check.sh`, `validate.sh`, `run_tests.sh`, `requires.txt`,
 `CHANGELOG.md` and every fixture stay in the checkout. A production host that
 holds passphrases has no business holding a test corpus or a git history. There
 is no build step to invent — `secrets.js` is the bytes the browser loads, byte

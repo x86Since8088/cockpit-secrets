@@ -251,7 +251,7 @@ Shipped: `manifest.json`, `index.html`, the `*.js` and `*.css` the page referenc
 `VERSION`, `LICENSE`, `README.md`.
 
 Not shipped: `.git/`, `.claude/`, `tests/`, `docs/`, `__pycache__/`, `check.sh`, `validate.sh`,
-`run_tests.sh`, `function-map/`, any `.env`, any `*.example` that is not under `etcdefaults/`,
+`run_tests.sh`, `scripts/`, any `.env`, any `*.example` that is not under `etcdefaults/`,
 any fixture, and anything not named by the declared manifest (§7).
 
 `cockpit-secrets`' helper is a single 450 KB `secrets-admin` file that today sits at the repo
@@ -296,7 +296,7 @@ It loses on one fact that outweighs all of that: **`install.sh` is the same scri
 install, and in a dev install the directory it would link to is the checkout.** Link
 `/usr/share/cockpit/secrets` at
 `/srv/smb/.../cockpit-secrets/source` and Cockpit is now serving `.git/`, `.claude/`, `tests/`,
-`docs/`, `validate.sh` and `function-map/` over HTTPS to any authenticated Cockpit session.
+`docs/`, `validate.sh` and `scripts/` over HTTPS to any authenticated Cockpit session.
 `/usr/share/cockpit/<name>` is a **web root**. Handing a web root a symlink to a directory whose
 contents you do not enumerate is how repositories end up on the internet.
 
